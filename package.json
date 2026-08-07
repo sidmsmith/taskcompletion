@@ -1,0 +1,17 @@
+{
+  "name": "taskcompletion",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "node server.js"
+  },
+  "description": "Task Check In - complete a WMS task (Putaway, Picking, Cycle Count, Replenishment) without a mobile RF device",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-fetch": "^2.7.0"
+  },
+  "license": "ISC",
+  "type": "commonjs"
+}
