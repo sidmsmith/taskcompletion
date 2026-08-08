@@ -169,11 +169,16 @@ building this:
   which is a thin pass-through) — both succeeded and were confirmed by
   re-querying the iLPN's actual current location afterward, not just
   by trusting `success: true`.
-- Not yet exercised: the warning-and-override path for this specific
-  flow (the document's `DCI::120` example). The mechanism
-  (`apply_warning_overrides()`) is the same one already proven for the
-  Substitute Location warning above, so it's expected to work, but
-  hasn't been triggered live through this exact code path yet.
+- **CONFIRMED live, 2026-08-08 (second session)**: the warning-and-
+  override path for this exact flow. `LPN000000000010` (no current
+  location — a container that had never been putaway) to `R2R61001`
+  returned `DCI::159` ("No item assignment exists for location
+  R2R61001") at the `AcceptLocationForUserDirectedPutaway` step on the
+  first attempt; resubmitting with `warningOverrideList: ["DCI::159"]`
+  returned `success: true`, and the iLPN's current location was
+  confirmed (by re-query, not just the response) to have actually
+  changed from `null` to `R2R61001`. Same override mechanism already
+  proven for Substitute Location, now proven for this flow too.
 
 ## iLPN search (2026-08-08)
 
