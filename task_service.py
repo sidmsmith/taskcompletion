@@ -1390,6 +1390,24 @@ def complete_container_putaway(
     dest = resolve_location(org, location)
     warning_overrides = warning_overrides or {}
 
+    # 2026-08-08, seventh session, per explicit instruction: a consumed
+    # LPN's inventory has already moved into a location record — there
+    # is nothing left on the LPN itself to adjust or putaway, so this
+    # refuses outright rather than attempting a call that would have
+    # nothing real to act on. Mirrors the frontend's own
+    # isConsumedLine() gating (public/app.js), which already keeps the
+    # UI from getting here in the normal click-through flow — this is
+    # the backend-side guarantee for a direct API call.
+    ilpn = search_ilpn_current_location(container_id, token, org, location=dest)
+    if ilpn and str(ilpn.get("Status") or "") == ILPN_CONSUMED_STATUS:
+        return {
+            "success": False,
+            "error": (
+                "This LPN has already been consumed — its inventory moved to "
+                "a location and it can no longer be updated."
+            ),
+        }
+
     if item_adjustments:
         adjust_result = adjust_ilpn_quantities(
             container_id, item_adjustments, token, org, location=dest

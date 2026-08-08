@@ -770,6 +770,44 @@ task. Needs a fresh allocated task headed to a consuming destination
   `A1AC0401*`; `IBPWIBPT0109`'s line (`LPN00763`) → green "Allocated"
   badge, `STAGIB0204` (its real TaskDetail source location) unchanged.
 
+## Consumed LPNs are read-only (2026-08-08, seventh session)
+
+Per explicit instruction: a consumed LPN's inventory has already moved
+to a location record — there's nothing left on the LPN to adjust or
+putaway, so it's now blocked at every layer rather than relying on any
+single check:
+
+- **Frontend inputs disabled outright** — `toLocationCellHtml()`'s To
+  Location input and the Completed Qty input (both the single-item box
+  and every mixed-item sub-row's box, keyed off the *parent* line's
+  status since only the container carries its own iLPN status) get
+  `disabled` + an explanatory `title` tooltip when `isConsumedLine(line)`
+  (`line.ilpnStatus === "9000"`, mirroring `mawm_client
+  .ILPN_CONSUMED_STATUS`). `validateLocation()` also skips a disabled
+  input rather than showing it red/"invalid" — a disabled empty box
+  reading as an error would be misleading when there's nothing to fix.
+- **Buttons gated explicitly** — `updateLineActionButtons()`/
+  `allOutstandingLinesValid()` both add `!isConsumedLine(...)` alongside
+  the existing location/qty/reason checks, and `completeLine()` shows
+  its own clear message ("already been consumed and can no longer be
+  updated") if a consumed line is ever selected, mirroring the existing
+  "already complete" pattern.
+- **Backend guard, defense in depth** — `complete_container_putaway()`
+  now looks up the container's iLPN status itself and refuses outright
+  (before touching anything else — adjustment, workflow_init, all of
+  it) if `Status == ILPN_CONSUMED_STATUS`, so a direct API call can't
+  bypass the frontend's own restriction. Confirmed live against
+  `LPN000000000006`: `{"success": false, "error": "This LPN has
+  already been consumed — its inventory moved to a location and it can
+  no longer be updated."}`.
+- Confirmed via browser render too: both inputs correctly greyed out,
+  Complete Line correctly disabled, no red "invalid" flash on the
+  disabled To Location.
+- **Not yet handled**: the user is separately researching a linked
+  history record that would surface the last item/qty/etc. a now-
+  read-only consumed LPN actually held, for display purposes — noted
+  as a likely near-future addition once that's found, not built here.
+
 ## Known-good test Task Id
 
 Refreshed 2026-08-08 (third session) — the demo environment's data

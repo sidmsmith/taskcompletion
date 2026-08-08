@@ -21,6 +21,16 @@
     return state.groups.flatMap((g) => g.lines || []);
   }
 
+  // Mirrors mawm_client.ILPN_CONSUMED_STATUS (2026-08-08, seventh
+  // session) — a consumed LPN's inventory already moved to a location
+  // record; nothing left on the LPN to adjust or complete. See
+  // isConsumedLine() below.
+  const ILPN_CONSUMED_STATUS = "9000";
+
+  function isConsumedLine(line) {
+    return line.ilpnStatus === ILPN_CONSUMED_STATUS;
+  }
+
   // Fallback only — the real list is preloaded once per session from
   // mawm_client.ADJUSTMENT_REASON_CODES via /api/preload_adjustment_
   // reason_codes (see preloadAdjustmentReasonCodes() below), the single
@@ -288,7 +298,17 @@
     return `<td>${escapeHtml(line.lpnId)}${badge ? "<br/>" + badge : ""}</td>`;
   }
 
+  /**
+   * Disabled outright for a consumed line (2026-08-08, per explicit
+   * instruction — "should not be able to have their location or qty
+   * changed"): its inventory already moved to a location record, so
+   * there's nothing left on the LPN for a destination to even mean.
+   */
   function toLocationCellHtml(line) {
+    const consumed = isConsumedLine(line);
+    const title = consumed
+      ? ' title="This LPN has been consumed — its location can no longer be updated."'
+      : "";
     return `
           <td>
             <input
@@ -298,6 +318,7 @@
               data-default-location="${escapeAttr(line.toLocationId)}"
               value="${escapeAttr(line.toLocationId)}"
               autocomplete="off"
+              ${consumed ? "disabled" : ""}${title}
             />
           </td>`;
   }
@@ -336,6 +357,7 @@
           <td><span class="text-muted">see items below</span></td>
           <td class="col-reason"></td>
         </tr>`;
+      const consumedForItems = isConsumedLine(line);
       const itemRows = line.mixedItems
         .map(
           (item) => `
@@ -360,6 +382,7 @@
               value="${escapeAttr(item.quantity)}"
               min="0"
               step="any"
+              ${consumedForItems ? "disabled" : ""}
             />
           </td>
           <td class="col-reason">
@@ -378,6 +401,7 @@
     }
 
     const remaining = remainingQty(line);
+    const consumed = isConsumedLine(line);
     return `
         <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
           <td>${escapeHtml(line.lineNumber)}</td>
@@ -399,6 +423,7 @@
               value="${escapeAttr(remaining)}"
               min="0"
               step="any"
+              ${consumed ? 'disabled title="This LPN has been consumed — its quantity can no longer be updated."' : ""}
             />
           </td>
           <td class="col-reason">
@@ -694,6 +719,15 @@
   function validateLocation(input, immediate) {
     clearTimeout(locationValidateTimers.get(input));
 
+    // A disabled input (2026-08-08 — a consumed line's To Location,
+    // see isConsumedLine()) has nothing actionable about it, so it
+    // shouldn't show a red "needs fixing" state — the disabled/greyed
+    // styling alone already communicates "nothing to do here."
+    if (input.disabled) {
+      input.classList.remove("invalid");
+      return;
+    }
+
     // Fast path: state.storageLocations is a preloaded Set, so this is
     // a synchronous, in-memory check — runs on every keystroke with no
     // artificial delay, no network round trip.
@@ -749,7 +783,11 @@
     const outstanding = allLines().filter((l) => remainingQty(l) > 0);
     if (!outstanding.length) return true; // let the click through to show "nothing to do"
     return outstanding.every(
-      (l) => isLocationValid(l.taskDetailId) && isQtyValid(l) && isReasonValid(l)
+      (l) =>
+        !isConsumedLine(l) &&
+        isLocationValid(l.taskDetailId) &&
+        isQtyValid(l) &&
+        isReasonValid(l)
     );
   }
 
@@ -758,6 +796,7 @@
     const hasSelection = !!selectedLine;
     const selectedValid =
       hasSelection &&
+      !isConsumedLine(selectedLine) &&
       isLocationValid(selectedLine.taskDetailId) &&
       isQtyValid(selectedLine) &&
       isReasonValid(selectedLine);
@@ -1013,6 +1052,13 @@
   async function completeLine() {
     const line = getSelectedLine();
     if (!line) return;
+    if (isConsumedLine(line)) {
+      setActionStatus(
+        "This LPN has already been consumed and can no longer be updated.",
+        "error"
+      );
+      return;
+    }
     const remaining = remainingQty(line);
     if (remaining <= 0) {
       setActionStatus("Line " + line.lineNumber + " is already complete.", "error");
