@@ -78,20 +78,28 @@ PUTAWAY_FETCH_MOVE_URL_TEMPLATE = f"{HOST}/putaway/api/putaway/execution/task/{{
 PUTAWAY_COMMIT_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/transfer/commitAndFetchNextMove"
 PUTAWAY_EXECUTION_CRITERIA_ID = "Putaway Execution Criteria"
 
-# UNCONFIRMED — from mawm_user_directed_putaway_with_warnings.md's own
-# "Optional core API alternative" section, explicitly caveated there as
-# unconfirmed even by that document ("use this alternative only after
-# confirming the exact core endpoint contract... the core endpoint may
-# return warnings using a different response and override contract").
-# The document's actually-proven flow is the multi-call, stateful DMM
-# Mobile Facade workflow (start -> scan container -> scan location,
-# carrying a workflowVO across calls) — not used here, since this app's
-# stateless per-request Flask backend has no natural place to hold that
-# session state between a scan and the next one. This task-independent,
-# single-call alternative fits this app's TaskId-driven architecture
-# instead; see task_service.py's user-directed completion path.
-PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
-USER_DIRECTED_TRANSACTION_ID = "User Directed"
+# SAVED FOR LATER — "user directed putaway" (task-independent core API
+# alternative). Replaced 2026-08 by the substitute-location + reason-code
+# flow (see complete_putaway_line() in task_service.py and
+# mawm_substitute_location_to_user_directed_putaway.md), which keeps
+# using the same task-based fetch+commit sequence instead. Kept here,
+# commented out, in case this task-independent approach is needed again
+# — see move_container_user_directed() below, also commented out.
+# PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
+# USER_DIRECTED_TRANSACTION_ID = "User Directed"
+
+# CONFIRMED live against SS-DEMO — the document's own
+# `/api/putaway/config/services/reasonCodes/list` guess (hedged there as
+# "typically GET", no method captured) 404'd; the real endpoint is the
+# standard `{component}/api/{component}/{object}/search` shape every
+# other confirmed object in this app uses. Verified: returns the same
+# four reason codes the document's DMM-facade lookup captured (Damaged
+# Location, Location Full, Aisle Congested, Default Reason code for
+# putaway/RC1) — the value to send back to MAWM is `ReasonCodeId`
+# (human label is `Description`), not the document's `key`/`value`
+# pair (that shape belongs to the DMM facade's own lookup response,
+# not this core search endpoint).
+PUTAWAY_REASON_CODE_SEARCH_URL = f"{HOST}/putaway/api/putaway/reasonCode/search"
 
 # Tier 1 (mawm_api_library/_conventions/statuses.json, domain
 # "task_status") — CONFIRMED, and matches what was observed live:
@@ -415,65 +423,86 @@ def commit_putaway_move(
     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
 
 
-def move_container_user_directed(
-    container_id: str,
-    to_location_id: str,
-    item_id: str,
-    quantity,
-    token: str,
-    org: str,
-    location: str = None,
-    warning_overrides: Optional[Dict[str, str]] = None,
-) -> dict:
-    """UNCONFIRMED — user-directed putaway to an operator-chosen
-    destination, per mawm_user_directed_putaway_with_warnings.md's core
-    API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
-    this (not the document's proven DMM Mobile Facade flow) was chosen.
+# SAVED FOR LATER — "user directed putaway" (task-independent core API
+# alternative), superseded by the substitute-location + reason-code flow.
+# See the PUTAWAY_USER_DIRECTED_MOVE_URL comment above for context and
+# task_service.py's own commented-out _complete_putaway_line_user_directed()
+# for the orchestration this was called from. Uncomment both (and the two
+# constants above) to bring this path back.
+#
+# def move_container_user_directed(
+#     container_id: str,
+#     to_location_id: str,
+#     item_id: str,
+#     quantity,
+#     token: str,
+#     org: str,
+#     location: str = None,
+#     warning_overrides: Optional[Dict[str, str]] = None,
+# ) -> dict:
+#     """UNCONFIRMED — user-directed putaway to an operator-chosen
+#     destination, per mawm_user_directed_putaway_with_warnings.md's core
+#     API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
+#     this (not the document's proven DMM Mobile Facade flow) was chosen.
+#
+#     Task-independent by design (per the document: "no task DTO, no task
+#     ID, and no allocation ID in the active move") — takes ContainerId/
+#     ItemId/Quantity/ToLocationId directly, unlike the system-directed
+#     Path C flow which is keyed by TaskId.
+#
+#     `warning_overrides`, if given, is sent the same way as
+#     commit_putaway_move()'s — a top-level `userInputs` map — which is
+#     itself an unconfirmed extrapolation there; doubly so here, since
+#     this endpoint's own warning contract is explicitly unconfirmed by
+#     the source document.
+#     """
+#     token = normalize_token(token)
+#     payload = {
+#         "ContainerId": container_id,
+#         "ToLocationId": to_location_id,
+#         "TransactionId": USER_DIRECTED_TRANSACTION_ID,
+#         "ItemId": item_id,
+#         "ScannedQty": quantity,
+#     }
+#     if warning_overrides:
+#         payload["userInputs"] = warning_overrides
+#     response = _post(
+#         PUTAWAY_USER_DIRECTED_MOVE_URL,
+#         headers=build_task_headers(token, org, location=location),
+#         json=payload,
+#     )
+#     try:
+#         body = response.json()
+#     except Exception:
+#         body = {"raw": response.text[:1200]}
+#     if response.status_code not in (200, 201):
+#         raise RuntimeError(
+#             f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
+#         )
+#     if isinstance(body, dict):
+#         body["_requestPayload"] = payload
+#     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
 
-    Task-independent by design (per the document: "no task DTO, no task
-    ID, and no allocation ID in the active move") — takes ContainerId/
-    ItemId/Quantity/ToLocationId directly, unlike the system-directed
-    Path C flow which is keyed by TaskId.
 
-    TODO(reason codes): the document doesn't capture a reason-code
-    prompt anywhere in this flow, but a user overriding a system-
-    directed destination is exactly the kind of action MAWM often
-    requires one for. Not addressed here — revisit once this flow has
-    been exercised live and it's clear whether MAWM actually asks for
-    one on this endpoint.
-
-    `warning_overrides`, if given, is sent the same way as
-    commit_putaway_move()'s — a top-level `userInputs` map — which is
-    itself an unconfirmed extrapolation there; doubly so here, since
-    this endpoint's own warning contract is explicitly unconfirmed by
-    the source document.
+def search_putaway_reason_codes(token: str, org: str, location: str = None) -> List[dict]:
+    """CONFIRMED live — Substitute Location reason codes, via the
+    standard search convention (see PUTAWAY_REASON_CODE_SEARCH_URL's
+    comment for why this replaced the document's original guess).
+    Each row's `ReasonCodeId` is the value to send back to MAWM;
+    `Description` is the human label.
     """
     token = normalize_token(token)
-    payload = {
-        "ContainerId": container_id,
-        "ToLocationId": to_location_id,
-        "TransactionId": USER_DIRECTED_TRANSACTION_ID,
-        "ItemId": item_id,
-        "ScannedQty": quantity,
-    }
-    if warning_overrides:
-        payload["userInputs"] = warning_overrides
+    payload = {"Query": "", "Size": 1000, "Page": 0}
     response = _post(
-        PUTAWAY_USER_DIRECTED_MOVE_URL,
+        PUTAWAY_REASON_CODE_SEARCH_URL,
         headers=build_task_headers(token, org, location=location),
         json=payload,
     )
-    try:
-        body = response.json()
-    except Exception:
-        body = {"raw": response.text[:1200]}
-    if response.status_code not in (200, 201):
+    if response.status_code != 200:
         raise RuntimeError(
-            f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
+            f"reason code search failed: {response.status_code} {response.text[:500]}"
         )
-    if isinstance(body, dict):
-        body["_requestPayload"] = payload
-    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+    return _response_data_list(response.json())
 
 
 def extract_warning(body) -> Optional[Dict[str, str]]:

@@ -18,6 +18,7 @@ from task_service import (  # noqa: E402
     complete_line,
     complete_putaway_line,
     load_task,
+    preload_putaway_reason_codes,
     preload_task_transactions,
 )
 
@@ -26,7 +27,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.5"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -200,6 +201,21 @@ def preload_task_transactions_route():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/preload_putaway_reason_codes", methods=["POST"])
+def preload_putaway_reason_codes_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    try:
+        result = preload_putaway_reason_codes(token, org, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[PRELOAD_PUTAWAY_REASON_CODES] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/complete_line", methods=["POST"])
 def complete_line_route():
     data = _json()
@@ -215,6 +231,7 @@ def complete_line_route():
     strategy_id = (data.get("strategyId") or data.get("strategy_id") or "").strip()
     warning_overrides = data.get("warningOverrides") or data.get("warning_overrides") or None
     to_location_id = (data.get("toLocationId") or data.get("to_location_id") or "").strip()
+    reason_code_id = (data.get("reasonCodeId") or data.get("reason_code_id") or "").strip()
     if not task_id or not task_detail_id:
         return jsonify({"success": False, "error": "taskId and taskDetailId required"})
     if not transaction_id:
@@ -227,8 +244,8 @@ def complete_line_route():
             # Putaway, so "full" always routes here for now. A non-blank
             # toLocationId means the user edited the grid's destination
             # away from what was loaded — see complete_putaway_line()'s
-            # docstring for how that's dispatched to the user-directed
-            # flow instead of the default system-directed one.
+            # docstring for the required reasonCodeId and Substitute
+            # Location handling.
             result = complete_putaway_line(
                 token,
                 org,
@@ -238,6 +255,7 @@ def complete_line_route():
                 location=location,
                 warning_overrides=warning_overrides,
                 to_location_id=to_location_id or None,
+                reason_code_id=reason_code_id or None,
             )
         else:
             result = complete_line(

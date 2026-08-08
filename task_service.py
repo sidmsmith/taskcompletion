@@ -19,6 +19,15 @@ complete_putaway_line() implements full-line Putaway completion via the
 confirmed-by-user-capture Path C sequence documented in
 mawm_putaway_api_call_set_with_warning_handling.md (fetch next move,
 then commit — see mawm_client.fetch_putaway_move()/commit_putaway_move()).
+When the user edits the destination in the grid, the same Path C
+sequence is still used ("directed putaway is still used") but the
+fetched move's ToLocationId/ReasonCodeId are overridden before
+committing — see mawm_substitute_location_to_user_directed_putaway.md
+and _complete_putaway_line_system_directed()'s docstring. The earlier,
+task-independent "user directed putaway" approach
+(_complete_putaway_line_user_directed(), calling
+mawm_client.move_container_user_directed()) is commented out below,
+kept for reference in case it's needed again.
 complete_line()'s underlying mawm_client.complete_task() call remains a
 separate, still-unconfirmed placeholder for non-Putaway task types.
 """
@@ -35,9 +44,9 @@ from mawm_client import (
     complete_task,
     extract_warning,
     fetch_putaway_move,
-    move_container_user_directed,
     resolve_location,
     search_items,
+    search_putaway_reason_codes,
     search_task,
     search_task_transactions,
     task_status_description,
@@ -199,6 +208,28 @@ def preload_task_transactions(
     }
 
 
+def preload_putaway_reason_codes(
+    token: str, org: str, location: str = None
+) -> Dict[str, Any]:
+    """Reason codes for the Substitute Location flow (see
+    complete_putaway_line()'s docstring) — the frontend shows these in a
+    required modal before completing a line whose destination was edited.
+    `value` (ReasonCodeId) is what's sent back to MAWM; `key`
+    (Description) is the human label shown in the picker.
+    """
+    dest = resolve_location(org, location)
+    rows = search_putaway_reason_codes(token, org, location=dest)
+    entries = []
+    for row in rows:
+        value = str(_first(row, "ReasonCodeId") or "").strip()
+        key = str(_first(row, "Description") or "").strip() or value
+        if not value:
+            continue
+        entries.append({"key": key, "value": value})
+    entries.sort(key=lambda e: e["key"].lower())
+    return {"success": True, "count": len(entries), "entries": entries}
+
+
 def _line_state(
     token: str, org: str, task_id: str, task_detail_id: str, location: str = None
 ) -> Dict[str, Any]:
@@ -298,36 +329,37 @@ def complete_putaway_line(
     location: str = None,
     warning_overrides: Optional[Dict[str, str]] = None,
     to_location_id: Optional[str] = None,
+    reason_code_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Complete one Putaway task line in full.
 
-    Dispatches on whether the caller supplied a `to_location_id`: the
-    frontend only sends one when the user actually edited the line's
-    destination away from what was loaded (see public/app.js's
-    `.to-location-input`), so its mere presence here is trusted as "the
-    user wants a user-directed override" rather than re-derived —
-    consistent with how `mode` ("full"/"partial") is trusted from the
-    caller elsewhere in this module.
+    `to_location_id` is only sent by the frontend when the user actually
+    edited the line's destination away from what was loaded (see
+    public/app.js's `.to-location-input`) — its mere presence here is
+    trusted as "the user wants to substitute the destination," the same
+    way `mode` ("full"/"partial") is trusted from the caller elsewhere
+    in this module. When present, a `reason_code_id` is required — the
+    frontend enforces this via a required reason-code modal (see
+    preload_putaway_reason_codes()) before ever sending toLocationId,
+    so a substitution without one here means the frontend didn't
+    enforce that; fail rather than silently proceeding.
 
-    - No override: `_complete_putaway_line_system_directed` — the
-      confirmed-by-capture Path C sequence (fetch next move, then
-      commit) from mawm_putaway_api_call_set_with_warning_handling.md.
-    - Override present: `_complete_putaway_line_user_directed` — the
-      task-independent container/move call from
-      mawm_user_directed_putaway_with_warnings.md's core API
-      alternative (see that function's docstring for why this path was
-      chosen over the document's proven-but-stateful DMM flow).
+    Per mawm_substitute_location_to_user_directed_putaway.md, "directed
+    putaway is still used" for a substituted destination — this always
+    calls `_complete_putaway_line_system_directed()` (the same fetch+
+    commit Path C sequence as the default case), just with the fetched
+    move's ToLocationId/ReasonCodeId overridden before committing when
+    a substitution was requested.
     """
     if to_location_id and to_location_id.strip():
-        return _complete_putaway_line_user_directed(
-            token,
-            org,
-            task_id,
-            task_detail_id,
-            to_location_id.strip(),
-            location=location,
-            warning_overrides=warning_overrides,
-        )
+        if not reason_code_id:
+            return {
+                "success": False,
+                "error": "A reason code is required when changing the destination location",
+            }
+    else:
+        to_location_id = None
+
     return _complete_putaway_line_system_directed(
         token,
         org,
@@ -336,6 +368,8 @@ def complete_putaway_line(
         transaction_id,
         location=location,
         warning_overrides=warning_overrides,
+        to_location_id=to_location_id,
+        reason_code_id=reason_code_id,
     )
 
 
@@ -347,6 +381,8 @@ def _complete_putaway_line_system_directed(
     transaction_id: str,
     location: str = None,
     warning_overrides: Optional[Dict[str, str]] = None,
+    to_location_id: Optional[str] = None,
+    reason_code_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The confirmed-by-capture Path C sequence
     (mawm_putaway_api_call_set_with_warning_handling.md): fetch the next
@@ -363,6 +399,23 @@ def _complete_putaway_line_system_directed(
     before committing — the document's own worked example does exactly
     this (CompletedQuantity: 240 alongside Quantity: 240), and the
     fetched move itself doesn't set CompletedQuantity that way.
+
+    Substitute Location (`to_location_id` + `reason_code_id` given):
+    per mawm_substitute_location_to_user_directed_putaway.md, "directed
+    putaway is still used" for this case, not a separate endpoint — the
+    document's own captured move payload (Call 1's "current move") is
+    field-identical to this same InventoryMove object, including
+    ToLocationId. UNCONFIRMED extrapolation: the document only captures
+    the DMM Mobile Facade's stateful equivalent of this substitution
+    (SubstituteLocation -> EnterReasonCodeForSubstituteAction ->
+    AcceptLocationForUserDirectedPutaway, each carrying a workflowVO
+    across calls); it never captures the core commitAndFetchNextMove
+    payload with an overridden ToLocationId/ReasonCodeId directly. This
+    overrides InventoryMove.ToLocationId with `to_location_id` and adds
+    InventoryMove.ReasonCodeId = `reason_code_id` (PascalCase to match
+    every other InventoryMove field, vs. the DMM flow's camelCase
+    `reasonCodeId` input name) before committing. If MAWM rejects this
+    shape, the DMM stateful flow is the fallback to implement instead.
 
     If either call surfaces an overrideable WARNING (see
     mawm_client.extract_warning()) and the matching code isn't already
@@ -403,6 +456,10 @@ def _complete_putaway_line_system_directed(
             ),
         }
 
+    if to_location_id:
+        inventory_move["ToLocationId"] = to_location_id
+        inventory_move["ReasonCodeId"] = reason_code_id
+
     # Full completion: CompletedQuantity == Quantity, per the document's
     # own worked commit payload example.
     inventory_move["CompletedQuantity"] = inventory_move.get("Quantity")
@@ -425,71 +482,74 @@ def _complete_putaway_line_system_directed(
         "success": bool(ok),
         "taskDetailId": task_detail_id,
         "quantity": _num(inventory_move.get("CompletedQuantity") or 0),
+        "toLocationId": inventory_move.get("ToLocationId"),
         "mawmResponse": commit_resp,
         "error": None if ok else (commit_resp.get("message") or "Complete failed"),
     }
 
 
-def _complete_putaway_line_user_directed(
-    token: str,
-    org: str,
-    task_id: str,
-    task_detail_id: str,
-    to_location_id: str,
-    location: str = None,
-    warning_overrides: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    """User-directed putaway to an operator-chosen destination, per
-    mawm_user_directed_putaway_with_warnings.md's core API alternative
-    (see mawm_client.move_container_user_directed()'s docstring for why
-    this path, not that document's proven DMM Mobile Facade flow, was
-    used here).
-
-    Re-fetches the task fresh to get the line's real current ItemId/
-    SourceContainerId/remaining quantity (same defensive re-verification
-    receivingworkbench's own receive_line() does) — `to_location_id`
-    itself is the only thing trusted from the caller, since it's a pure
-    UI-state fact (what's currently typed in the grid), not fetched data.
-
-    TODO(reason codes): not implemented — see
-    mawm_client.move_container_user_directed()'s docstring. Revisit once
-    this flow has been exercised live.
-    """
-    state = _line_state(token, org, task_id, task_detail_id, location=location)
-    if not state.get("success"):
-        return state
-
-    line = state["line"]
-    remaining = _dec(line["remainingQuantity"])
-    if remaining <= 0:
-        return {"success": False, "error": "No remaining quantity on this line"}
-
-    move_resp = move_container_user_directed(
-        line["lpnId"],
-        to_location_id,
-        line["itemId"],
-        _num(remaining),
-        token,
-        org,
-        location=state["dest"],
-        warning_overrides=warning_overrides,
-    )
-    warning = extract_warning(move_resp)
-    if warning and warning["code"] not in (warning_overrides or {}):
-        return {
-            "success": False,
-            "warning": True,
-            "messageId": warning["code"],
-            "messageText": warning["text"],
-            "stage": "move",
-        }
-
-    ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
-    return {
-        "success": bool(ok),
-        "taskDetailId": task_detail_id,
-        "quantity": _num(remaining),
-        "toLocationId": to_location_id,
-        "mawmResponse": move_resp,
-        "error": None if ok else (move_resp.get("message") or "Complete failed"),
-    }
+# SAVED FOR LATER — "user directed putaway" (task-independent core API
+# alternative), superseded by the substitute-location + reason-code flow
+# implemented above. Kept for reference in case it's needed again — see
+# mawm_client.py's commented-out move_container_user_directed() and the
+# PUTAWAY_USER_DIRECTED_MOVE_URL/USER_DIRECTED_TRANSACTION_ID constants.
+#
+# def _complete_putaway_line_user_directed(
+#     token: str,
+#     org: str,
+#     task_id: str,
+#     task_detail_id: str,
+#     to_location_id: str,
+#     location: str = None,
+#     warning_overrides: Optional[Dict[str, str]] = None,
+# ) -> Dict[str, Any]:
+#     """User-directed putaway to an operator-chosen destination, per
+#     mawm_user_directed_putaway_with_warnings.md's core API alternative
+#     (see mawm_client.move_container_user_directed()'s docstring for why
+#     this path, not that document's proven DMM Mobile Facade flow, was
+#     used here).
+#
+#     Re-fetches the task fresh to get the line's real current ItemId/
+#     SourceContainerId/remaining quantity (same defensive re-verification
+#     receivingworkbench's own receive_line() does) — `to_location_id`
+#     itself is the only thing trusted from the caller, since it's a pure
+#     UI-state fact (what's currently typed in the grid), not fetched data.
+#     """
+#     state = _line_state(token, org, task_id, task_detail_id, location=location)
+#     if not state.get("success"):
+#         return state
+#
+#     line = state["line"]
+#     remaining = _dec(line["remainingQuantity"])
+#     if remaining <= 0:
+#         return {"success": False, "error": "No remaining quantity on this line"}
+#
+#     move_resp = move_container_user_directed(
+#         line["lpnId"],
+#         to_location_id,
+#         line["itemId"],
+#         _num(remaining),
+#         token,
+#         org,
+#         location=state["dest"],
+#         warning_overrides=warning_overrides,
+#     )
+#     warning = extract_warning(move_resp)
+#     if warning and warning["code"] not in (warning_overrides or {}):
+#         return {
+#             "success": False,
+#             "warning": True,
+#             "messageId": warning["code"],
+#             "messageText": warning["text"],
+#             "stage": "move",
+#         }
+#
+#     ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
+#     return {
+#         "success": bool(ok),
+#         "taskDetailId": task_detail_id,
+#         "quantity": _num(remaining),
+#         "toLocationId": to_location_id,
+#         "mawmResponse": move_resp,
+#         "error": None if ok else (move_resp.get("message") or "Complete failed"),
+#     }

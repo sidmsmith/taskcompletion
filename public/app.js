@@ -43,6 +43,10 @@
     warningMessageId: document.getElementById("warningMessageId"),
     warningMessageText: document.getElementById("warningMessageText"),
     warningConfirmBtn: document.getElementById("warningConfirmBtn"),
+    reasonCodeInfo: document.getElementById("reasonCodeInfo"),
+    reasonCodeSelect: document.getElementById("reasonCodeSelect"),
+    reasonCodeHint: document.getElementById("reasonCodeHint"),
+    reasonCodeConfirmBtn: document.getElementById("reasonCodeConfirmBtn"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
@@ -316,7 +320,7 @@
     return rem > 0 ? rem : 0;
   }
 
-  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides, toLocationId) {
+  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides, toLocationId, reasonCodeId) {
     return api("complete_line", {
       org: state.org,
       token: state.token,
@@ -328,6 +332,68 @@
       transactionId: TRANSACTION_ID,
       warningOverrides: warningOverrides || undefined,
       toLocationId: toLocationId || undefined,
+      reasonCodeId: reasonCodeId || undefined,
+    });
+  }
+
+  /**
+   * Substitute Location requires a reason code (see
+   * task_service.complete_putaway_line()). Fetches the live reason-code
+   * list fresh each time (small, static-ish lookup — not worth caching)
+   * and shows a required-selection modal. Resolves the selected value,
+   * or null if the user cancels / picks nothing and closes the modal.
+   */
+  async function promptReasonCode(line, toLocationId) {
+    el.reasonCodeInfo.textContent =
+      "Line " + line.lineNumber + " destination changed to " + toLocationId + ".";
+    el.reasonCodeSelect.innerHTML = '<option value="">Loading…</option>';
+    el.reasonCodeHint.textContent = "";
+    reasonCodeModal.show();
+    try {
+      const data = await api("preload_putaway_reason_codes", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+      });
+      const entries = data.success ? data.entries || [] : [];
+      el.reasonCodeSelect.innerHTML = ['<option value="">-- Select --</option>']
+        .concat(
+          entries.map(
+            (e) => `<option value="${escapeAttr(e.value)}">${escapeHtml(e.key)}</option>`
+          )
+        )
+        .join("");
+      if (!entries.length) {
+        el.reasonCodeHint.textContent = data.error || "No reason codes available.";
+      }
+    } catch (e) {
+      el.reasonCodeSelect.innerHTML = '<option value="">-- Select --</option>';
+      el.reasonCodeHint.textContent = e.message || String(e);
+    }
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      function finish(result) {
+        if (resolved) return;
+        resolved = true;
+        el.reasonCodeConfirmBtn.removeEventListener("click", onConfirm);
+        reasonCodeModalEl.removeEventListener("hidden.bs.modal", onHidden);
+        resolve(result);
+      }
+      function onConfirm() {
+        const value = el.reasonCodeSelect.value;
+        if (!value) {
+          el.reasonCodeHint.textContent = "A reason code is required.";
+          return;
+        }
+        reasonCodeModal.hide();
+        finish(value);
+      }
+      function onHidden() {
+        finish(null);
+      }
+      el.reasonCodeConfirmBtn.addEventListener("click", onConfirm);
+      reasonCodeModalEl.addEventListener("hidden.bs.modal", onHidden);
     });
   }
 
@@ -366,16 +432,16 @@
    * failure), or `{ success: false, cancelled: true }` if the user
    * cancels out of a warning.
    */
-  async function completeLineWithWarningHandling(taskDetailId, mode, quantity, toLocationId) {
+  async function completeLineWithWarningHandling(taskDetailId, mode, quantity, toLocationId, reasonCodeId) {
     const overrides = {};
-    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId);
+    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId, reasonCodeId);
     while (result && result.warning) {
       const confirmed = await showWarningModal(result.messageId, result.messageText);
       if (!confirmed) {
         return { success: false, cancelled: true, error: "Cancelled after warning." };
       }
       overrides[result.messageId] = result.messageId;
-      result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId);
+      result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId, reasonCodeId);
     }
     return result;
   }
@@ -389,9 +455,17 @@
       return;
     }
     const toLocationId = getLocationOverride(line.taskDetailId);
+    let reasonCodeId = null;
+    if (toLocationId) {
+      reasonCodeId = await promptReasonCode(line, toLocationId);
+      if (!reasonCodeId) {
+        setActionStatus("Cancelled — a reason code is required to change the destination.", "");
+        return;
+      }
+    }
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
-      const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId);
+      const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId, reasonCodeId);
       if (!result.success) {
         if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
@@ -494,9 +568,18 @@
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
       const toLocationId = getLocationOverride(line.taskDetailId);
+      let reasonCodeId = null;
+      if (toLocationId) {
+        setBusy(false);
+        reasonCodeId = await promptReasonCode(line, toLocationId);
+        if (!reasonCodeId) {
+          cancelled = true;
+          break;
+        }
+      }
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId);
+        const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId, reasonCodeId);
         if (result.success) {
           succeeded++;
         } else if (result.cancelled) {
@@ -557,6 +640,8 @@
     : null;
   const warningModalEl = document.getElementById("warningModal");
   const warningModal = window.bootstrap ? new window.bootstrap.Modal(warningModalEl) : null;
+  const reasonCodeModalEl = document.getElementById("reasonCodeModal");
+  const reasonCodeModal = window.bootstrap ? new window.bootstrap.Modal(reasonCodeModalEl) : null;
 
   el.fullLineBtn.addEventListener("click", completeFullLine);
   el.partialLineBtn.addEventListener("click", openPartialModal);
