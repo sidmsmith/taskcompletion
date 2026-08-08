@@ -207,12 +207,13 @@ auto-detect (`task_service.resolve_search()`):
    blank; fails cleanly if the LPN holds more than one item (mixed-LPN
    putaway isn't handled).
 4. Completing that synthetic line goes through
-   `complete_container_putaway()` → the revived
-   `move_container_user_directed()` — **no reason code required** here
-   (unlike Substitute Location: there's no system-directed default being
-   overridden). **UNCONFIRMED**: nobody has completed a no-task
-   container through this app yet; only the read/search side has been
-   verified live.
+   `complete_container_putaway()` → the DMM Mobile Facade "User
+   Directed Putaway" flow (see the confirmed section above) — **no
+   reason code required** here (unlike Substitute Location: there's no
+   system-directed default being overridden). **CONFIRMED live,
+   2026-08-08**: both the plain-success and the warning-and-override
+   paths, with real inventory moves verified by re-query, not just
+   `success: true` — see above.
 
 **To Location validation now applies everywhere, always** (per explicit
 instruction, not just the no-task case), and is now preloaded rather
