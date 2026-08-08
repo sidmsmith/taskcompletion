@@ -105,6 +105,45 @@ def _first(row: dict, *keys):
     return None
 
 
+def _package_conversion_factor(item: dict, code: str) -> tuple[Decimal, str]:
+    """Ported from receivingworkbench's rw_service.py
+    `_package_conversion_factor()` (2026-08-08, per explicit
+    instruction to reference that app's already-confirmed UOM logic —
+    same shape of problem: a bare quantity + raw UOM *code* (e.g.
+    "LPN") is not directly displayable, since MAWM quantities are
+    always in the item's base unit, not the code's own unit).
+
+    `code` is the code a quantity is expressed against — TaskDetail's
+    `UomTypeId` for a task line, or the item's own `DisplayUomId` for a
+    no-task container line (there's no per-line "shipped as X" concept
+    there). Looks up the item's `ItemPackage[]` for the *Standard*
+    entry whose `StandardQuantityUomId` matches that code; `Quantity`
+    on that entry is the real conversion factor (base units per one of
+    that code), `UomIdDisplay`/`UomId` its human label. Confirmed live,
+    2026-08-08: item `3000223`'s "LPN" entry has `Quantity: 50,
+    UomId: "Case"` — its 50-base-unit Substitute Location test line
+    earlier this session was in fact exactly 1 Case, not "50 LPN" (which
+    would misread as 50 containers, since this app already uses "LPN"
+    to mean a container id elsewhere in the UI).
+
+    Falls back to (1, code) when the item has no matching standard
+    package entry — same as receivingworkbench, so an unresolvable UOM
+    degrades to showing the raw base quantity with its raw code instead
+    of silently guessing.
+    """
+    code = str(code or "").strip()
+    for pkg in (item or {}).get("ItemPackage") or []:
+        if pkg.get("Standard") is not True:
+            continue
+        if str(pkg.get("StandardQuantityUomId") or "").strip() != code:
+            continue
+        factor = _dec(pkg.get("Quantity"))
+        if factor > 0:
+            label = str(pkg.get("UomIdDisplay") or pkg.get("UomId") or code)
+            return factor, label
+    return Decimal("1"), code
+
+
 def _task_type_label(task_type: str) -> str:
     key = str(task_type or "").strip().upper()
     return TASK_TYPE_LABELS.get(key, key or "")
@@ -128,11 +167,20 @@ def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = Non
 
     lines: List[dict] = []
     for idx, line in enumerate(raw_lines, start=1):
-        planned = _dec(_first(line, "Quantity", "PlannedQuantity") or 0)
-        completed = _dec(_first(line, "CompletedQuantity") or 0)
-        remaining = planned - completed
+        planned_base = _dec(_first(line, "Quantity", "PlannedQuantity") or 0)
+        completed_base = _dec(_first(line, "CompletedQuantity") or 0)
+        remaining_base = planned_base - completed_base
         item_id = str(_first(line, "ItemId") or "")
         item = items.get(item_id) or {}
+        uom_code = str(_first(line, "UomTypeId", "UomId", "QuantityUomId") or "")
+        # 2026-08-08 (see _package_conversion_factor()'s docstring):
+        # Quantity/CompletedQuantity are base-unit; converted to the
+        # item's real pack quantity for display. uomFactor rides along
+        # so the frontend can convert an edited Completed Qty (entered
+        # in this same display unit) back to base units before it's
+        # ever sent anywhere — adjust_ilpn_quantities()/MAWM itself
+        # only ever deal in base units.
+        factor, uom_label = _package_conversion_factor(item, uom_code)
         lines.append(
             {
                 "lineNumber": idx,
@@ -147,10 +195,13 @@ def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = Non
                     _first(line, "TargetContainerId", "SourceContainerId", "WorkingContainerId")
                     or ""
                 ),
-                "uomId": str(_first(line, "UomTypeId", "UomId", "QuantityUomId") or ""),
-                "plannedQuantity": _num(planned),
-                "completedQuantity": _num(completed),
-                "remainingQuantity": _num(remaining if remaining > 0 else 0),
+                "uomId": uom_label,
+                "uomFactor": _num(factor),
+                "plannedQuantity": _num(planned_base / factor),
+                "completedQuantity": _num(completed_base / factor),
+                "remainingQuantity": _num(
+                    (remaining_base if remaining_base > 0 else Decimal("0")) / factor
+                ),
                 "mixedItems": None,  # only ever set on a no_task MIXED container line, see resolve_search()
             }
         )
@@ -240,29 +291,46 @@ def resolve_search(
 
     mixed = len(inv_rows) > 1
     mixed_items = None
+    uom_label = ""
+    factor = Decimal("1")
     if mixed:
         # 2026-08-08, per explicit instruction: "MIXED" now shows in the
         # Item column (blank Description), not the other way around.
         # mixedItems carries each real line's own detail so the frontend
         # can expand this summary row into per-item editable rows (see
         # adjust_ilpn_quantities()) instead of just displaying a total.
+        # No single per-line UOM code exists for a no-task container
+        # (unlike a task line's UomTypeId) — each item's own
+        # DisplayUomId backs its own conversion instead (see
+        # _package_conversion_factor()'s docstring); the summary row's
+        # aggregate stays a bare base-unit total (uomId left blank —
+        # mixed items may use different units, nothing coherent to
+        # label it with).
         item_id = "MIXED"
         description = ""
         qty = sum((_dec(r.get("OnHand")) for r in inv_rows), Decimal("0"))
-        mixed_items = [
-            {
-                "itemId": str(r.get("ItemId") or ""),
-                "description": str(
-                    (items.get(str(r.get("ItemId") or "")) or {}).get("Description") or ""
-                ),
-                "quantity": _num(_dec(r.get("OnHand"))),
-            }
-            for r in inv_rows
-        ]
+        mixed_items = []
+        for r in inv_rows:
+            row_item_id = str(r.get("ItemId") or "")
+            row_item = items.get(row_item_id) or {}
+            item_factor, item_uom_label = _package_conversion_factor(
+                row_item, str(row_item.get("DisplayUomId") or "")
+            )
+            mixed_items.append(
+                {
+                    "itemId": row_item_id,
+                    "description": str(row_item.get("Description") or ""),
+                    "quantity": _num(_dec(r.get("OnHand")) / item_factor),
+                    "uomId": item_uom_label,
+                    "uomFactor": _num(item_factor),
+                }
+            )
     elif inv_rows:
         item_id = str(inv_rows[0].get("ItemId") or "")
-        description = str((items.get(item_id) or {}).get("Description") or "")
-        qty = _dec(inv_rows[0].get("OnHand"))
+        item = items.get(item_id) or {}
+        description = str(item.get("Description") or "")
+        factor, uom_label = _package_conversion_factor(item, str(item.get("DisplayUomId") or ""))
+        qty = _dec(inv_rows[0].get("OnHand")) / factor
     else:
         item_id = ""
         description = ""
@@ -276,7 +344,8 @@ def resolve_search(
         "fromLocationId": current_location,
         "toLocationId": "",
         "lpnId": search_value,
-        "uomId": "",
+        "uomId": uom_label,
+        "uomFactor": _num(factor),
         "plannedQuantity": _num(qty),
         "completedQuantity": 0,
         "remainingQuantity": _num(qty),

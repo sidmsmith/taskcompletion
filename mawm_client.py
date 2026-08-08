@@ -634,6 +634,11 @@ def search_items(
     Neither Task nor TaskDetail carries an item description field, so
     this is called after loading a task to fill that column in — same
     endpoint/shape receivingworkbench already uses for the same reason.
+
+    Template extended 2026-08-08 to also fetch `DisplayUomId` and
+    `ItemPackage[]` (exact same shape receivingworkbench's own
+    search_items() confirmed live) — see task_service's UOM-resolution
+    helpers, ported from that app, for how these back the UOM column.
     """
     clean = [str(i).strip() for i in item_ids if str(i).strip()]
     if not clean:
@@ -645,7 +650,19 @@ def search_items(
         "Query": f"ItemId in ({quoted})",
         "Page": 0,
         "Size": max(len(clean), 50),
-        "Template": {"ItemId": "", "Description": ""},
+        "Template": {
+            "ItemId": "",
+            "Description": "",
+            "DisplayUomId": "",
+            "ItemPackage": [
+                {
+                    "UomId": None,
+                    "StandardQuantityUomId": None,
+                    "Quantity": None,
+                    "Standard": None,
+                }
+            ],
+        },
     }
     headers = build_task_headers(token, org, location=location)
     headers["FacilityId"] = resolve_location(org, location)

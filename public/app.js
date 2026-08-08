@@ -326,7 +326,7 @@
           <td></td>
           <td></td>
           <td class="col-qty-wide">${escapeHtml(item.quantity)}</td>
-          <td class="col-uom"></td>
+          <td class="col-uom">${escapeHtml(item.uomId)}</td>
           <td>
             <input
               type="number"
@@ -334,6 +334,7 @@
               data-parent-task-detail-id="${escapeAttr(line.taskDetailId)}"
               data-item-id="${escapeAttr(item.itemId)}"
               data-default-qty="${escapeAttr(item.quantity)}"
+              data-uom-factor="${escapeAttr(item.uomFactor)}"
               value="${escapeAttr(item.quantity)}"
               min="0"
               step="any"
@@ -372,6 +373,7 @@
               class="form-control completed-qty-input"
               data-task-detail-id="${escapeAttr(line.taskDetailId)}"
               data-default-qty="${escapeAttr(remaining)}"
+              data-uom-factor="${escapeAttr(line.uomFactor)}"
               value="${escapeAttr(remaining)}"
               min="0"
               step="any"
@@ -465,6 +467,15 @@
    * normal single-item line, reuses getCompletedQtyOverride()'s
    * "only if changed" value.
    */
+  /**
+   * `desiredQty` sent to the backend is always base units (2026-08-08
+   * — see task_service._package_conversion_factor()'s docstring): every
+   * quantity shown/edited in the UI is in the item's *display* pack
+   * unit (e.g. "10 Units" for 240 base units at a 24x factor), so the
+   * box's raw value is multiplied back up by its own
+   * `data-uom-factor` here before it's ever sent anywhere — MAWM
+   * itself and adjust_ilpn_quantities() only deal in base units.
+   */
   function collectItemAdjustments(line) {
     if (line.mixedItems) {
       return line.mixedItems.map((item) => {
@@ -482,23 +493,29 @@
             CSS.escape(item.itemId) +
             '"]'
         );
-        const value = input ? Number(input.value) : item.quantity;
+        const factor = input ? Number(input.dataset.uomFactor) || 1 : item.uomFactor || 1;
+        const displayValue = input ? Number(input.value) : item.quantity;
+        const baseValue = Number.isFinite(displayValue) ? displayValue * factor : item.quantity * factor;
         return {
           itemId: item.itemId,
-          desiredQty: Number.isFinite(value) ? value : item.quantity,
+          desiredQty: baseValue,
           reasonCode: select ? select.value : DEFAULT_REASON_CODE,
         };
       });
     }
     const override = getCompletedQtyOverride(line.taskDetailId);
     if (override === undefined) return [];
+    const input = el.linesBody.querySelector(
+      '.completed-qty-input[data-task-detail-id="' + CSS.escape(line.taskDetailId) + '"]'
+    );
+    const factor = (input && Number(input.dataset.uomFactor)) || 1;
     const reasonSelect = el.linesBody.querySelector(
       '.reason-code-select[data-task-detail-id="' + CSS.escape(line.taskDetailId) + '"]'
     );
     return [
       {
         itemId: line.itemId,
-        desiredQty: override,
+        desiredQty: override * factor,
         reasonCode: reasonSelect ? reasonSelect.value : DEFAULT_REASON_CODE,
       },
     ];

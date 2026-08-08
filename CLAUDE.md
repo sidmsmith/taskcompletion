@@ -258,14 +258,10 @@ than just 404ing. Don't call it against a real environment without
 either a real RF-session capture to correct it against first, or
 explicit sign-off to probe it live.
 
-**Open question, not yet resolved**: `TaskDetail.UomTypeId` (e.g.
-`"LPN"`) does not appear to be a literal per-unit UOM for `Quantity`
-(240 in the test task) the way `receivingworkbench` resolves ASN line
-UOMs via `ItemPackage[]` — showing `"240 LPN"` would misread as "240
-LPN containers." The frontend currently shows planned/completed
-quantity as a bare number with no unit suffix for this reason;
-`uomId` is still threaded through the API response for when this gets
-resolved.
+**RESOLVED, 2026-08-08 (fifth session)** — see the "UOM display and
+conversion" section further down: `TaskDetail.UomTypeId` is a code into
+the item's `ItemPackage[]`, not a display label, and `Quantity` really
+is base-unit and needed real conversion, not just a label fix.
 
 ## Multi-LPN search, editable Completed Qty, LPN column (2026-08-08, third session)
 
@@ -509,6 +505,56 @@ undefined  on line N" in the frontend instead of the real amount.
 Fixed by including the actual post-adjustment on-hand quantity
 (`rows[0]["OnHand"]`, already fetched for the single-item check) in the
 response.
+
+## UOM display and conversion, full-width results table (2026-08-08, fifth session)
+
+**UOM display and conversion** — `task_service._package_conversion_factor()`,
+ported from `receivingworkbench`'s already-confirmed `rw_service.py`
+`_package_conversion_factor()`, per explicit instruction to reference
+that app's logic rather than re-derive it. Resolves the real story
+behind the "Open question" above: `TaskDetail.UomTypeId` (e.g. `"LPN"`)
+is a *code*, not a label — `Quantity`/`CompletedQuantity` are always
+base-unit, and the item's `ItemPackage[]` (now fetched by
+`mawm_client.search_items()`, Template extended to match
+receivingworkbench's exactly) holds the real conversion factor and
+human label for that code. **CONFIRMED live**: item `50002217`
+(`IBPWIBPT0929`) — raw 240 base units, `UomTypeId="LPN"` resolves to
+`ItemPackage` entry `{Quantity: 24, UomId: "units"}` → displays as
+`10 Units`, not the misleading raw `"240 LPN"`. Item `3000223`
+similarly resolves its own "LPN" code to `Case`/factor 50 — its earlier
+50-unit Substitute Location test line (this session's history) really
+was exactly 1 Case.
+
+This is a **real, bidirectional conversion**, not just a display fix —
+matching how receivingworkbench's own `receive_line()` converts a
+user-entered display-unit quantity back to base units before ever
+calling MAWM. Every line now carries `uomFactor` alongside the already-
+converted `uomId`/`plannedQuantity`/`completedQuantity`/
+`remainingQuantity`; `public/app.js`'s Completed Qty inputs
+(`.completed-qty-input`/`.mixed-qty-input`) carry `data-uom-factor`, and
+`collectItemAdjustments()` multiplies the box's display-unit value back
+up by that factor before it's ever sent as `desiredQty` — MAWM and
+`adjust_ilpn_quantities()` only ever see base units. No-task/container
+lines resolve their factor from the item's own `DisplayUomId` instead
+of a per-line code (there's no "shipped as X" concept for on-hand
+inventory) — including per-item for a MIXED container's accordion rows.
+
+The UOM label itself shows in its own column between Planned Qty and
+Completed Qty (no header text) — `public/index.html`'s `.col-uom`,
+added in the fourth session but was rendering blank until this
+conversion actually resolved a label to put there.
+
+**Full-width results table**: `.app-shell`'s `max-width: 1200px` /
+`margin: 0 auto` were removed (per explicit instruction — "running out
+of real estate"). The filters/auth screen keeps its own narrower
+centered width via its `.card-panel`'s own inline `max-width: 620px`,
+so login/search still reads comfortably narrow while the results
+table now uses the full viewport width minus the shell's existing
+padding.
+
+**Complete Line / Complete All buttons** moved from centered to
+left-aligned (`.action-toolbar`'s `justify-content: center` →
+`flex-start`), per explicit instruction.
 
 ## Known-good test Task Id
 
