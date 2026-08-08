@@ -41,6 +41,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -78,15 +79,56 @@ PUTAWAY_FETCH_MOVE_URL_TEMPLATE = f"{HOST}/putaway/api/putaway/execution/task/{{
 PUTAWAY_COMMIT_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/transfer/commitAndFetchNextMove"
 PUTAWAY_EXECUTION_CRITERIA_ID = "Putaway Execution Criteria"
 
-# Confirmed-by-user-provided-capture (mawm_user_directed_putaway_with_
-# warnings.md's "core API alternative") — task-independent putaway,
-# revived 2026-08-08 for the no-open-task iLPN case (see
-# task_service.complete_container_putaway()). Not used for the
-# Substitute-Location-on-an-existing-task case — that still goes through
-# the system-directed fetch+commit sequence with an overridden
-# destination (see _complete_putaway_line_system_directed()).
+# SUPERSEDED AGAIN 2026-08-08 — this task-independent core API call's own
+# warning-override mechanism was confirmed live NOT to work (resubmitting
+# with userInputs against a real DCI::120 warning returned the identical
+# warning again). Kept defined (not commented out — still called from the
+# commented-out orchestration below) since the URL/payload shape itself
+# is still correct, just superseded by the DMM Mobile Facade flow for
+# the no-open-task iLPN case — see PUTAWAY_WORKFLOW_INIT_URL below and
+# task_service.complete_container_putaway().
 PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
 USER_DIRECTED_TRANSACTION_ID = "User Directed"
+
+# CONFIRMED live (2026-08-08 HAR capture of a real mobile RF session,
+# start to finish) — the DMM Mobile Facade "User Directed Putaway" flow.
+# Both source documents said the bootstrap/init call "is not present in
+# the captured responses, do not invent one" — it's this, a genuinely
+# different URL shape from workflow/execute (under .../api/dmmobile-
+# facade/, not .../services/rest/), body is a literal `{}`, everything
+# driven by query params. The full confirmed sequence:
+#   1. workflow_init("User Directed", "Putaway") -> fresh workflowVO,
+#      currentState="AcceptContainerForUserDirectedPutaway".
+#   2. Set that workflowVO's header.state.scannedContainerBarcode =
+#      <container>, then workflow_execute(..., "AcceptContainerFor
+#      UserDirectedPutaway", that workflowVO).
+#   3. Set the PRIOR call's returned workflowVO's
+#      header.state.scannedLocationBarcode = <location>, then
+#      workflow_execute(..., "AcceptLocationForUserDirectedPutaway",
+#      that workflowVO).
+# CONFIRMED via HAR body inspection (2026-08-08): the scanned value is
+# NOT a separate top-level sibling field in the request body (an
+# earlier guess assumed `{"workflowVO": ..., "scannedContainerBarcode":
+# ...}` and it silently produced a generic serverError) — it lives
+# inside `workflowVO.header.state`, mutated in place exactly like
+# warningOverrideList below.
+# A warning at either step 2 or 3 comes back as `status: "FAILURE"` with
+# `workflowVO.header.state.errorVOList` containing an entry with
+# `errorCategory: "WARNING"` (extract_warning() already handles this
+# shape). CONFIRMED live exactly how to clear it: take the SAME
+# workflowVO the warning response returned, add the warning's errorCode
+# into `header.state.warningOverrideList`, and resubmit that whole
+# object back to the SAME action — nothing else changes. No separate
+# override field, no session store needed on our side (see
+# apply_warning_overrides() and task_service.complete_container_putaway()
+# for how this app replays the whole sequence per attempt instead of
+# round-tripping the intermediate workflowVO through the frontend).
+PUTAWAY_WORKFLOW_INIT_URL = f"{HOST}/dmmobile-facade/api/dmmobile-facade/workflow/init"
+PUTAWAY_WORKFLOW_EXECUTE_URL_TEMPLATE = (
+    f"{HOST}/dmmobile-facade/services/rest/workflow/execute/"
+    "workflowScriptName/{script}/stateName/{state}/actionName/{action}"
+)
+PUTAWAY_WORKFLOW_SCRIPT_NAME = "Putaway"
 
 # CONFIRMED live — resolves the open (not Completed/Canceled) Putaway
 # task for a container, and an iLPN's current location + on-hand
@@ -570,65 +612,152 @@ def commit_putaway_move(
     return body
 
 
-def move_container_user_directed(
-    container_id: str,
-    to_location_id: str,
-    item_id: str,
-    quantity,
-    token: str,
-    org: str,
-    location: str = None,
-    warning_overrides: Optional[Dict[str, str]] = None,
+# SUPERSEDED 2026-08-08 — this call's own warning-override mechanism
+# (userInputs, an extrapolation from the DMM flow's documented pattern)
+# was confirmed live NOT to work: resubmitting against a real DCI::120
+# warning returned the identical warning again. Replaced by the
+# confirmed-live DMM Mobile Facade flow (workflow_init()/
+# workflow_execute()/apply_warning_overrides() below). Kept, commented
+# out, in case this task-independent single-call approach is ever useful
+# again — e.g. if a future capture confirms its real override contract.
+#
+# def move_container_user_directed(
+#     container_id: str,
+#     to_location_id: str,
+#     item_id: str,
+#     quantity,
+#     token: str,
+#     org: str,
+#     location: str = None,
+#     warning_overrides: Optional[Dict[str, str]] = None,
+# ) -> dict:
+#     """UNCONFIRMED — user-directed putaway to an operator-chosen
+#     destination, per mawm_user_directed_putaway_with_warnings.md's core
+#     API alternative.
+#
+#     Task-independent by design (per the document: "no task DTO, no task
+#     ID, and no allocation ID in the active move") — takes ContainerId/
+#     ItemId/Quantity/ToLocationId directly, unlike the system-directed
+#     Path C flow which is keyed by TaskId.
+#     """
+#     token = normalize_token(token)
+#     payload = {
+#         "ContainerId": container_id,
+#         "ToLocationId": to_location_id,
+#         "TransactionId": USER_DIRECTED_TRANSACTION_ID,
+#         "ItemId": item_id,
+#         "ScannedQty": quantity,
+#     }
+#     if warning_overrides:
+#         payload["userInputs"] = warning_overrides
+#     response = _post(
+#         PUTAWAY_USER_DIRECTED_MOVE_URL,
+#         headers=build_task_headers(token, org, location=location),
+#         json=payload,
+#     )
+#     try:
+#         body = response.json()
+#     except Exception:
+#         body = {"raw": response.text[:1200]}
+#     if not isinstance(body, dict):
+#         body = {"data": body}
+#     if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+#         raise RuntimeError(
+#             f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
+#         )
+#     body["_requestPayload"] = payload
+#     return body
+
+
+def workflow_init(
+    transaction_id: str, transaction_type: str, token: str, org: str, location: str = None
 ) -> dict:
-    """UNCONFIRMED — user-directed putaway to an operator-chosen
-    destination, per mawm_user_directed_putaway_with_warnings.md's core
-    API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
-    this (not the document's proven DMM Mobile Facade flow) was chosen.
-
-    Task-independent by design (per the document: "no task DTO, no task
-    ID, and no allocation ID in the active move") — takes ContainerId/
-    ItemId/Quantity/ToLocationId directly, unlike the system-directed
-    Path C flow which is keyed by TaskId. This is exactly why it was
-    revived for task_service.complete_container_putaway(): the no-open-
-    task iLPN case has no TaskId to key off of either.
-
-    `warning_overrides`, if given, is sent the same way as
-    commit_putaway_move()'s — a top-level `userInputs` map — which is
-    itself an unconfirmed extrapolation there; doubly so here, since
-    this endpoint's own warning contract is explicitly unconfirmed by
-    the source document.
+    """CONFIRMED live — bootstrap a fresh DMM Mobile Facade workflow
+    session (see PUTAWAY_WORKFLOW_INIT_URL's comment for the full
+    confirmed sequence). Body is a literal `{}`; everything is driven by
+    the query params. Returns the initial `{"workflowVO": {...}}`.
     """
     token = normalize_token(token)
-    payload = {
-        "ContainerId": container_id,
-        "ToLocationId": to_location_id,
-        "TransactionId": USER_DIRECTED_TRANSACTION_ID,
-        "ItemId": item_id,
-        "ScannedQty": quantity,
-    }
-    if warning_overrides:
-        payload["userInputs"] = warning_overrides
-    response = _post(
-        PUTAWAY_USER_DIRECTED_MOVE_URL,
-        headers=build_task_headers(token, org, location=location),
-        json=payload,
+    url = (
+        f"{PUTAWAY_WORKFLOW_INIT_URL}"
+        f"?transactionId={quote(transaction_id)}&transactionType={quote(transaction_type)}"
     )
+    response = _post(url, headers=build_task_headers(token, org, location=location), json={})
     try:
         body = response.json()
     except Exception:
         body = {"raw": response.text[:1200]}
-    # See fetch_putaway_move()'s comment — same fix, same reason. This is
-    # the exact function LPN00953's Substitute-Location-with-no-open-task
-    # test hit: a real WARNING came back over a non-2xx status and was
-    # being raised as a hard error before extract_warning() ever saw it.
     if not isinstance(body, dict):
         body = {"data": body}
     if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
         raise RuntimeError(
-            f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
+            f"workflow init failed: {response.status_code} {response.text[:800]}"
         )
-    body["_requestPayload"] = payload
     return body
+
+
+def workflow_execute(
+    state_name: str,
+    action_name: str,
+    workflow_vo: dict,
+    token: str,
+    org: str,
+    location: str = None,
+) -> dict:
+    """CONFIRMED live — resubmit a DMM Mobile Facade workflow action.
+    `workflow_vo` must be the complete object from the immediately
+    preceding call (init or execute) — every other field it carries
+    (breadCrumbs, idempotencyKey, etc.) is required as-is. The scanned
+    input for this action (e.g. `scannedContainerBarcode`,
+    `scannedLocationBarcode`) is CONFIRMED (via HAR body inspection,
+    2026-08-08) to live *inside* `workflow_vo["header"]["state"]` —
+    the caller must set it there before calling this, the same way
+    `apply_warning_overrides()` mutates `header.state.warningOverrideList`.
+    There is NO separate top-level sibling field in the request body;
+    an earlier version of this function guessed one
+    (`{"workflowVO": ..., "scannedContainerBarcode": ...}`) and it
+    silently produced a generic `serverError` — the server never saw
+    the scan because it only reads it from `header.state`.
+    See PUTAWAY_WORKFLOW_INIT_URL's comment for the confirmed warning
+    shape and how apply_warning_overrides() clears one.
+    """
+    token = normalize_token(token)
+    url = PUTAWAY_WORKFLOW_EXECUTE_URL_TEMPLATE.format(
+        script=PUTAWAY_WORKFLOW_SCRIPT_NAME, state=state_name, action=action_name
+    )
+    payload = {"workflowVO": workflow_vo}
+    response = _post(url, headers=build_task_headers(token, org, location=location), json=payload)
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+        raise RuntimeError(
+            f"workflow execute ({action_name}) failed: {response.status_code} {response.text[:800]}"
+        )
+    return body
+
+
+def apply_warning_overrides(workflow_vo: dict, warning_overrides: Optional[Dict[str, str]]) -> dict:
+    """Mutates (and returns) `workflow_vo` so its
+    `header.state.warningOverrideList` includes every code in
+    `warning_overrides` — the CONFIRMED live mechanism for clearing a
+    DMM Mobile Facade warning (see PUTAWAY_WORKFLOW_INIT_URL's comment).
+    No-op if there's nothing to apply.
+    """
+    if not warning_overrides or not isinstance(workflow_vo, dict):
+        return workflow_vo
+    state = (workflow_vo.get("header") or {}).get("state")
+    if not isinstance(state, dict):
+        return workflow_vo
+    existing = list(state.get("warningOverrideList") or [])
+    for code in warning_overrides:
+        if code not in existing:
+            existing.append(code)
+    state["warningOverrideList"] = existing
+    return workflow_vo
 
 
 def search_putaway_reason_codes(token: str, org: str, location: str = None) -> List[dict]:

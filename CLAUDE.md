@@ -125,17 +125,55 @@ from a real captured request/response set the user supplied):
   item"`) instead of the unhelpful top-level `"error.400"` when this
   happens.
 
-**Revived 2026-08-08** — `mawm_client.move_container_user_directed()`
-(`POST putaway/api/putaway/execution/container/move`, from
-`mawm_user_directed_putaway_with_warnings.md`'s core API alternative)
-was superseded on an *existing task* by the Substitute Location +
-reason-code flow above, but turned out to be exactly the right tool for
-a container with **no task at all** — see "iLPN search" below. It's
-active again via `task_service.complete_container_putaway()`, not
-commented out. `task_service._complete_putaway_line_user_directed()` —
-the old orchestration that called it for the on-task case — remains
-commented out (superseded, not needed); uncomment it if the on-task
-case ever needs to bypass Substitute Location again.
+**Superseded a second time, 2026-08-08** — `mawm_client.move_container_user_directed()`
+(`POST putaway/api/putaway/execution/container/move`) was briefly
+revived for the no-task/iLPN container case, but its own warning
+override was confirmed not to work (same as on an existing task), so
+it's commented out again. The no-task container case now goes through
+the DMM Mobile Facade flow below instead — same mechanism, same
+override, already proven live end to end. `task_service
+._complete_putaway_line_user_directed()` — the old orchestration that
+called it for the on-task case — also remains commented out.
+
+**CONFIRMED live end-to-end, 2026-08-08** — the DMM Mobile Facade
+"User Directed Putaway" flow now backs `task_service
+.complete_container_putaway()` (the no-task/iLPN container case, see
+"iLPN search" below): `mawm_client.workflow_init()` →
+`workflow_execute()` (`AcceptContainerForUserDirectedPutaway`, then
+`AcceptLocationForUserDirectedPutaway`), captured start-to-finish from
+a real mobile RF session's HAR. Two real, non-header findings from
+building this:
+- **Root cause of an early `serverError`**: the scanned input for each
+  step (`scannedContainerBarcode`, `scannedLocationBarcode`) is **not**
+  a separate top-level sibling field in the request body — an
+  extrapolation from the source document assumed
+  `{"workflowVO": ..., "scannedContainerBarcode": "..."}` and the
+  server silently ignored it, returning a generic
+  `"serverError": "An unexpected system error occurred."` with no
+  other diagnostic info. Confirmed via direct HAR body inspection: the
+  value lives *inside* `workflowVO.header.state.scannedContainerBarcode`
+  (a hidden field on the state, alongside `warningOverrideList`),
+  mutated the same way as the warning override, then the whole
+  `workflowVO` resubmitted. `workflow_execute()` no longer takes an
+  `extra_fields` parameter for this reason — the caller must set the
+  field on `workflow_vo["header"]["state"]` before calling it.
+- Headers were a dead end for this bug — `workflow_init()`'s headers
+  (which already worked) matched `AcceptContainer`'s almost exactly;
+  no missing session cookie or auth header was involved. Worth
+  remembering for next time a DMM step fails with an opaque
+  `serverError`: check the request **body** shape against a real HAR
+  capture before suspecting headers/session state.
+- Verified with two real round-trip moves of `LPN00953` between
+  `R2R40106` and `R2R40105` through `task_service
+  .complete_container_putaway()` directly (bypassing the Flask route,
+  which is a thin pass-through) — both succeeded and were confirmed by
+  re-querying the iLPN's actual current location afterward, not just
+  by trusting `success: true`.
+- Not yet exercised: the warning-and-override path for this specific
+  flow (the document's `DCI::120` example). The mechanism
+  (`apply_warning_overrides()`) is the same one already proven for the
+  Substitute Location warning above, so it's expected to work, but
+  hasn't been triggered live through this exact code path yet.
 
 ## iLPN search (2026-08-08)
 

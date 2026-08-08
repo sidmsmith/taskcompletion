@@ -37,11 +37,12 @@ container — resolving to its open (not Completed/Canceled) Putaway
 task if one exists — and finally, if no task exists at all, a
 synthetic single-line "no open task" response built from the
 container's real current location + on-hand inventory. Completing that
-synthetic line goes through complete_container_putaway(), which revives
-mawm_client.move_container_user_directed() (the task-independent flow
-saved off, commented out, during the Substitute Location work) — this
-is exactly the case that flow was kept around for, since there's no
-TaskId to key the system-directed fetch+commit sequence off of.
+synthetic line goes through complete_container_putaway(), which — as of
+a second capture the same day — uses the CONFIRMED-live DMM Mobile
+Facade "User Directed Putaway" flow (workflow_init()/workflow_execute()/
+apply_warning_overrides()), not the earlier task-independent core API
+call (mawm_client.move_container_user_directed(), now commented out a
+second time after its own warning override was confirmed not to work).
 """
 
 from __future__ import annotations
@@ -51,13 +52,15 @@ from typing import Any, Dict, List, Optional
 
 from mawm_client import (
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
+    PUTAWAY_WORKFLOW_SCRIPT_NAME,
     TASK_TYPE_LABELS,
+    USER_DIRECTED_TRANSACTION_ID,
+    apply_warning_overrides,
     commit_putaway_move,
     complete_task,
     extract_message,
     extract_warning,
     fetch_putaway_move,
-    move_container_user_directed,
     resolve_location,
     search_container_inventory,
     search_ilpn_current_location,
@@ -68,6 +71,8 @@ from mawm_client import (
     search_task_transactions,
     task_status_description,
     validate_storage_location,
+    workflow_execute,
+    workflow_init,
 )
 
 
@@ -586,6 +591,53 @@ def _complete_putaway_line_system_directed(
     }
 
 
+# SUPERSEDED 2026-08-08 — move_container_user_directed()'s own warning
+# override was confirmed live not to work (see mawm_client.py). Replaced
+# by the DMM Mobile Facade implementation below. Kept, commented out,
+# alongside its transport function.
+#
+# def complete_container_putaway(
+#     token: str,
+#     org: str,
+#     container_id: str,
+#     to_location_id: str,
+#     location: str = None,
+#     warning_overrides: Optional[Dict[str, str]] = None,
+# ) -> Dict[str, Any]:
+#     dest = resolve_location(org, location)
+#     rows = search_container_inventory(container_id, token, org, location=dest)
+#     if not rows:
+#         return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
+#     if len(rows) > 1:
+#         return {
+#             "success": False,
+#             "error": f"{container_id} holds more than one item — not supported here.",
+#         }
+#     item_id = str(rows[0].get("ItemId") or "")
+#     quantity = _dec(rows[0].get("OnHand"))
+#     if not item_id or quantity <= 0:
+#         return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
+#     move_resp = move_container_user_directed(
+#         container_id, to_location_id, item_id, _num(quantity), token, org,
+#         location=dest, warning_overrides=warning_overrides,
+#     )
+#     warning = extract_warning(move_resp)
+#     if warning and warning["code"] not in (warning_overrides or {}):
+#         return {
+#             "success": False, "warning": True,
+#             "messageId": warning["code"], "messageText": warning["text"], "stage": "move",
+#         }
+#     ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
+#     return {
+#         "success": bool(ok),
+#         "taskDetailId": f"container:{container_id}",
+#         "quantity": _num(quantity),
+#         "toLocationId": to_location_id,
+#         "mawmResponse": move_resp,
+#         "error": None if ok else extract_message(move_resp),
+#     }
+
+
 def complete_container_putaway(
     token: str,
     org: str,
@@ -595,20 +647,36 @@ def complete_container_putaway(
     warning_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Complete putaway for a container with no open Task at all (see
-    resolve_search()'s `mode: "no_task"` branch) — the task-independent
-    "user directed putaway" call (mawm_client.move_container_user_directed()),
-    revived for exactly this case. No reason code is required here
-    (unlike Substitute Location on an existing task): there's no
-    system-directed default being overridden, just a fresh destination
-    for a loose container.
+    resolve_search()'s `mode: "no_task"` branch), via the CONFIRMED-live
+    DMM Mobile Facade "User Directed Putaway" flow — captured 2026-08-08
+    end to end, including a real warning and its override (see
+    mawm_client.py's `PUTAWAY_WORKFLOW_INIT_URL` comment for the full
+    story). No reason code is required here (unlike Substitute Location
+    on an existing task): there's no system-directed default being
+    overridden, just a fresh destination for a loose container.
 
-    Re-fetches the container's real on-hand inventory fresh (not trusted
-    from the caller — same re-verification convention as
-    receivingworkbench's receive_line()) to get ItemId/Quantity. Fails
-    cleanly on a mixed LPN (more than one item) rather than guessing
-    which item's quantity to send.
+    Stateless by design, consistent with every other completion path in
+    this app: every call — the first attempt or a Confirm retry —
+    bootstraps a brand-new workflow session via workflow_init() and
+    replays the whole AcceptContainer -> AcceptLocation sequence, with
+    any already-known `warning_overrides` pre-applied to each step's
+    workflowVO before submitting it. This trades a little redundant work
+    on retries for not having to round-trip the ~10KB intermediate
+    workflowVO blob through the frontend between the warning and the
+    Confirm click — the frontend's existing warning-loop
+    (completeLineWithWarningHandling()) already resubmits with an
+    accumulated override map and keeps looping until no warning comes
+    back, so this needed no frontend changes to wire up.
+
+    Fails cleanly on a mixed LPN (more than one item) — same as before —
+    since the DMM flow's AcceptContainer step doesn't take an ItemId or
+    Quantity input at all (per the document: "no task DTO... in the
+    active move" — it resolves the item from the container itself), so
+    there's no way to tell it which item to move if there's more than one.
     """
     dest = resolve_location(org, location)
+    warning_overrides = warning_overrides or {}
+
     rows = search_container_inventory(container_id, token, org, location=dest)
     if not rows:
         return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
@@ -618,39 +686,68 @@ def complete_container_putaway(
             "error": f"{container_id} holds more than one item — not supported here.",
         }
 
-    item_id = str(rows[0].get("ItemId") or "")
-    quantity = _dec(rows[0].get("OnHand"))
-    if not item_id or quantity <= 0:
-        return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
+    init_resp = workflow_init(
+        USER_DIRECTED_TRANSACTION_ID, PUTAWAY_WORKFLOW_SCRIPT_NAME, token, org, location=dest
+    )
+    workflow_vo = init_resp.get("workflowVO") if isinstance(init_resp, dict) else None
+    if not isinstance(workflow_vo, dict):
+        return {"success": False, "error": "Could not start the User Directed Putaway workflow"}
 
-    move_resp = move_container_user_directed(
-        container_id,
-        to_location_id,
-        item_id,
-        _num(quantity),
+    apply_warning_overrides(workflow_vo, warning_overrides)
+    workflow_vo["header"]["state"]["scannedContainerBarcode"] = container_id
+    container_resp = workflow_execute(
+        "AcceptContainerForUserDirectedPutaway",
+        "AcceptContainerForUserDirectedPutaway",
+        workflow_vo,
         token,
         org,
         location=dest,
-        warning_overrides=warning_overrides,
     )
-    warning = extract_warning(move_resp)
-    if warning and warning["code"] not in (warning_overrides or {}):
+    warning = extract_warning(container_resp)
+    if warning and warning["code"] not in warning_overrides:
         return {
             "success": False,
             "warning": True,
             "messageId": warning["code"],
             "messageText": warning["text"],
-            "stage": "move",
+            "stage": "container",
+        }
+    next_vo = container_resp.get("workflowVO") if isinstance(container_resp, dict) else None
+    if not isinstance(next_vo, dict):
+        return {"success": False, "error": extract_message(container_resp)}
+
+    apply_warning_overrides(next_vo, warning_overrides)
+    next_vo["header"]["state"]["scannedLocationBarcode"] = to_location_id
+    location_resp = workflow_execute(
+        "AcceptLocationForUserDirectedPutaway",
+        "AcceptLocationForUserDirectedPutaway",
+        next_vo,
+        token,
+        org,
+        location=dest,
+    )
+    warning = extract_warning(location_resp)
+    if warning and warning["code"] not in warning_overrides:
+        return {
+            "success": False,
+            "warning": True,
+            "messageId": warning["code"],
+            "messageText": warning["text"],
+            "stage": "location",
         }
 
-    ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
+    final_header = (
+        (location_resp.get("workflowVO") or {}).get("header")
+        if isinstance(location_resp, dict)
+        else None
+    )
+    ok = isinstance(final_header, dict) and final_header.get("status") == "SUCCESS"
     return {
         "success": bool(ok),
         "taskDetailId": f"container:{container_id}",
-        "quantity": _num(quantity),
         "toLocationId": to_location_id,
-        "mawmResponse": move_resp,
-        "error": None if ok else extract_message(move_resp),
+        "mawmResponse": location_resp,
+        "error": None if ok else extract_message(location_resp),
     }
 
 
