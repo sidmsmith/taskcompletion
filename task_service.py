@@ -1051,14 +1051,27 @@ def complete_container_putaway(
     task-mode line's Completed Qty box, see that function's docstring.
     Covers both the ordinary single-item case (one entry) and the
     MIXED-container accordion case (multiple entries, one per real
-    line) uniformly. The row-count check just below re-queries fresh
-    inventory either way, so it naturally reflects whatever the
-    adjustment left behind — **per explicit instruction, a container
-    still holding more than one item with nonzero on-hand after
-    adjusting stays unsupported** (e.g., zeroing out every item but one
-    resolves a MIXED container down to something completable; leaving
-    two-plus items nonzero does not — that's still the same "not
-    supported" error below, not a new one).
+    line) uniformly.
+
+    **A genuinely multi-item (MIXED) container is CONFIRMED supported,
+    2026-08-08 (fifth session), via a real HAR capture of the mobile RF
+    client** (`userdirectedmultiple.har`) — an earlier version of this
+    function refused any container with more than one on-hand line,
+    reasoning that "the DMM flow's AcceptContainer step doesn't take an
+    ItemId or Quantity input, so there's no way to tell it which item to
+    move." That reasoning was backwards: neither `AcceptContainer` nor
+    `AcceptLocation` need to know which item at all — MAWM's own
+    workflow state carries a `multiItemContainer: true` flag and moves
+    every item on the container to the *same* destination in one
+    AcceptLocation call, exactly like the single-item case. The capture
+    showed the identical `DCI::120` warning/override mechanism already
+    implemented here, at the same states, no shape difference — so this
+    function needed no structural change at all, only the removal of
+    its own artificial refusal. `item_adjustments` is still useful for
+    correcting a MIXED container's quantities beforehand (or reducing
+    it to one item, e.g. zeroing out a mis-scanned item), but is no
+    longer *required* to complete a multi-item container — the whole
+    thing can be moved as-is.
 
     Stateless by design, consistent with every other completion path in
     this app: every call — the first attempt or a Confirm retry —
@@ -1072,12 +1085,6 @@ def complete_container_putaway(
     (completeLineWithWarningHandling()) already resubmits with an
     accumulated override map and keeps looping until no warning comes
     back, so this needed no frontend changes to wire up.
-
-    Fails cleanly on a mixed LPN (more than one item) — same as before —
-    since the DMM flow's AcceptContainer step doesn't take an ItemId or
-    Quantity input at all (per the document: "no task DTO... in the
-    active move" — it resolves the item from the container itself), so
-    there's no way to tell it which item to move if there's more than one.
     """
     dest = resolve_location(org, location)
     warning_overrides = warning_overrides or {}
@@ -1096,11 +1103,6 @@ def complete_container_putaway(
     rows = search_container_inventory(container_id, token, org, location=dest)
     if not rows:
         return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
-    if len(rows) > 1:
-        return {
-            "success": False,
-            "error": f"{container_id} holds more than one item — not supported here.",
-        }
 
     init_resp = workflow_init(
         USER_DIRECTED_TRANSACTION_ID, PUTAWAY_WORKFLOW_SCRIPT_NAME, token, org, location=dest
@@ -1165,10 +1167,12 @@ def complete_container_putaway(
         # Bug fixed 2026-08-08: this never included a `quantity` at all
         # (unlike the task-mode path), so a successful no-task
         # completion showed "Completed undefined  on line N" in the
-        # frontend's status message. `rows[0]` is whatever was actually
-        # on hand right before this move (post-adjustment if
-        # item_adjustments were applied above).
-        "quantity": _num(_dec(rows[0].get("OnHand"))),
+        # frontend's status message. Summed across every row (not just
+        # rows[0]) since a genuinely multi-item container moves all of
+        # them together — whatever was actually on hand right before
+        # this move (post-adjustment if item_adjustments were applied
+        # above).
+        "quantity": _num(sum((_dec(r.get("OnHand")) for r in rows), Decimal("0"))),
         "mawmResponse": location_resp,
         "error": None if ok else extract_message(location_resp),
     }

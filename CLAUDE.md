@@ -467,13 +467,23 @@ To Location input (one container, one destination) and shows the
 aggregate Planned Qty read-only. Submitting sends every item's current
 box value as one multi-entry `itemAdjustments` array (unchanged items
 safely no-op server-side, no client-side "did it change" detection
-needed for this case, unlike the single-item box). **Per explicit
-instruction**: if a container still holds more than one item with
-nonzero quantity after adjusting, it's still refused by
-`complete_container_putaway()`'s existing single-item check — adjusting
-can *resolve* a MIXED container down to something completable (e.g.,
-zeroing out a mis-scanned item), but genuine multi-item putaway
-completion stays out of scope.
+needed for this case, unlike the single-item box).
+
+**Multi-item putaway completion is now CONFIRMED supported, 2026-08-08
+(fifth session)** — the "must resolve to one item first" restriction
+described here in the fourth session was wrong and has been removed;
+see `complete_container_putaway()`'s docstring for the full story (a
+real HAR capture of the mobile RF client, `userdirectedmultiple.har`,
+showed MAWM's own workflow state carries a `multiItemContainer: true`
+flag and moves every item on a container to the same destination in
+one call — no per-item ItemId/Quantity input was ever needed).
+`item_adjustments` is still useful for correcting quantities beforehand,
+just no longer required to complete a MIXED container. **Confirmed
+live** against the exact real container from the original bug report,
+`0000099999000008672` (items `6000106`/10 units, `8000145`/2 units) —
+completed to `R2R40105` after confirming the same `DCI::120` warning
+the mobile capture hit, both items independently verified at the new
+location afterward.
 
 **Completed Qty no longer disabled for no-task/container rows** — the
 original disable-for-no-task reasoning ("the DMM AcceptContainer step
@@ -592,10 +602,14 @@ locations* dedicated to a specific item (each reliably reproduces
 these test items) — that warning is a property of the destination, not
 something that "clears" on the source LPN over time.
 
-**Modify iLPN test containers** (2026-08-08, fourth session):
-`0000099999000008672` (the source document's own test iLPN) now holds
-only item `6000106` (10 units) — `6000105` was deleted via the
-qty-0 test. `0000099999100000772` was a real MIXED container (items
+**Modify iLPN / multi-item test containers**: `0000099999000008672`
+(the source document's own test iLPN) — `6000105` was deleted via the
+qty-0 test (fourth session), then item `8000145` reappeared on it
+(added back via the user's own Postman testing, matching the
+document's own add-line example) making it genuinely MIXED again; used
+in the fifth session to confirm multi-item putaway completion works —
+now single-item again, `6000106` (10 units) + `8000145` (2 units) both
+at `R2R40105`. `0000099999100000772` was a real MIXED container (items
 `4000042`/`4000043`) used to prove the accordion end-to-end — now
 single-item (`4000042`, 3 units) at `R2R40105`, `4000043` zeroed out.
 `0000099999000005596` is still genuinely MIXED (3 items —
