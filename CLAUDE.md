@@ -276,30 +276,21 @@ Three related UI/API changes, delivered together per explicit instruction:
 - **Completed Qty is now an editable inline box** (`public/app.js`'s
   `.completed-qty-input`), defaulted to the line's remaining quantity,
   same "only send if changed" override contract as Current Location
-  (`getCompletedQtyOverride()` mirrors `getLocationOverride()` exactly)
-  and the same client-side validity gating
-  (`validateQty()`/`isQtyValid()`, purely arithmetic — `0 < qty <=
-  remaining` — no API call needed, unlike location validation). The
-  separate **Partial Complete button/modal was removed** — editing this
-  box down is now how a partial is expressed, on the same single
-  "Complete Line" button. Locked (`disabled`) for `no_task`/container
-  rows, which always move the full on-hand quantity (no partial concept
-  there — `complete_container_putaway()`'s DMM flow doesn't take an
-  Item/Quantity input at all).
+  (`getCompletedQtyOverride()` mirrors `getLocationOverride()` exactly).
+  The separate **Partial Complete button/modal was removed** — editing
+  this box is now how a different quantity is expressed, on the same
+  single "Complete Line" button.
 
-  **CONFIRMED NOT to work, live**: booking a genuine partial Putaway
-  completion this way. Tested against `IBPWIBPT0929`
-  (`CompletedQuantity: 100` of `Quantity: 240`) — MAWM's core
-  `commitAndFetchNextMove` endpoint (Path C) rejected it outright:
-  *"Quantity entered is less than the system quantity."* This endpoint
-  requires the full system quantity; there is currently no known way to
-  book a genuine partial Putaway completion. The box/button are kept
-  wired anyway (not reverted) so this real rejection reaches the
-  frontend instead of silently never being attempted — consistent with
-  this app always letting MAWM be the final word rather than guessing
-  client-side. See `mawm_client.commit_putaway_move()`'s and
-  `task_service._complete_putaway_line_system_directed()`'s docstrings
-  for the full story.
+  **Superseded the same day, see the "Modify iLPN" section below**:
+  the mechanism this originally shipped with — sending the edited value
+  straight through as the Path C commit's `CompletedQuantity` — was
+  confirmed live NOT to work (MAWM's core `commitAndFetchNextMove`
+  rejects `CompletedQuantity < Quantity` outright: *"Quantity entered is
+  less than the system quantity"*) and has been fully reverted, not
+  just left disabled. An edited Completed Qty now triggers a real
+  inventory correction (Modify iLPN) *before* the normal, unmodified
+  completion call, which is a materially different (and — for the
+  no-task/container case — confirmed working) mechanism.
 
 - **Multi-LPN search** (`task_service.resolve_search_multi()`): the
   search box now accepts more than one Task Id/iLPN, delimited by `;`,
@@ -367,6 +358,158 @@ Three related UI/API changes, delivered together per explicit instruction:
     the response actually has one, same pattern already used elsewhere
     in this module.
 
+## Modify iLPN adjustment, MIXED accordion, Task/Container column move (2026-08-08, fourth session)
+
+The real mechanism for a different Completed Qty, replacing the
+same-day-earlier (confirmed-broken) direct-`CompletedQuantity` attempt
+described above. Source: `mawm_modify_ilpn_query_and_adjustment.md`
+(a real captured Postman test set) plus `modifyLPN-single.har`
+(reason-code lookup only — the DMM ModifyIlpn mobile workflow itself
+was explicitly out of scope, per instruction).
+
+**The mechanism** — `task_service.adjust_ilpn_quantities()`:
+correct the LPN's actual on-hand inventory *first* via
+`POST inventory-management/api/inventory-management/adjust/endIlpn`,
+*then* run the normal, unmodified completion, which re-fetches fresh
+and so picks up whatever quantity MAWM now considers correct.
+- `ScannedQuantity` on the wire is a *relative* adjustment
+  (`New OnHand = Current + (ScannedQuantity - ExpectedOnHandQuantity)`),
+  but since this always re-queries live inventory immediately before
+  building the payload, `Original == Expected == current OnHand` here,
+  which collapses `ScannedQuantity` to simply the desired new total —
+  see the function's docstring for the full reasoning.
+- Unchanged items are omitted from the payload entirely (per the
+  document — "don't include unrelated lines"), not sent with a
+  no-op adjustment.
+- A quantity of exactly 0 is sent as a normal line
+  (`ScannedQuantity: 0`), **not** through the document's
+  `DeletedInventory` path — per explicit instruction, based on the
+  document author's own live testing that this removes the line the
+  same way. `adjust_ilpn_inventory()` keeps `DeletedInventory` as an
+  unused parameter in case that ever needs wiring in instead.
+- **CONFIRMED WRONG, live**: the assumption (stated in the original
+  request) that a null `InventoryReadTimestamp` only comes up when
+  adding a brand-new line. Checked two real, pre-existing (nothing
+  being added) containers live: one had a real timestamp, the other —
+  `LPN000000000010` — came back null. So `adjust_ilpn_quantities()`
+  always checks for this and calls `refresh_ilpn_read_timestamp()` +
+  re-queries once whenever a targeted line needs it, rather than
+  skipping that step. Adding a genuinely new line (a row that doesn't
+  exist in inventory at all yet) is still out of scope and correctly
+  refused with a clear error — there's no existing row to read *any*
+  timestamp from, refreshed or not; the document's own approach for
+  that case is to send a literal null timestamp directly, which this
+  function deliberately doesn't attempt.
+- `endIlpn` is asynchronous (may return HTTP 200 with an empty body) —
+  `adjust_ilpn_quantities()` waits ~1.5s then re-queries once to verify
+  the new on-hand actually matches what was requested, returning
+  `success: False` with the mismatched item ids if it doesn't yet
+  (treat as "try again shortly," not a hard failure).
+
+**CONFIRMED live end-to-end**, all against real `SS-DEMO` data,
+independently re-verified by direct re-query (not just trusting a
+`success: true`):
+- Basic increase: `0000099999000008672` item `6000106`, 9 → 10 units.
+- Qty-0 deletion: same container, item `6000105`, 5 → 0 — the line was
+  fully removed from inventory search results, confirming the
+  qty-0-instead-of-`DeletedInventory` approach works exactly as the
+  document's author found.
+- Null-timestamp refresh path: `LPN000000000010` item `5000225`, real
+  pre-existing line, null timestamp → refresh → retry succeeded, 200 →
+  195 units, timestamp now populated.
+- **No-task/container completion with an adjustment, full click-driven
+  browser test** (not just direct Python calls): `LPN000000000010`
+  edited to 190 units + destination `R2R40106` in the actual UI,
+  Complete Line clicked, a real `DCI::120` warning appeared and was
+  confirmed, and the completion succeeded — independently verified
+  both the on-hand quantity (195 → 190) and the container's current
+  location actually changed.
+- **MIXED container, adjustment down to a single item, then full
+  completion**: `0000099999100000772` (real mixed inventory found live,
+  not fabricated — items `4000042`/`4000043`) — zeroed out `4000043`,
+  left `4000042` unchanged (correctly skipped as a no-op), container
+  correctly reduced to one item, then completed putaway to `R2R40105`
+  (after confirming the same `DCI::120` warning) — confirmed both the
+  adjustment and the final location live.
+
+**UNCONFIRMED, explicitly deferred to the user to test live**: this
+whole sequence against an LPN **already allocated to an open task**
+(the `complete_putaway_line()` task-mode path). Everything above was
+tested against no-task/container LPNs only, matching the source
+document's own Postman testing scope. Whether
+`fetchNextPutawayMoveAndStartLaborActivity` re-syncs its `Quantity` to
+an adjusted on-hand, or still expects the task's original planned
+amount, is genuinely unknown — see `complete_putaway_line()`'s and
+`adjust_ilpn_quantities()`'s docstrings.
+
+**Reason codes**: `mawm_client.ADJUSTMENT_REASON_CODES` — a static
+list of 6 (`Charity/CH`, `Inventory Adjustment/IA`,
+`Inventory Damaged/DM`, `Inventory Delete/ID`,
+`Lost in cycle count/LC`, `Mass Inventory Movement/MM`), extracted from
+a real captured lookup response, not a live search — that lookup
+(`adjustmentReasonCodes/list`) only ever appeared nested inside an
+active DMM ModifyIlpn workflow session in the HAR, and building that
+whole workflow just to fetch six stable codes was out of scope.
+Preloaded once per session via `/api/preload_adjustment_reason_codes`
+(single source of truth in `mawm_client.py`, not duplicated in
+`public/app.js` — mirrors the `preloadStorageLocations()` pattern).
+Hardcoded default `IA`, always changeable. The dropdown
+(`.reason-code-select`) only becomes visible next to a row once its
+Completed Qty box is actually edited away from its default — same
+"only show/send when it matters" pattern as everything else here.
+
+**MIXED containers now expand into an accordion**
+(`resolve_search()`'s no_task branch now returns `mixedItems:
+[{itemId, description, quantity}, ...]` on the summary line instead of
+just a total). `MIXED` itself moved from the Description column into
+the Item column (Description now blank for that row), per explicit
+instruction. Each item gets its own sub-row (`.mixed-item-row`,
+`.mixed-qty-input`) with an independent Completed Qty box and reason
+dropdown, defaulted to that item's own on-hand — collapsed by default,
+toggled via the `▶ MIXED` button. The summary row keeps the *shared*
+To Location input (one container, one destination) and shows the
+aggregate Planned Qty read-only. Submitting sends every item's current
+box value as one multi-entry `itemAdjustments` array (unchanged items
+safely no-op server-side, no client-side "did it change" detection
+needed for this case, unlike the single-item box). **Per explicit
+instruction**: if a container still holds more than one item with
+nonzero quantity after adjusting, it's still refused by
+`complete_container_putaway()`'s existing single-item check — adjusting
+can *resolve* a MIXED container down to something completable (e.g.,
+zeroing out a mis-scanned item), but genuine multi-item putaway
+completion stays out of scope.
+
+**Completed Qty no longer disabled for no-task/container rows** — the
+original disable-for-no-task reasoning ("the DMM AcceptContainer step
+has no quantity input") is now moot: a different quantity is corrected
+via Modify iLPN *before* AcceptContainer ever runs, so
+`complete_container_putaway()` needed zero changes itself to support
+this — it already re-queries live on-hand at call time regardless.
+
+**Validity gating relaxed**: Completed Qty no longer has an upper bound
+(`validateQty()`/`isQtyValid()`) — before this change, editing the box
+could only ever express a *smaller* quantity on the same move, so it
+was capped at "remaining." Now it triggers a real inventory correction
+that can go either direction — finding *more* units than expected is
+just as valid a correction as finding fewer.
+
+**Column reorder**: Task/Container moved from last to right after LPN
+(`Line, LPN, Task/Container, Item, Description, ...`), per explicit
+instruction. A small UOM column was added between Planned Qty and
+Completed Qty (no header text) — cosmetic only, `uomId`'s own
+resolution/threading is unchanged (still blank for no-task lines, still
+the raw `UomTypeId` value for task lines — see the "Open question"
+above).
+
+**One more real bug found and fixed** while live-testing the no-task
+completion path in the browser: `complete_container_putaway()`'s
+success response never included a `quantity` field at all (unlike the
+task-mode path), so a successful completion showed "Completed
+undefined  on line N" in the frontend instead of the real amount.
+Fixed by including the actual post-adjustment on-hand quantity
+(`rows[0]["OnHand"]`, already fetched for the single-item check) in the
+response.
+
 ## Known-good test Task Id
 
 Refreshed 2026-08-08 (third session) — the demo environment's data
@@ -394,12 +537,24 @@ app can work around.
 
 **No open task (`mode: "no_task"`), useful for the container/DMM
 flow**: `LPN00076` (now that `IBPWIBPT0929` is Completed — its task no
-longer counts as "open" — current location `R1R20701`, following the
-completion above) and `LPN000000000010` (current location `R2R40105`,
-following live Complete-All testing above; previously used for the
-`DCI::159`/`DCI::120` warning-override tests — has now cleared
-whatever dedicated-item conflict `R2R61001`/`R2R40105` had, so it may
-no longer reproduce a warning at those specific destinations).
+longer counts as "open" — current location `R1R20701`) and
+`LPN000000000010` (item `5000225`, now 190 units at `R2R40106`,
+following the Modify iLPN + Complete Line browser test above). Note
+`R2R40105`/`R2R40106`/`R2R61001` all appear to be *destination
+locations* dedicated to a specific item (each reliably reproduces
+`DCI::120`, "Location permanently dedicated to a different item," for
+these test items) — that warning is a property of the destination, not
+something that "clears" on the source LPN over time.
+
+**Modify iLPN test containers** (2026-08-08, fourth session):
+`0000099999000008672` (the source document's own test iLPN) now holds
+only item `6000106` (10 units) — `6000105` was deleted via the
+qty-0 test. `0000099999100000772` was a real MIXED container (items
+`4000042`/`4000043`) used to prove the accordion end-to-end — now
+single-item (`4000042`, 3 units) at `R2R40105`, `4000043` zeroed out.
+`0000099999000005596` is still genuinely MIXED (3 items —
+`6000102`/`6000103`/`6000104`) and untouched, if another real MIXED
+container is needed for testing.
 
 ## Status badge
 

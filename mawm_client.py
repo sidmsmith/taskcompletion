@@ -137,6 +137,38 @@ PUTAWAY_WORKFLOW_SCRIPT_NAME = "Putaway"
 ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
 INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
 
+# CONFIRMED-by-user-capture (mawm_modify_ilpn_query_and_adjustment.md,
+# 2026-08-08) — Modify iLPN: correct an LPN's actual on-hand quantity
+# directly (not via a task move), used ahead of a putaway completion
+# when the operator's Completed Qty differs from what was planned. See
+# task_service.adjust_ilpn_quantities() for the full sequence/decision
+# table this backs. Verified against a *non-allocated* LPN in Postman
+# by the document's author; behavior against an LPN already on an open
+# task is UNCONFIRMED — see that function's docstring.
+INVENTORY_READ_TIMESTAMP_REFRESH_URL = (
+    f"{HOST}/dcinventory/api/dcinventory/inventory/updateReadTimeStamp"
+)
+MODIFY_ILPN_ADJUST_URL = f"{HOST}/inventory-management/api/inventory-management/adjust/endIlpn"
+MODIFY_ILPN_TRANSACTION_ID = "Modify iLPN"
+
+# Static list, not a live search (2026-08-08) — extracted from a real
+# captured lookup response (modifyLPN-single.har's
+# adjustmentReasonCodes/list call), which only ever appeared nested
+# inside an active DMM ModifyIlpn workflow session in the capture.
+# Building that whole workflow just to fetch six stable codes was
+# explicitly out of scope; revisit if a core-API equivalent search
+# endpoint is ever found, same as how Putaway's own reason codes moved
+# from a static guess to a confirmed live search earlier in this app.
+ADJUSTMENT_REASON_CODES = [
+    {"key": "Charity", "value": "CH"},
+    {"key": "Inventory Adjustment", "value": "IA"},
+    {"key": "Inventory Damaged", "value": "DM"},
+    {"key": "Inventory Delete", "value": "ID"},
+    {"key": "Lost in cycle count", "value": "LC"},
+    {"key": "Mass Inventory Movement", "value": "MM"},
+]
+DEFAULT_ADJUSTMENT_REASON_CODE = "IA"
+
 # CONFIRMED live — Tier 1 (mawm_api_library/location/api.md). Real
 # putaway destinations observed in SS-DEMO (R1R20701, C1CS0110,
 # C1CS0111) all carry LocationTypeId="STORAGE" — used to validate a
@@ -453,6 +485,83 @@ def search_container_inventory(
             f"inventory search failed: {response.status_code} {response.text[:500]}"
         )
     return _response_data_list(response.json())
+
+
+def refresh_ilpn_read_timestamp(container_id: str, token: str, org: str, location: str = None) -> None:
+    """CONFIRMED-by-user-capture — Modify iLPN step 4: when a targeted
+    line's InventoryReadTimestamp comes back null from
+    search_container_inventory(), call this once, then re-run that
+    search to get the now-populated timestamp before building an
+    endIlpn payload. Per the document, don't use any timestamp from
+    this call's own response — only the subsequent search's.
+    """
+    token = normalize_token(token)
+    quoted = container_id.replace("'", "''")
+    response = _post(
+        INVENTORY_READ_TIMESTAMP_REFRESH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={"Query": f"InventoryContainerId = '{quoted}'"},
+    )
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"updateReadTimeStamp failed: {response.status_code} {response.text[:500]}"
+        )
+
+
+def adjust_ilpn_inventory(
+    ilpn_id: str,
+    inventory_lines: List[dict],
+    token: str,
+    org: str,
+    location: str = None,
+    deleted_lines: Optional[List[dict]] = None,
+) -> dict:
+    """CONFIRMED-by-user-capture — Modify iLPN step 2 (endIlpn): correct
+    an LPN's on-hand quantity directly. `inventory_lines` are dicts
+    already shaped like the document's payload (OriginalOnHandQuantity/
+    ExpectedOnHandQuantity/AllocatedQuantity/ScannedQuantity/ReasonCode/
+    InventoryReadTimestamp/ItemAttributeDTO) — see
+    task_service.adjust_ilpn_quantities() for how those are built.
+    `ScannedQuantity` is relative, not absolute: New OnHand = Current
+    OnHand + (ScannedQuantity - ExpectedOnHandQuantity). Only include
+    lines actually changing — the document says not to include
+    unrelated lines.
+
+    A qty-0 delete: per explicit instruction, this app deliberately does
+    NOT use the document's `DeletedInventory` path — live testing (by
+    the document's author, outside this app) found that just including
+    the line in `inventory_lines` with `ScannedQuantity: 0` removes it
+    the same way. `deleted_lines` is kept as an unused parameter only so
+    the (untested-here) documented path is easy to wire in later if the
+    qty-0 approach ever turns out not to hold up.
+
+    The response may be HTTP 200 with an empty body — the adjustment is
+    processed asynchronously; the caller is expected to re-query and
+    verify (see adjust_ilpn_quantities()).
+    """
+    token = normalize_token(token)
+    payload = {
+        "IlpnId": ilpn_id,
+        "TransactionId": MODIFY_ILPN_TRANSACTION_ID,
+        "Inventory": inventory_lines,
+        "DeletedInventory": deleted_lines or [],
+    }
+    response = _post(
+        MODIFY_ILPN_ADJUST_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]} if response.text else {}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+        raise RuntimeError(
+            f"endIlpn adjustment failed: {response.status_code} {response.text[:800]}"
+        )
+    return body
 
 
 def validate_storage_location(

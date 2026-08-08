@@ -48,20 +48,25 @@ second time after its own warning override was confirmed not to work).
 from __future__ import annotations
 
 import re
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from mawm_client import (
+    ADJUSTMENT_REASON_CODES,
+    DEFAULT_ADJUSTMENT_REASON_CODE,
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
     PUTAWAY_WORKFLOW_SCRIPT_NAME,
     TASK_TYPE_LABELS,
     USER_DIRECTED_TRANSACTION_ID,
+    adjust_ilpn_inventory,
     apply_warning_overrides,
     commit_putaway_move,
     complete_task,
     extract_message,
     extract_warning,
     fetch_putaway_move,
+    refresh_ilpn_read_timestamp,
     resolve_location,
     search_all_storage_locations,
     search_container_inventory,
@@ -146,6 +151,7 @@ def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = Non
                 "plannedQuantity": _num(planned),
                 "completedQuantity": _num(completed),
                 "remainingQuantity": _num(remaining if remaining > 0 else 0),
+                "mixedItems": None,  # only ever set on a no_task MIXED container line, see resolve_search()
             }
         )
     return lines
@@ -233,10 +239,26 @@ def resolve_search(
     items = search_items(item_ids, token, org, location=dest) if item_ids else {}
 
     mixed = len(inv_rows) > 1
+    mixed_items = None
     if mixed:
-        item_id = ""
-        description = "MIXED"
+        # 2026-08-08, per explicit instruction: "MIXED" now shows in the
+        # Item column (blank Description), not the other way around.
+        # mixedItems carries each real line's own detail so the frontend
+        # can expand this summary row into per-item editable rows (see
+        # adjust_ilpn_quantities()) instead of just displaying a total.
+        item_id = "MIXED"
+        description = ""
         qty = sum((_dec(r.get("OnHand")) for r in inv_rows), Decimal("0"))
+        mixed_items = [
+            {
+                "itemId": str(r.get("ItemId") or ""),
+                "description": str(
+                    (items.get(str(r.get("ItemId") or "")) or {}).get("Description") or ""
+                ),
+                "quantity": _num(_dec(r.get("OnHand"))),
+            }
+            for r in inv_rows
+        ]
     elif inv_rows:
         item_id = str(inv_rows[0].get("ItemId") or "")
         description = str((items.get(item_id) or {}).get("Description") or "")
@@ -258,6 +280,7 @@ def resolve_search(
         "plannedQuantity": _num(qty),
         "completedQuantity": 0,
         "remainingQuantity": _num(qty),
+        "mixedItems": mixed_items,
     }
     return {
         "success": True,
@@ -499,6 +522,157 @@ def complete_line(
     }
 
 
+def preload_adjustment_reason_codes() -> Dict[str, Any]:
+    """Static list (see mawm_client.ADJUSTMENT_REASON_CODES's docstring
+    for why this isn't a live search) for the frontend's reason-code
+    dropdown next to an edited Completed Qty box.
+    """
+    entries = [{"key": c["key"], "value": c["value"]} for c in ADJUSTMENT_REASON_CODES]
+    return {
+        "success": True,
+        "count": len(entries),
+        "entries": entries,
+        "defaultReasonCode": DEFAULT_ADJUSTMENT_REASON_CODE,
+    }
+
+
+def adjust_ilpn_quantities(
+    container_id: str,
+    adjustments: List[Dict[str, Any]],
+    token: str,
+    org: str,
+    location: str = None,
+) -> Dict[str, Any]:
+    """Modify iLPN: correct `container_id`'s actual on-hand quantity for
+    each item in `adjustments` (`[{"itemId", "desiredQty", "reasonCode"}]`)
+    to the given value, per
+    mawm_modify_ilpn_query_and_adjustment.md (2026-08-08). Always
+    re-queries live inventory first — never trusts a caller's belief
+    about current on-hand — so `ScannedQuantity` (a *relative*
+    adjustment on the wire, `New OnHand = Current + (ScannedQuantity -
+    ExpectedOnHandQuantity)`) collapses to simply the desired new total,
+    since `OriginalOnHandQuantity == ExpectedOnHandQuantity == the
+    freshly-read current OnHand` here.
+
+    Items already at their desired quantity are silently skipped (not
+    sent at all — the document says not to include unrelated lines).
+    Returns `{"success": True, "adjusted": False}` if nothing needed to
+    change.
+
+    A quantity of exactly 0 is sent as a normal line with
+    `ScannedQuantity: 0` (not through the document's `DeletedInventory`
+    path) — per explicit instruction, based on live testing (by the
+    document's author, outside this app) that found this removes the
+    line the same way.
+
+    **Null `InventoryReadTimestamp` is NOT only an add-line thing** —
+    confirmed live, 2026-08-08: a real, pre-existing (not newly added)
+    container's inventory line came back with a null timestamp on a
+    fresh query. So this always checks for it and calls
+    `refresh_ilpn_read_timestamp()` + re-queries once when any targeted
+    line needs it, rather than skipping that step.
+
+    The `endIlpn` adjustment is asynchronous — this waits briefly, then
+    re-queries once to verify the new on-hand actually matches what was
+    requested, returning `success: False` with the mismatched item ids
+    if it doesn't (the caller should treat that as "try again in a
+    moment," not necessarily a hard failure).
+
+    **UNCONFIRMED against an allocated LPN**: the document's own
+    testing only ever exercised this against a *non-allocated* LPN via
+    Postman. Whether adjusting on-hand this way plays correctly with a
+    LPN that's already the target of an open task's planned quantity —
+    e.g., whether `fetchNextPutawayMoveAndStartLaborActivity` re-syncs
+    its `Quantity` to match, or still expects the original planned
+    amount — is untested. This is exactly the scenario the caller
+    (`complete_putaway_line()`) is being verified against live.
+    """
+    dest = resolve_location(org, location)
+    rows = search_container_inventory(container_id, token, org, location=dest)
+    by_item = {str(r.get("ItemId") or ""): r for r in rows}
+
+    to_send = []
+    needs_refresh = False
+    for adj in adjustments:
+        item_id = str(adj.get("itemId") or "").strip()
+        if not item_id:
+            continue
+        desired = _dec(adj.get("desiredQty"))
+        row = by_item.get(item_id)
+        current = _dec(row.get("OnHand")) if row else Decimal("0")
+        if desired == current:
+            continue
+        if not row or row.get("InventoryReadTimestamp") is None:
+            needs_refresh = True
+        to_send.append(
+            {
+                "itemId": item_id,
+                "desired": desired,
+                "current": current,
+                "allocated": _dec((row or {}).get("Allocated") or 0),
+                "reasonCode": str(adj.get("reasonCode") or "").strip()
+                or DEFAULT_ADJUSTMENT_REASON_CODE,
+            }
+        )
+
+    if not to_send:
+        return {"success": True, "adjusted": False}
+
+    if needs_refresh:
+        refresh_ilpn_read_timestamp(container_id, token, org, location=dest)
+        rows = search_container_inventory(container_id, token, org, location=dest)
+        by_item = {str(r.get("ItemId") or ""): r for r in rows}
+
+    inventory_lines = []
+    for item in to_send:
+        row = by_item.get(item["itemId"])
+        timestamp = row.get("InventoryReadTimestamp") if row else None
+        if timestamp is None:
+            return {
+                "success": False,
+                "adjusted": False,
+                "error": (
+                    f"No InventoryReadTimestamp available for {item['itemId']} "
+                    f"on {container_id} even after refresh"
+                ),
+            }
+        inventory_lines.append(
+            {
+                "OriginalOnHandQuantity": _num(item["current"]),
+                "ExpectedOnHandQuantity": _num(item["current"]),
+                "AllocatedQuantity": _num(item["allocated"]),
+                "ScannedQuantity": _num(item["desired"]),
+                "ReasonCode": item["reasonCode"],
+                "InventoryReadTimestamp": timestamp,
+                "ItemAttributeDTO": {"ItemBarcode": item["itemId"], "Item": item["itemId"]},
+            }
+        )
+
+    adjust_ilpn_inventory(container_id, inventory_lines, token, org, location=dest)
+
+    time.sleep(1.5)
+    verify_rows = search_container_inventory(container_id, token, org, location=dest)
+    verify_by_item = {str(r.get("ItemId") or ""): r for r in verify_rows}
+    mismatches = []
+    for item in to_send:
+        new_row = verify_by_item.get(item["itemId"])
+        new_onhand = _dec(new_row.get("OnHand")) if new_row else Decimal("0")
+        if new_onhand != item["desired"]:
+            mismatches.append(item["itemId"])
+
+    return {
+        "success": not mismatches,
+        "adjusted": True,
+        "mismatches": mismatches,
+        "error": (
+            "Adjustment not yet verified for: " + ", ".join(mismatches) + " — endIlpn processes "
+            "asynchronously, this may just need a moment longer."
+        )
+        if mismatches
+        else None,
+    }
+
+
 def complete_putaway_line(
     token: str,
     org: str,
@@ -509,19 +683,28 @@ def complete_putaway_line(
     warning_overrides: Optional[Dict[str, str]] = None,
     to_location_id: Optional[str] = None,
     reason_code_id: Optional[str] = None,
-    quantity: Optional[float] = None,
+    item_id: Optional[str] = None,
+    lpn_id: Optional[str] = None,
+    desired_qty: Optional[float] = None,
+    adjustment_reason_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Complete one Putaway task line — full by default. `quantity`, if
-    given (2026-08-08: the frontend's Completed Qty box, replacing the
-    separate Partial Complete button/modal), is passed through, but
-    **CONFIRMED NOT to book a genuine partial** — see
-    `_complete_putaway_line_system_directed()`'s docstring: MAWM
-    rejects `CompletedQuantity < Quantity` outright with "Quantity
-    entered is less than the system quantity." Kept wired anyway (not
-    reverted) so the frontend correctly surfaces that real rejection
-    when someone edits the box down, rather than silently disabling it —
-    consistent with how this app always lets MAWM be the final word
-    instead of guessing client-side.
+    """Complete one Putaway task line in full.
+
+    **2026-08-08, superseding the same day's earlier (confirmed-broken)
+    attempt**: a `desired_qty` different from what's planned no longer
+    tries to book a partial completion directly (MAWM's core
+    `commitAndFetchNextMove` rejects that outright — see
+    `mawm_client.commit_putaway_move()`'s docstring). Instead, per
+    `mawm_modify_ilpn_query_and_adjustment.md`, it corrects the LPN's
+    actual on-hand quantity FIRST via `adjust_ilpn_quantities()`
+    (requires `item_id`/`lpn_id` — the frontend already has both off
+    the loaded line), then falls through to the normal, unmodified full
+    completion below, which re-fetches the move fresh and so picks up
+    whatever quantity MAWM now considers correct post-adjustment.
+    **UNCONFIRMED**: see `adjust_ilpn_quantities()`'s docstring — this
+    whole sequence has only ever been verified against a non-allocated
+    LPN; behavior against a line already on an open task (this case) is
+    the live test this was built for.
 
     `to_location_id` is only sent by the frontend when the user actually
     edited the line's destination away from what was loaded (see
@@ -531,7 +714,10 @@ def complete_putaway_line(
     this via a required reason-code modal (see
     preload_putaway_reason_codes()) before ever sending toLocationId,
     so a substitution without one here means the frontend didn't
-    enforce that; fail rather than silently proceeding.
+    enforce that; fail rather than silently proceeding. (This is the
+    Putaway-domain Substitute Location reason code, a different concept
+    and a different code list from `adjustment_reason_code`'s
+    inventory-adjustment domain — see mawm_client.ADJUSTMENT_REASON_CODES.)
 
     Per mawm_substitute_location_to_user_directed_putaway.md, "directed
     putaway is still used" for a substituted destination — this always
@@ -540,6 +726,32 @@ def complete_putaway_line(
     move's ToLocationId/ReasonCodeId overridden before committing when
     a substitution was requested.
     """
+    if desired_qty is not None:
+        if not item_id or not lpn_id:
+            return {
+                "success": False,
+                "error": "itemId and lpnId are required to adjust the completed quantity",
+            }
+        adjust_result = adjust_ilpn_quantities(
+            lpn_id,
+            [
+                {
+                    "itemId": item_id,
+                    "desiredQty": desired_qty,
+                    "reasonCode": adjustment_reason_code,
+                }
+            ],
+            token,
+            org,
+            location=location,
+        )
+        if not adjust_result.get("success"):
+            return {
+                "success": False,
+                "error": adjust_result.get("error") or "Inventory adjustment failed",
+                "stage": "adjust",
+            }
+
     if to_location_id and to_location_id.strip():
         if not reason_code_id:
             return {
@@ -559,7 +771,6 @@ def complete_putaway_line(
         warning_overrides=warning_overrides,
         to_location_id=to_location_id,
         reason_code_id=reason_code_id,
-        quantity=quantity,
     )
 
 
@@ -573,11 +784,10 @@ def _complete_putaway_line_system_directed(
     warning_overrides: Optional[Dict[str, str]] = None,
     to_location_id: Optional[str] = None,
     reason_code_id: Optional[str] = None,
-    quantity: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The confirmed-by-capture Path C sequence
     (mawm_putaway_api_call_set_with_warning_handling.md): fetch the next
-    move for the task, then commit it.
+    move for the task, then commit it in full.
 
     fetchNextPutawayMoveAndStartLaborActivity returns whatever move is
     "next" for the TaskId, not one scoped to a specific TaskDetailId — so
@@ -585,20 +795,19 @@ def _complete_putaway_line_system_directed(
     the user actually selected and refuses to commit on a mismatch,
     rather than silently completing the wrong line.
 
-    Completion quantity is expressed by setting the fetched
-    InventoryMove's CompletedQuantity before committing — the document's
-    own worked example does exactly this for a full completion
-    (CompletedQuantity: 240 alongside Quantity: 240; the fetched move
-    itself doesn't set CompletedQuantity that way). `quantity`, if given
-    (2026-08-08, the frontend's inline Completed Qty box), is validated
-    against the *fetched move's own* `Quantity` (not the caller's belief
-    about remaining — the fetched move is the source of truth) and used
-    instead of the full amount — **CONFIRMED NOT to work**: see
-    mawm_client.commit_putaway_move()'s docstring — tested live against
-    `IBPWIBPT0929` with `quantity=100` of 240, MAWM rejected it with
-    "Quantity entered is less than the system quantity." Left wired
-    (not reverted) purely so that real rejection reaches the frontend
-    instead of the request silently never being attempted.
+    Always books the fetched move's full Quantity (CompletedQuantity ==
+    Quantity, per the document's own worked commit payload example) —
+    **2026-08-08, reverted back to this**: a same-day earlier attempt at
+    a caller-supplied partial `quantity` here was confirmed live NOT to
+    work (MAWM's core `commitAndFetchNextMove` rejects
+    `CompletedQuantity < Quantity` outright — see
+    mawm_client.commit_putaway_move()'s docstring). A different
+    quantity is now expressed by correcting the LPN's actual on-hand
+    *before* ever calling this, via `adjust_ilpn_quantities()` (see
+    `complete_putaway_line()`'s docstring) — so by the time this
+    function fetches the move, whatever Quantity comes back should
+    already reflect the correction, and this function itself needed no
+    quantity-related parameter at all anymore.
 
     Substitute Location (`to_location_id` + `reason_code_id` given):
     per mawm_substitute_location_to_user_directed_putaway.md, "directed
@@ -673,21 +882,9 @@ def _complete_putaway_line_system_directed(
         inventory_move["ToLocationId"] = to_location_id
         inventory_move["ReasonCodeId"] = reason_code_id
 
-    move_quantity = _dec(inventory_move.get("Quantity"))
-    if quantity is None:
-        # Full completion: CompletedQuantity == Quantity, per the
-        # document's own worked commit payload example.
-        completed_quantity = move_quantity
-    else:
-        completed_quantity = _dec(quantity)
-        if completed_quantity <= 0:
-            return {"success": False, "error": "quantity must be greater than 0"}
-        if completed_quantity > move_quantity:
-            return {
-                "success": False,
-                "error": f"quantity exceeds this move's quantity ({_num(move_quantity)})",
-            }
-    inventory_move["CompletedQuantity"] = _num(completed_quantity)
+    # Full completion: CompletedQuantity == Quantity, per the document's
+    # own worked commit payload example.
+    inventory_move["CompletedQuantity"] = inventory_move.get("Quantity")
 
     commit_resp = commit_putaway_move(
         sub_type, inventory_move, token, org, location=dest, warning_overrides=warning_overrides
@@ -767,6 +964,7 @@ def complete_container_putaway(
     to_location_id: str,
     location: str = None,
     warning_overrides: Optional[Dict[str, str]] = None,
+    item_adjustments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Complete putaway for a container with no open Task at all (see
     resolve_search()'s `mode: "no_task"` branch), via the CONFIRMED-live
@@ -776,6 +974,22 @@ def complete_container_putaway(
     story). No reason code is required here (unlike Substitute Location
     on an existing task): there's no system-directed default being
     overridden, just a fresh destination for a loose container.
+
+    `item_adjustments` (2026-08-08,
+    `[{"itemId", "desiredQty", "reasonCode"}, ...]`), if given, runs
+    `adjust_ilpn_quantities()` against this container first — the same
+    Modify iLPN mechanism `complete_putaway_line()` now uses for a
+    task-mode line's Completed Qty box, see that function's docstring.
+    Covers both the ordinary single-item case (one entry) and the
+    MIXED-container accordion case (multiple entries, one per real
+    line) uniformly. The row-count check just below re-queries fresh
+    inventory either way, so it naturally reflects whatever the
+    adjustment left behind — **per explicit instruction, a container
+    still holding more than one item with nonzero on-hand after
+    adjusting stays unsupported** (e.g., zeroing out every item but one
+    resolves a MIXED container down to something completable; leaving
+    two-plus items nonzero does not — that's still the same "not
+    supported" error below, not a new one).
 
     Stateless by design, consistent with every other completion path in
     this app: every call — the first attempt or a Confirm retry —
@@ -798,6 +1012,17 @@ def complete_container_putaway(
     """
     dest = resolve_location(org, location)
     warning_overrides = warning_overrides or {}
+
+    if item_adjustments:
+        adjust_result = adjust_ilpn_quantities(
+            container_id, item_adjustments, token, org, location=dest
+        )
+        if not adjust_result.get("success"):
+            return {
+                "success": False,
+                "error": adjust_result.get("error") or "Inventory adjustment failed",
+                "stage": "adjust",
+            }
 
     rows = search_container_inventory(container_id, token, org, location=dest)
     if not rows:
@@ -868,6 +1093,13 @@ def complete_container_putaway(
         "success": bool(ok),
         "taskDetailId": f"container:{container_id}",
         "toLocationId": to_location_id,
+        # Bug fixed 2026-08-08: this never included a `quantity` at all
+        # (unlike the task-mode path), so a successful no-task
+        # completion showed "Completed undefined  on line N" in the
+        # frontend's status message. `rows[0]` is whatever was actually
+        # on hand right before this move (post-adjustment if
+        # item_adjustments were applied above).
+        "quantity": _num(_dec(rows[0].get("OnHand"))),
         "mawmResponse": location_resp,
         "error": None if ok else extract_message(location_resp),
     }

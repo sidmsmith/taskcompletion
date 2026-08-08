@@ -14,10 +14,47 @@
     lastSearchValue: "", // raw search box text, re-used to refresh after a completion
     selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
+    adjustmentReasonCodes: null, // [{key,value}] once preloaded, see preloadAdjustmentReasonCodes()
   };
 
   function allLines() {
     return state.groups.flatMap((g) => g.lines || []);
+  }
+
+  // Fallback only — the real list is preloaded once per session from
+  // mawm_client.ADJUSTMENT_REASON_CODES via /api/preload_adjustment_
+  // reason_codes (see preloadAdjustmentReasonCodes() below), the single
+  // source of truth. This mirrors it just so a row can render sane
+  // options in the brief window before that preload resolves (or if it
+  // fails outright) — same fallback pattern as storageLocations.
+  const FALLBACK_REASON_CODES = [
+    { key: "Charity", value: "CH" },
+    { key: "Inventory Adjustment", value: "IA" },
+    { key: "Inventory Damaged", value: "DM" },
+    { key: "Inventory Delete", value: "ID" },
+    { key: "Lost in cycle count", value: "LC" },
+    { key: "Mass Inventory Movement", value: "MM" },
+  ];
+  const DEFAULT_REASON_CODE = "IA";
+
+  async function preloadAdjustmentReasonCodes() {
+    try {
+      const data = await api("preload_adjustment_reason_codes", {});
+      if (data.success) state.adjustmentReasonCodes = data.entries || [];
+    } catch (e) {
+      // Leave state.adjustmentReasonCodes null — reasonCodeOptionsHtml()
+      // falls back to FALLBACK_REASON_CODES.
+    }
+  }
+
+  function reasonCodeOptionsHtml(selected) {
+    const codes = state.adjustmentReasonCodes || FALLBACK_REASON_CODES;
+    return codes
+      .map(
+        (c) =>
+          `<option value="${escapeAttr(c.value)}"${c.value === selected ? " selected" : ""}>${escapeHtml(c.key)}</option>`
+      )
+      .join("");
   }
 
   // Hardcoded for now — Putaway is the only task type wired to a real
@@ -160,6 +197,7 @@
       state.token = data.token;
       state.facility = state.org + "-DM1";
       preloadStorageLocations(); // fire-and-forget, see its own docstring
+      preloadAdjustmentReasonCodes(); // fire-and-forget, see its own docstring
       el.org.value = state.org;
       el.orgSection.style.display = "none";
       el.mainUI.style.display = "block";
@@ -222,26 +260,19 @@
     }
   }
 
-  function renderGroups() {
-    state.selectedTaskDetailId = null;
-    renderTaskMeta();
-    const multiGroup = state.groups.length > 1;
-    el.linesTable.classList.toggle("multi-group", multiGroup);
-    const lines = allLines();
-    el.linesBody.innerHTML = lines
-      .map((line) => {
-        const remaining = remainingQty(line);
-        const isNoTask = line.groupMode === "no_task";
-        const groupLabel = isNoTask
-          ? "Container " + escapeHtml(line.groupContainerId)
-          : "Task " + escapeHtml(line.groupTaskId);
-        return `
-        <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
-          <td>${escapeHtml(line.lineNumber)}</td>
-          <td>${escapeHtml(line.lpnId)}</td>
-          <td>${escapeHtml(line.itemId)}</td>
-          <td>${escapeHtml(line.description)}</td>
-          <td>${escapeHtml(line.fromLocationId)}</td>
+  function groupCellHtml(line) {
+    const isNoTask = line.groupMode === "no_task";
+    const groupLabel = isNoTask
+      ? "Container " + escapeHtml(line.groupContainerId)
+      : "Task " + escapeHtml(line.groupTaskId);
+    return `
+          <td class="col-group">
+            ${groupLabel}<br/>${statusBadgeHtml(line.groupTaskStatusLabel, line.groupTaskStatus)}
+          </td>`;
+  }
+
+  function toLocationCellHtml(line) {
+    return `
           <td>
             <input
               type="text"
@@ -251,8 +282,90 @@
               value="${escapeAttr(line.toLocationId)}"
               autocomplete="off"
             />
+          </td>`;
+  }
+
+  /**
+   * One row for a normal (single-item) line, or a summary row plus one
+   * expandable sub-row per item for a MIXED no-task container
+   * (2026-08-08, line.mixedItems — see resolve_search()'s no_task
+   * branch). The summary row carries the shared To Location (a
+   * container only has one destination) and an aggregate read-only
+   * Planned Qty; each item's own Completed Qty/reason code live on its
+   * own sub-row, collapsed by default behind the "MIXED" toggle.
+   */
+  function renderLineRow(line) {
+    if (line.mixedItems) {
+      const summaryRow = `
+        <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+          <td>${escapeHtml(line.lineNumber)}</td>
+          <td>${escapeHtml(line.lpnId)}</td>
+          ${groupCellHtml(line)}
+          <td>
+            <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(line.taskDetailId)}">
+              <i class="fas fa-caret-right"></i> MIXED
+            </button>
           </td>
+          <td></td>
+          <td>${escapeHtml(line.fromLocationId)}</td>
+          ${toLocationCellHtml(line)}
           <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
+          <td class="col-uom"></td>
+          <td><span class="text-muted">see items below</span></td>
+          <td class="col-reason"></td>
+        </tr>`;
+      const itemRows = line.mixedItems
+        .map(
+          (item) => `
+        <tr class="mixed-item-row" data-mixed-parent="${escapeAttr(line.taskDetailId)}" style="display:none">
+          <td></td>
+          <td></td>
+          <td class="col-group"></td>
+          <td>${escapeHtml(item.itemId)}</td>
+          <td>${escapeHtml(item.description)}</td>
+          <td></td>
+          <td></td>
+          <td class="col-qty-wide">${escapeHtml(item.quantity)}</td>
+          <td class="col-uom"></td>
+          <td>
+            <input
+              type="number"
+              class="form-control mixed-qty-input"
+              data-parent-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              data-item-id="${escapeAttr(item.itemId)}"
+              data-default-qty="${escapeAttr(item.quantity)}"
+              value="${escapeAttr(item.quantity)}"
+              min="0"
+              step="any"
+            />
+          </td>
+          <td class="col-reason">
+            <select
+              class="form-select reason-code-select"
+              data-parent-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              data-item-id="${escapeAttr(item.itemId)}"
+            >
+              ${reasonCodeOptionsHtml(DEFAULT_REASON_CODE)}
+            </select>
+          </td>
+        </tr>`
+        )
+        .join("");
+      return summaryRow + itemRows;
+    }
+
+    const remaining = remainingQty(line);
+    return `
+        <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+          <td>${escapeHtml(line.lineNumber)}</td>
+          <td>${escapeHtml(line.lpnId)}</td>
+          ${groupCellHtml(line)}
+          <td>${escapeHtml(line.itemId)}</td>
+          <td>${escapeHtml(line.description)}</td>
+          <td>${escapeHtml(line.fromLocationId)}</td>
+          ${toLocationCellHtml(line)}
+          <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
+          <td class="col-uom">${escapeHtml(line.uomId)}</td>
           <td>
             <input
               type="number"
@@ -262,21 +375,27 @@
               value="${escapeAttr(remaining)}"
               min="0"
               step="any"
-              ${isNoTask ? "disabled" : ""}
             />
           </td>
-          <td class="col-group">
-            ${groupLabel}<br/>${statusBadgeHtml(line.groupTaskStatusLabel, line.groupTaskStatus)}
+          <td class="col-reason">
+            <select class="form-select reason-code-select" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+              ${reasonCodeOptionsHtml(DEFAULT_REASON_CODE)}
+            </select>
           </td>
         </tr>`;
-      })
-      .join("");
+  }
+
+  function renderGroups() {
+    state.selectedTaskDetailId = null;
+    renderTaskMeta();
+    const multiGroup = state.groups.length > 1;
+    el.linesTable.classList.toggle("multi-group", multiGroup);
+    const lines = allLines();
+    el.linesBody.innerHTML = lines.map((line) => renderLineRow(line)).join("");
     el.linesBody
       .querySelectorAll(".to-location-input")
       .forEach((input) => validateLocation(input, true));
-    el.linesBody
-      .querySelectorAll(".completed-qty-input:not(:disabled)")
-      .forEach((input) => validateQty(input));
+    el.linesBody.querySelectorAll(".completed-qty-input").forEach((input) => validateQty(input));
     updateLineActionButtons();
   }
 
@@ -316,25 +435,73 @@
 
   /**
    * Mirrors getLocationOverride() exactly, same "only send if changed"
-   * contract (2026-08-08, the Completed Qty box) — an untouched box
-   * sends nothing, so the backend keeps doing a fresh full completion
-   * off whatever it fetches at submit time (the confirmed path); only
-   * an edited-down value takes the UNCONFIRMED partial-quantity path
-   * (see task_service._complete_putaway_line_system_directed()'s
-   * docstring). Deliberately not "always send the box's value" —
-   * that would make a full completion silently depend on the
-   * frontend's possibly-stale snapshot of "remaining" matching
-   * whatever the backend freshly fetches at submit time.
+   * contract — an untouched box sends nothing, so the backend does a
+   * plain full completion, no adjustment call at all. An edited value
+   * now (2026-08-08) means "correct the LPN's actual quantity first,
+   * via Modify iLPN, then complete" — see
+   * task_service.adjust_ilpn_quantities()/complete_putaway_line()'s
+   * docstrings. Deliberately not "always send the box's value" — that
+   * would trigger a pointless adjustment call (itself a real inventory
+   * transaction) even when nothing actually changed.
    */
   function getCompletedQtyOverride(taskDetailId) {
     const input = el.linesBody.querySelector(
       '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
     );
-    if (!input || input.disabled) return undefined;
+    if (!input) return undefined;
     const value = Number(input.value);
     const original = Number(input.dataset.defaultQty || 0);
     if (!Number.isFinite(value) || value === original) return undefined;
     return value;
+  }
+
+  /**
+   * Builds the `itemAdjustments` array a completion call sends (2026-08-08)
+   * — empty if nothing changed. For a MIXED container, sends every
+   * item's *current* box value unconditionally (not just changed ones)
+   * — task_service.adjust_ilpn_quantities() already compares against
+   * live on-hand and silently skips true no-ops, so there's no need to
+   * detect "changed" client-side for each item individually. For a
+   * normal single-item line, reuses getCompletedQtyOverride()'s
+   * "only if changed" value.
+   */
+  function collectItemAdjustments(line) {
+    if (line.mixedItems) {
+      return line.mixedItems.map((item) => {
+        const input = el.linesBody.querySelector(
+          '.mixed-qty-input[data-parent-task-detail-id="' +
+            CSS.escape(line.taskDetailId) +
+            '"][data-item-id="' +
+            CSS.escape(item.itemId) +
+            '"]'
+        );
+        const select = el.linesBody.querySelector(
+          '.reason-code-select[data-parent-task-detail-id="' +
+            CSS.escape(line.taskDetailId) +
+            '"][data-item-id="' +
+            CSS.escape(item.itemId) +
+            '"]'
+        );
+        const value = input ? Number(input.value) : item.quantity;
+        return {
+          itemId: item.itemId,
+          desiredQty: Number.isFinite(value) ? value : item.quantity,
+          reasonCode: select ? select.value : DEFAULT_REASON_CODE,
+        };
+      });
+    }
+    const override = getCompletedQtyOverride(line.taskDetailId);
+    if (override === undefined) return [];
+    const reasonSelect = el.linesBody.querySelector(
+      '.reason-code-select[data-task-detail-id="' + CSS.escape(line.taskDetailId) + '"]'
+    );
+    return [
+      {
+        itemId: line.itemId,
+        desiredQty: override,
+        reasonCode: reasonSelect ? reasonSelect.value : DEFAULT_REASON_CODE,
+      },
+    ];
   }
 
   function isLocationValid(taskDetailId) {
@@ -345,29 +512,37 @@
   }
 
   /**
-   * Completed Qty must be > 0 and <= the remaining quantity it was
-   * defaulted to (data-default-qty), same gating role Current Location
-   * plays for the destination — a plain arithmetic check, synchronous,
-   * no API call needed unlike location validation. Locked (disabled)
-   * rows — no-task containers, which always move the full amount, see
-   * complete_container_putaway() — are always considered valid.
+   * Completed Qty just needs to be a non-negative number — no upper
+   * bound anymore (2026-08-08). Before the Modify iLPN adjustment
+   * mechanism, this box could only ever express a *smaller* quantity on
+   * the same move, so it was capped at "remaining." Now an edited value
+   * triggers an inventory adjustment before completion (see
+   * task_service.adjust_ilpn_quantities()), which can correct the
+   * quantity in either direction — found MORE units than expected is
+   * just as valid a correction as found fewer.
    */
   function validateQty(input) {
-    const remaining = Number(input.dataset.defaultQty || 0);
     const value = Number(input.value);
-    const valid = Number.isFinite(value) && value > 0 && value <= remaining;
+    const valid = Number.isFinite(value) && value >= 0;
     input.dataset.qtyValid = valid ? "true" : "false";
     input.classList.toggle("invalid", !valid);
     updateLineActionButtons();
   }
 
-  function isQtyValid(taskDetailId) {
+  /**
+   * Takes the line object, not just its taskDetailId (2026-08-08) — a
+   * MIXED row's summary line has no single `.completed-qty-input` of
+   * its own (its quantity is an aggregate, edited per-item in the
+   * expandable sub-rows instead), so it short-circuits valid here;
+   * gating for a MIXED completion happens server-side when the
+   * adjustment + putaway sequence actually runs.
+   */
+  function isQtyValid(line) {
+    if (line.mixedItems) return true;
     const input = el.linesBody.querySelector(
-      '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+      '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(line.taskDetailId)) + '"]'
     );
-    if (!input) return false;
-    if (input.disabled) return true;
-    return input.dataset.qtyValid === "true";
+    return !!input && input.dataset.qtyValid === "true";
   }
 
   /**
@@ -475,18 +650,14 @@
   function allOutstandingLinesValid() {
     const outstanding = allLines().filter((l) => remainingQty(l) > 0);
     if (!outstanding.length) return true; // let the click through to show "nothing to do"
-    return outstanding.every(
-      (l) => isLocationValid(l.taskDetailId) && isQtyValid(l.taskDetailId)
-    );
+    return outstanding.every((l) => isLocationValid(l.taskDetailId) && isQtyValid(l));
   }
 
   function updateLineActionButtons() {
     const selectedLine = getSelectedLine();
     const hasSelection = !!selectedLine;
     const selectedValid =
-      hasSelection &&
-      isLocationValid(selectedLine.taskDetailId) &&
-      isQtyValid(selectedLine.taskDetailId);
+      hasSelection && isLocationValid(selectedLine.taskDetailId) && isQtyValid(selectedLine);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
     el.allLinesBtn.disabled = !allOutstandingLinesValid();
   }
@@ -585,11 +756,11 @@
    * multi-LPN search) — its own groupMode/groupTaskId carry which
    * task/container it belongs to, since that's no longer one global
    * value for the whole page. `mode` is always "full" now — Partial
-   * Complete was removed; the inline Completed Qty box's value (see
-   * getCompletedQtyOverride()) is what makes a "full" completion
-   * partial, only when actually edited down.
+   * Complete was removed; `itemAdjustments` (see
+   * collectItemAdjustments()) is what corrects the quantity before
+   * completing, when it's not empty.
    */
-  async function callCompleteLine(line, quantity, warningOverrides, toLocationId, reasonCodeId) {
+  async function callCompleteLine(line, itemAdjustments, warningOverrides, toLocationId, reasonCodeId) {
     const isNoTask = line.groupMode === "no_task";
     return api("complete_line", {
       org: state.org,
@@ -598,8 +769,9 @@
       taskId: isNoTask ? "" : line.groupTaskId,
       taskDetailId: isNoTask ? "" : line.taskDetailId,
       containerId: isNoTask ? line.lpnId : undefined,
+      lpnId: line.lpnId || undefined,
       mode: "full",
-      quantity,
+      itemAdjustments: itemAdjustments && itemAdjustments.length ? itemAdjustments : undefined,
       transactionId: TRANSACTION_ID,
       warningOverrides: warningOverrides || undefined,
       toLocationId: toLocationId || undefined,
@@ -703,16 +875,16 @@
    * failure), or `{ success: false, cancelled: true }` if the user
    * cancels out of a warning.
    */
-  async function completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId) {
+  async function completeLineWithWarningHandling(line, itemAdjustments, toLocationId, reasonCodeId) {
     const overrides = {};
-    let result = await callCompleteLine(line, quantity, overrides, toLocationId, reasonCodeId);
+    let result = await callCompleteLine(line, itemAdjustments, overrides, toLocationId, reasonCodeId);
     while (result && result.warning) {
       const confirmed = await showWarningModal(result.messageId, result.messageText);
       if (!confirmed) {
         return { success: false, cancelled: true, error: "Cancelled after warning." };
       }
       overrides[result.messageId] = result.messageId;
-      result = await callCompleteLine(line, quantity, overrides, toLocationId, reasonCodeId);
+      result = await callCompleteLine(line, itemAdjustments, overrides, toLocationId, reasonCodeId);
     }
     return result;
   }
@@ -720,10 +892,13 @@
   /**
    * The single completion button (2026-08-08 — Partial Complete was
    * removed; its job is now done by editing the row's Completed Qty
-   * box down from its default before clicking this). `quantity` is
-   * undefined unless the box was actually edited (see
-   * getCompletedQtyOverride()), so an untouched row behaves exactly as
-   * "Complete Line" always did.
+   * box, or a MIXED row's per-item boxes, before clicking this — see
+   * collectItemAdjustments()). Editable for no-task rows too now
+   * (2026-08-08) — the old "no partial concept for a container" limit
+   * only applied to the DMM AcceptContainer step itself, which never
+   * changes; a different quantity now gets corrected via Modify iLPN
+   * *before* that step runs, so it applies there just as well as to a
+   * task-mode line.
    */
   async function completeLine() {
     const line = getSelectedLine();
@@ -734,7 +909,7 @@
       return;
     }
     const isNoTask = line.groupMode === "no_task";
-    const quantity = isNoTask ? undefined : getCompletedQtyOverride(line.taskDetailId);
+    const itemAdjustments = collectItemAdjustments(line);
     const toLocationId = getLocationOverride(line.taskDetailId);
     if (isNoTask && !toLocationId) {
       setActionStatus("Enter a destination location first.", "error");
@@ -750,7 +925,7 @@
     }
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
-      const result = await completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId);
+      const result = await completeLineWithWarningHandling(line, itemAdjustments, toLocationId, reasonCodeId);
       if (!result.success) {
         if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
@@ -810,7 +985,7 @@
         cancelled = true;
         break;
       }
-      const quantity = isNoTask ? undefined : getCompletedQtyOverride(line.taskDetailId);
+      const itemAdjustments = collectItemAdjustments(line);
       let reasonCodeId = null;
       if (toLocationId && !isNoTask) {
         setBusy(false);
@@ -822,7 +997,7 @@
       }
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId);
+        const result = await completeLineWithWarningHandling(line, itemAdjustments, toLocationId, reasonCodeId);
         if (result.success) {
           succeeded++;
         } else if (result.cancelled) {
@@ -863,6 +1038,19 @@
   el.loadTaskBtn.addEventListener("click", loadTask);
   el.backToFilters.addEventListener("click", showFilters);
   el.linesBody.addEventListener("click", (e) => {
+    const toggle = e.target.closest(".mixed-toggle");
+    if (toggle) {
+      const target = toggle.dataset.mixedTarget;
+      const expanded = toggle.classList.toggle("expanded");
+      const icon = toggle.querySelector("i");
+      if (icon) icon.className = expanded ? "fas fa-caret-down" : "fas fa-caret-right";
+      el.linesBody
+        .querySelectorAll('.mixed-item-row[data-mixed-parent="' + CSS.escape(target) + '"]')
+        .forEach((row) => {
+          row.style.display = expanded ? "" : "none";
+        });
+      return;
+    }
     const row = e.target.closest("tr.line-row");
     if (!row) return;
     selectLine(row.dataset.taskDetailId);
@@ -880,10 +1068,33 @@
     if (qtyInput) {
       const value = Number(qtyInput.value);
       const original = Number(qtyInput.dataset.defaultQty || 0);
-      qtyInput.classList.toggle("overridden", Number.isFinite(value) && value !== original);
+      const overridden = Number.isFinite(value) && value !== original;
+      qtyInput.classList.toggle("overridden", overridden);
       validateQty(qtyInput);
+      toggleReasonSelect(qtyInput, overridden);
+      return;
+    }
+    // Mixed-item sub-row quantity (2026-08-08) — same override/reason-
+    // select behavior as the normal Completed Qty box, but no gating
+    // role in updateLineActionButtons() (see isQtyValid()'s docstring);
+    // the min="0" input attribute plus this class is just visual
+    // feedback here, not a submission block.
+    const mixedQtyInput = e.target.closest(".mixed-qty-input");
+    if (mixedQtyInput) {
+      const value = Number(mixedQtyInput.value);
+      const original = Number(mixedQtyInput.dataset.defaultQty || 0);
+      const overridden = Number.isFinite(value) && value !== original;
+      mixedQtyInput.classList.toggle("overridden", overridden);
+      mixedQtyInput.classList.toggle("invalid", !(Number.isFinite(value) && value >= 0));
+      toggleReasonSelect(mixedQtyInput, overridden);
     }
   });
+
+  function toggleReasonSelect(qtyInput, visible) {
+    const row = qtyInput.closest("tr");
+    const reasonSelect = row ? row.querySelector(".reason-code-select") : null;
+    if (reasonSelect) reasonSelect.classList.toggle("visible", visible);
+  }
 
   const allLinesModal = window.bootstrap
     ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
