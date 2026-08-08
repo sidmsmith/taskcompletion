@@ -30,6 +30,18 @@ mawm_client.move_container_user_directed()) is commented out below,
 kept for reference in case it's needed again.
 complete_line()'s underlying mawm_client.complete_task() call remains a
 separate, still-unconfirmed placeholder for non-Putaway task types.
+
+resolve_search() is the single entry point behind the "Task Id or iLPN"
+search box (2026-08-08): try the value as a Task Id, then as a
+container — resolving to its open (not Completed/Canceled) Putaway
+task if one exists — and finally, if no task exists at all, a
+synthetic single-line "no open task" response built from the
+container's real current location + on-hand inventory. Completing that
+synthetic line goes through complete_container_putaway(), which revives
+mawm_client.move_container_user_directed() (the task-independent flow
+saved off, commented out, during the Substitute Location work) — this
+is exactly the case that flow was kept around for, since there's no
+TaskId to key the system-directed fetch+commit sequence off of.
 """
 
 from __future__ import annotations
@@ -44,12 +56,17 @@ from mawm_client import (
     complete_task,
     extract_warning,
     fetch_putaway_move,
+    move_container_user_directed,
     resolve_location,
+    search_container_inventory,
+    search_ilpn_current_location,
     search_items,
     search_putaway_reason_codes,
     search_task,
+    search_task_id_for_container,
     search_task_transactions,
     task_status_description,
+    validate_storage_location,
 )
 
 
@@ -126,19 +143,10 @@ def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = Non
     return lines
 
 
-def load_task(
-    token: str,
-    org: str,
-    task_id: str,
-    location: str = None,
-) -> Dict[str, Any]:
-    if not task_id:
-        return {"success": False, "error": "Task Id required"}
-    dest = resolve_location(org, location)
-    raw_task = search_task(task_id, token, org, location=dest)
-    if not raw_task:
-        return {"success": False, "error": f"Task {task_id} not found"}
-
+def _build_task_response(raw_task: dict, task_id: str, token: str, org: str, dest: str) -> Dict[str, Any]:
+    """Shared normalization for a real Task — used by resolve_search()'s
+    direct-TaskId and container->TaskId branches alike.
+    """
     # The Task object has no dedicated `TaskType` field — confirmed live;
     # TransactionTypeId (e.g. "Putaway") is the closest real field, with
     # LaborActivityId as a fallback for any task type where it differs.
@@ -153,6 +161,7 @@ def load_task(
 
     return {
         "success": True,
+        "mode": "task",
         "taskId": task_id,
         "facility": dest,
         "taskType": task_type,
@@ -167,6 +176,94 @@ def load_task(
         "taskTransactionId": str(_first(raw_task, "TransactionId") or ""),
         "lineCount": len(lines),
         "lines": lines,
+    }
+
+
+def resolve_search(
+    token: str,
+    org: str,
+    search_value: str,
+    location: str = None,
+) -> Dict[str, Any]:
+    """Single entry point behind the "Task Id or iLPN" search box.
+
+    1. Try `search_value` as a Task Id directly.
+    2. Else try it as a container — resolve its open (not Completed/
+       Canceled) Putaway task, if one exists, and load that.
+    3. Else, if `search_value` is at least a real iLPN, return a
+       synthetic single "no open task" line: Current Location = the
+       iLPN's real CurrentLocationId (may be blank), To Location blank
+       (the operator must enter one — see complete_container_putaway()),
+       Item/Description/Qty pulled from the container's actual on-hand
+       inventory. `mode: "no_task"` tells the frontend to render/complete
+       this differently than a real task.
+    4. Else, not found.
+    """
+    search_value = (search_value or "").strip()
+    if not search_value:
+        return {"success": False, "error": "Task Id or iLPN required"}
+
+    dest = resolve_location(org, location)
+
+    raw_task = search_task(search_value, token, org, location=dest)
+    if raw_task:
+        return _build_task_response(raw_task, search_value, token, org, dest)
+
+    found_task_id = search_task_id_for_container(search_value, token, org, location=dest)
+    if found_task_id:
+        raw_task = search_task(found_task_id, token, org, location=dest)
+        if raw_task:
+            return _build_task_response(raw_task, found_task_id, token, org, dest)
+
+    ilpn = search_ilpn_current_location(search_value, token, org, location=dest)
+    if ilpn is None:
+        return {"success": False, "error": f"No task or iLPN found for '{search_value}'"}
+
+    current_location = str(ilpn.get("CurrentLocationId") or "")
+    inv_rows = search_container_inventory(search_value, token, org, location=dest)
+    item_ids = [str(r.get("ItemId") or "") for r in inv_rows if r.get("ItemId")]
+    items = search_items(item_ids, token, org, location=dest) if item_ids else {}
+
+    mixed = len(inv_rows) > 1
+    if mixed:
+        item_id = ""
+        description = "MIXED"
+        qty = sum((_dec(r.get("OnHand")) for r in inv_rows), Decimal("0"))
+    elif inv_rows:
+        item_id = str(inv_rows[0].get("ItemId") or "")
+        description = str((items.get(item_id) or {}).get("Description") or "")
+        qty = _dec(inv_rows[0].get("OnHand"))
+    else:
+        item_id = ""
+        description = ""
+        qty = Decimal("0")
+
+    line = {
+        "lineNumber": 1,
+        "taskDetailId": f"container:{search_value}",
+        "itemId": item_id,
+        "description": description,
+        "fromLocationId": current_location,
+        "toLocationId": "",
+        "lpnId": search_value,
+        "uomId": "",
+        "plannedQuantity": _num(qty),
+        "completedQuantity": 0,
+        "remainingQuantity": _num(qty),
+    }
+    return {
+        "success": True,
+        "mode": "no_task",
+        "taskId": "",
+        "facility": dest,
+        "taskType": "PUTAWAY",
+        "taskTypeLabel": "Putaway",
+        "taskStatus": "",
+        "taskStatusLabel": "No Open Task",
+        "taskTransactionId": "",
+        "lineCount": 1,
+        "lines": [line],
+        "containerId": search_value,
     }
 
 
@@ -488,68 +585,92 @@ def _complete_putaway_line_system_directed(
     }
 
 
-# SAVED FOR LATER — "user directed putaway" (task-independent core API
-# alternative), superseded by the substitute-location + reason-code flow
-# implemented above. Kept for reference in case it's needed again — see
-# mawm_client.py's commented-out move_container_user_directed() and the
-# PUTAWAY_USER_DIRECTED_MOVE_URL/USER_DIRECTED_TRANSACTION_ID constants.
-#
-# def _complete_putaway_line_user_directed(
-#     token: str,
-#     org: str,
-#     task_id: str,
-#     task_detail_id: str,
-#     to_location_id: str,
-#     location: str = None,
-#     warning_overrides: Optional[Dict[str, str]] = None,
-# ) -> Dict[str, Any]:
-#     """User-directed putaway to an operator-chosen destination, per
-#     mawm_user_directed_putaway_with_warnings.md's core API alternative
-#     (see mawm_client.move_container_user_directed()'s docstring for why
-#     this path, not that document's proven DMM Mobile Facade flow, was
-#     used here).
-#
-#     Re-fetches the task fresh to get the line's real current ItemId/
-#     SourceContainerId/remaining quantity (same defensive re-verification
-#     receivingworkbench's own receive_line() does) — `to_location_id`
-#     itself is the only thing trusted from the caller, since it's a pure
-#     UI-state fact (what's currently typed in the grid), not fetched data.
-#     """
-#     state = _line_state(token, org, task_id, task_detail_id, location=location)
-#     if not state.get("success"):
-#         return state
-#
-#     line = state["line"]
-#     remaining = _dec(line["remainingQuantity"])
-#     if remaining <= 0:
-#         return {"success": False, "error": "No remaining quantity on this line"}
-#
-#     move_resp = move_container_user_directed(
-#         line["lpnId"],
-#         to_location_id,
-#         line["itemId"],
-#         _num(remaining),
-#         token,
-#         org,
-#         location=state["dest"],
-#         warning_overrides=warning_overrides,
-#     )
-#     warning = extract_warning(move_resp)
-#     if warning and warning["code"] not in (warning_overrides or {}):
-#         return {
-#             "success": False,
-#             "warning": True,
-#             "messageId": warning["code"],
-#             "messageText": warning["text"],
-#             "stage": "move",
-#         }
-#
-#     ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
-#     return {
-#         "success": bool(ok),
-#         "taskDetailId": task_detail_id,
-#         "quantity": _num(remaining),
-#         "toLocationId": to_location_id,
-#         "mawmResponse": move_resp,
-#         "error": None if ok else (move_resp.get("message") or "Complete failed"),
-#     }
+def complete_container_putaway(
+    token: str,
+    org: str,
+    container_id: str,
+    to_location_id: str,
+    location: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Complete putaway for a container with no open Task at all (see
+    resolve_search()'s `mode: "no_task"` branch) — the task-independent
+    "user directed putaway" call (mawm_client.move_container_user_directed()),
+    revived for exactly this case. No reason code is required here
+    (unlike Substitute Location on an existing task): there's no
+    system-directed default being overridden, just a fresh destination
+    for a loose container.
+
+    Re-fetches the container's real on-hand inventory fresh (not trusted
+    from the caller — same re-verification convention as
+    receivingworkbench's receive_line()) to get ItemId/Quantity. Fails
+    cleanly on a mixed LPN (more than one item) rather than guessing
+    which item's quantity to send.
+    """
+    dest = resolve_location(org, location)
+    rows = search_container_inventory(container_id, token, org, location=dest)
+    if not rows:
+        return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
+    if len(rows) > 1:
+        return {
+            "success": False,
+            "error": f"{container_id} holds more than one item — not supported here.",
+        }
+
+    item_id = str(rows[0].get("ItemId") or "")
+    quantity = _dec(rows[0].get("OnHand"))
+    if not item_id or quantity <= 0:
+        return {"success": False, "error": f"No on-hand inventory found for {container_id}"}
+
+    move_resp = move_container_user_directed(
+        container_id,
+        to_location_id,
+        item_id,
+        _num(quantity),
+        token,
+        org,
+        location=dest,
+        warning_overrides=warning_overrides,
+    )
+    warning = extract_warning(move_resp)
+    if warning and warning["code"] not in (warning_overrides or {}):
+        return {
+            "success": False,
+            "warning": True,
+            "messageId": warning["code"],
+            "messageText": warning["text"],
+            "stage": "move",
+        }
+
+    ok = move_resp.get("success", True) if isinstance(move_resp, dict) else True
+    return {
+        "success": bool(ok),
+        "taskDetailId": f"container:{container_id}",
+        "quantity": _num(quantity),
+        "toLocationId": to_location_id,
+        "mawmResponse": move_resp,
+        "error": None if ok else (move_resp.get("message") or "Complete failed"),
+    }
+
+
+def validate_putaway_location(
+    token: str, org: str, location_text: str, location: str = None
+) -> Dict[str, Any]:
+    """Backs the frontend's To Location validity check — per explicit
+    instruction, button-gating depends on a real, active Storage
+    location, not just non-blank text (see
+    mawm_client.validate_storage_location()).
+    """
+    text = (location_text or "").strip()
+    if not text:
+        return {"success": True, "valid": False}
+    dest = resolve_location(org, location)
+    row = validate_storage_location(text, token, org, location=dest)
+    if not row:
+        return {"success": True, "valid": False}
+    return {
+        "success": True,
+        "valid": True,
+        "locationId": str(row.get("LocationId") or ""),
+        "displayLocation": str(row.get("DisplayLocation") or row.get("LocationId") or ""),
+    }

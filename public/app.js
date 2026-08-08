@@ -47,6 +47,7 @@
     reasonCodeSelect: document.getElementById("reasonCodeSelect"),
     reasonCodeHint: document.getElementById("reasonCodeHint"),
     reasonCodeConfirmBtn: document.getElementById("reasonCodeConfirmBtn"),
+    transactionIdValue: document.getElementById("transactionIdValue"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
@@ -202,6 +203,9 @@
         </tr>`
       )
       .join("");
+    el.linesBody
+      .querySelectorAll(".to-location-input")
+      .forEach((input) => validateLocation(input, true));
   }
 
   /** Completed/Canceled = red, everything else = green (for now). */
@@ -234,11 +238,80 @@
     return value;
   }
 
+  function getLineByTaskDetailId(taskDetailId) {
+    if (!state.task) return null;
+    return (state.task.lines || []).find(
+      (l) => String(l.taskDetailId) === String(taskDetailId)
+    ) || null;
+  }
+
+  function isLocationValid(taskDetailId) {
+    const input = el.linesBody.querySelector(
+      '.to-location-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    return !!input && input.dataset.locationValid === "true";
+  }
+
+  /**
+   * A To Location must always resolve to a real, active Storage location
+   * before any of the 3 completion buttons are usable — per explicit
+   * instruction, this applies to every Putaway line, not just the
+   * no-open-task case. `dataset.locationValid` starts unset (falsy) on
+   * every row until validateLocation() resolves, so buttons stay
+   * disabled until that first check completes, not just on override.
+   */
+  const locationValidateTimers = new WeakMap();
+
+  function validateLocation(input, immediate) {
+    clearTimeout(locationValidateTimers.get(input));
+    const run = async () => {
+      const value = input.value.trim();
+      if (!value) {
+        input.dataset.locationValid = "false";
+        input.classList.add("invalid");
+        updateLineActionButtons();
+        return;
+      }
+      try {
+        const data = await api("validate_putaway_location", {
+          org: state.org,
+          token: state.token,
+          location: state.facility,
+          locationText: value,
+        });
+        const valid = !!(data.success && data.valid);
+        input.dataset.locationValid = valid ? "true" : "false";
+        input.classList.toggle("invalid", !valid);
+      } catch (e) {
+        input.dataset.locationValid = "false";
+        input.classList.add("invalid");
+      }
+      updateLineActionButtons();
+    };
+    if (immediate) {
+      run();
+      return;
+    }
+    locationValidateTimers.set(input, setTimeout(run, 400));
+  }
+
+  function allOutstandingLinesValid() {
+    if (!state.task) return true;
+    const outstanding = (state.task.lines || []).filter((l) => remainingQty(l) > 0);
+    if (!outstanding.length) return true; // let the click through to show "nothing to do"
+    return outstanding.every((l) => isLocationValid(l.taskDetailId));
+  }
+
   function updateLineActionButtons() {
     const hasSelection = state.selectedLineNumber !== null;
-    el.partialLineBtn.disabled = !hasSelection;
-    el.fullLineBtn.disabled = !hasSelection;
-    el.allLinesBtn.disabled = false;
+    const selectedLine = getSelectedLine();
+    const selectedValid = !!selectedLine && isLocationValid(selectedLine.taskDetailId);
+    const isNoTask = !!state.task && state.task.mode === "no_task";
+    // Partial isn't wired for the no-open-task container flow (it always
+    // moves the full on-hand quantity) — see complete_container_putaway().
+    el.partialLineBtn.disabled = !hasSelection || !selectedValid || isNoTask;
+    el.fullLineBtn.disabled = !hasSelection || !selectedValid;
+    el.allLinesBtn.disabled = !allOutstandingLinesValid();
   }
 
   function selectLine(lineNumber) {
@@ -262,12 +335,12 @@
     el.taskIdInput.focus();
   }
 
-  async function fetchAndRenderTask(taskId) {
+  async function fetchAndRenderTask(searchValue) {
     const data = await api("load_task", {
       org: state.org,
       token: state.token,
       location: state.facility,
-      taskId,
+      taskId: searchValue,
     });
     if (!data.success) {
       setStatus(data.error || "Load failed", "error");
@@ -275,21 +348,33 @@
     }
     state.task = data;
     renderLines(data.lines);
-    el.taskMeta.innerHTML = `
-      <span><strong>Task</strong> ${escapeHtml(data.taskId)}</span>
-      <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
-      <span><strong>Status</strong> ${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
-    `;
+    if (data.mode === "no_task") {
+      // No open Putaway task for this container — see
+      // task_service.resolve_search()'s no_task branch.
+      el.taskMeta.innerHTML = `
+        <span><strong>Container</strong> ${escapeHtml(data.containerId || "")}</span>
+        <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
+        <span>${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
+      `;
+      el.transactionIdValue.textContent = "User Directed";
+    } else {
+      el.taskMeta.innerHTML = `
+        <span><strong>Task</strong> ${escapeHtml(data.taskId)}</span>
+        <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
+        <span><strong>Status</strong> ${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
+      `;
+      el.transactionIdValue.textContent = TRANSACTION_ID;
+    }
     el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
     return true;
   }
 
   async function loadTask() {
-    const taskId = el.taskIdInput.value.trim();
-    if (!taskId) return;
-    setBusy(true, "Loading task…");
+    const searchValue = el.taskIdInput.value.trim();
+    if (!searchValue) return;
+    setBusy(true, "Loading…");
     try {
-      const ok = await fetchAndRenderTask(taskId);
+      const ok = await fetchAndRenderTask(searchValue);
       if (ok) showResults();
     } catch (e) {
       setStatus(e.message || String(e), "error");
@@ -308,6 +393,12 @@
     if (!el.loadTaskBtn.disabled) await loadTask();
   }
 
+  /** Re-search value to refresh the currently loaded task/container by. */
+  function currentSearchValue() {
+    if (!state.task) return "";
+    return state.task.mode === "no_task" ? state.task.containerId : state.task.taskId;
+  }
+
   function getSelectedLine() {
     if (state.selectedLineNumber === null || !state.task) return null;
     return (state.task.lines || []).find(
@@ -321,12 +412,15 @@
   }
 
   async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides, toLocationId, reasonCodeId) {
+    const isNoTask = state.task.mode === "no_task";
+    const line = isNoTask ? getLineByTaskDetailId(taskDetailId) : null;
     return api("complete_line", {
       org: state.org,
       token: state.token,
       location: state.facility,
-      taskId: state.task.taskId,
-      taskDetailId,
+      taskId: isNoTask ? "" : state.task.taskId,
+      taskDetailId: isNoTask ? "" : taskDetailId,
+      containerId: isNoTask ? (line ? line.lpnId : "") : undefined,
       mode,
       quantity,
       transactionId: TRANSACTION_ID,
@@ -455,8 +549,13 @@
       return;
     }
     const toLocationId = getLocationOverride(line.taskDetailId);
+    const isNoTask = state.task.mode === "no_task";
+    if (isNoTask && !toLocationId) {
+      setActionStatus("Enter a destination location first.", "error");
+      return;
+    }
     let reasonCodeId = null;
-    if (toLocationId) {
+    if (toLocationId && !isNoTask) {
       reasonCodeId = await promptReasonCode(line, toLocationId);
       if (!reasonCodeId) {
         setActionStatus("Cancelled — a reason code is required to change the destination.", "");
@@ -475,7 +574,7 @@
           " on line " + line.lineNumber + ".",
         "success"
       );
-      await fetchAndRenderTask(state.task.taskId);
+      await fetchAndRenderTask(currentSearchValue());
     } catch (e) {
       setActionStatus(e.message || String(e), "error");
     } finally {
@@ -532,7 +631,7 @@
           " on line " + line.lineNumber + ".",
         "success"
       );
-      await fetchAndRenderTask(state.task.taskId);
+      await fetchAndRenderTask(currentSearchValue());
     } catch (e) {
       setActionStatus(e.message || String(e), "error");
     } finally {
@@ -565,11 +664,16 @@
     let succeeded = 0;
     let cancelled = false;
     const failures = [];
+    const isNoTask = state.task.mode === "no_task";
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
       const toLocationId = getLocationOverride(line.taskDetailId);
+      if (isNoTask && !toLocationId) {
+        cancelled = true;
+        break;
+      }
       let reasonCodeId = null;
-      if (toLocationId) {
+      if (toLocationId && !isNoTask) {
         setBusy(false);
         reasonCodeId = await promptReasonCode(line, toLocationId);
         if (!reasonCodeId) {
@@ -593,7 +697,7 @@
       }
     }
     setBusy(false);
-    await fetchAndRenderTask(state.task.taskId);
+    await fetchAndRenderTask(currentSearchValue());
     if (cancelled) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + " before cancelling.", "");
     } else if (!failures.length) {
@@ -630,6 +734,7 @@
     const value = input.value.trim().toUpperCase();
     const original = (input.dataset.defaultLocation || "").trim().toUpperCase();
     input.classList.toggle("overridden", !!value && value !== original);
+    validateLocation(input);
   });
 
   const partialLineModal = window.bootstrap

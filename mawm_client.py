@@ -78,15 +78,30 @@ PUTAWAY_FETCH_MOVE_URL_TEMPLATE = f"{HOST}/putaway/api/putaway/execution/task/{{
 PUTAWAY_COMMIT_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/transfer/commitAndFetchNextMove"
 PUTAWAY_EXECUTION_CRITERIA_ID = "Putaway Execution Criteria"
 
-# SAVED FOR LATER — "user directed putaway" (task-independent core API
-# alternative). Replaced 2026-08 by the substitute-location + reason-code
-# flow (see complete_putaway_line() in task_service.py and
-# mawm_substitute_location_to_user_directed_putaway.md), which keeps
-# using the same task-based fetch+commit sequence instead. Kept here,
-# commented out, in case this task-independent approach is needed again
-# — see move_container_user_directed() below, also commented out.
-# PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
-# USER_DIRECTED_TRANSACTION_ID = "User Directed"
+# Confirmed-by-user-provided-capture (mawm_user_directed_putaway_with_
+# warnings.md's "core API alternative") — task-independent putaway,
+# revived 2026-08-08 for the no-open-task iLPN case (see
+# task_service.complete_container_putaway()). Not used for the
+# Substitute-Location-on-an-existing-task case — that still goes through
+# the system-directed fetch+commit sequence with an overridden
+# destination (see _complete_putaway_line_system_directed()).
+PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
+USER_DIRECTED_TRANSACTION_ID = "User Directed"
+
+# CONFIRMED live — resolves the open (not Completed/Canceled) Putaway
+# task for a container, and an iLPN's current location + on-hand
+# contents when no such task exists. See search_task_id_for_container()/
+# search_ilpn_current_location()/search_container_inventory() below.
+ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
+INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
+
+# CONFIRMED live — Tier 1 (mawm_api_library/location/api.md). Real
+# putaway destinations observed in SS-DEMO (R1R20701, C1CS0110,
+# C1CS0111) all carry LocationTypeId="STORAGE" — used to validate a
+# user-typed "To Location" is a real storage location, per explicit
+# instruction that button-gating depend on this, not just non-blank text.
+LOCATION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/location/search"
+STORAGE_LOCATION_TYPE_ID = "STORAGE"
 
 # CONFIRMED live against SS-DEMO — the document's own
 # `/api/putaway/config/services/reasonCodes/list` guess (hedged there as
@@ -309,6 +324,125 @@ def search_task_transactions(
     return _response_data_list(response.json())
 
 
+def search_task_id_for_container(
+    container_id: str, token: str, org: str, location: str = None
+) -> Optional[str]:
+    """CONFIRMED live — the open (not Completed/Canceled) Putaway TaskId
+    for a container, or None if there isn't one.
+
+    Query: `(TaskDetail.SourceContainerId ='{id}' or
+    TaskDetail.TargetContainerId ='{id}') and TransactionTypeId
+    ='Putaway' and Status !='8000' and Status !='9000'` — the nested
+    `TaskDetail.<field>` dotted-path filter on the header search is
+    confirmed to work (mirrors mawm_api_library's documented
+    `AsnLine.PurchaseOrderId` pattern for a different object); `Status
+    not in (...)` was tried and rejected with a 400, chained `!=` works.
+    Also confirmed live: filtering out TransactionTypeId narrows out
+    unrelated task types on the same container (a real LPN in SS-DEMO
+    had both an open Putaway task and an open "LPN Disposition" task).
+    """
+    token = normalize_token(token)
+    quoted = container_id.replace("'", "''")
+    query = (
+        f"(TaskDetail.SourceContainerId ='{quoted}' or "
+        f"TaskDetail.TargetContainerId ='{quoted}') and "
+        f"TransactionTypeId ='Putaway' and Status !='8000' and Status !='9000'"
+    )
+    response = _post(
+        TASK_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={"Query": query, "Size": 5, "Page": 0},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"task-by-container search failed: {response.status_code} {response.text[:500]}"
+        )
+    data = _response_data_list(response.json())
+    return str(data[0].get("TaskId")) if data else None
+
+
+def search_ilpn_current_location(
+    container_id: str, token: str, org: str, location: str = None
+) -> Optional[dict]:
+    """CONFIRMED live (Tier 1, mawm_api_library/ilpn/api.md) — one iLPN
+    row (for its CurrentLocationId), or None if the iLPN doesn't exist.
+    """
+    token = normalize_token(token)
+    quoted = container_id.replace("'", "''")
+    response = _post(
+        ILPN_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "Query": f"IlpnId ='{quoted}'",
+            "Size": 5,
+            "Page": 0,
+            "Template": {"IlpnId": "", "CurrentLocationId": ""},
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"ilpn search failed: {response.status_code} {response.text[:500]}"
+        )
+    data = _response_data_list(response.json())
+    return data[0] if data else None
+
+
+def search_container_inventory(
+    container_id: str, token: str, org: str, location: str = None
+) -> List[dict]:
+    """CONFIRMED live — {ItemId, OnHand} rows for a container's actual
+    on-hand contents, same endpoint/shape receivingworkbench already
+    uses for received-LPN summaries. More than one row means the LPN is
+    mixed (more than one item).
+    """
+    token = normalize_token(token)
+    quoted = container_id.replace("'", "''")
+    response = _post(
+        INVENTORY_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "Query": f"InventoryContainerId ='{quoted}' and InventoryContainerTypeId ='ILPN'",
+            "Size": 50,
+            "Page": 0,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"inventory search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
+
+def validate_storage_location(
+    location_text: str, token: str, org: str, location: str = None
+) -> Optional[dict]:
+    """CONFIRMED live — resolves a typed value against a real, active
+    STORAGE location, matching either LocationId or DisplayLocation
+    (case-insensitively handled by the caller — this does one exact-value
+    query per candidate field rather than a client-side cached list,
+    since Storage locations can run into the thousands org-wide, unlike
+    receivingworkbench's much smaller preloaded STAGING list). Returns
+    the matched row, or None if nothing matches.
+    """
+    token = normalize_token(token)
+    quoted = location_text.replace("'", "''")
+    query = (
+        f"(LocationId ='{quoted}' or DisplayLocation ='{quoted}') and "
+        f"LocationTypeId ='{STORAGE_LOCATION_TYPE_ID}' and IsActive=true"
+    )
+    response = _post(
+        LOCATION_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={"Query": query, "Size": 5, "Page": 0},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"location search failed: {response.status_code} {response.text[:500]}"
+        )
+    data = _response_data_list(response.json())
+    return data[0] if data else None
+
+
 def search_items(
     item_ids: List[str], token: str, org: str, location: str = None
 ) -> Dict[str, dict]:
@@ -423,65 +557,60 @@ def commit_putaway_move(
     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
 
 
-# SAVED FOR LATER — "user directed putaway" (task-independent core API
-# alternative), superseded by the substitute-location + reason-code flow.
-# See the PUTAWAY_USER_DIRECTED_MOVE_URL comment above for context and
-# task_service.py's own commented-out _complete_putaway_line_user_directed()
-# for the orchestration this was called from. Uncomment both (and the two
-# constants above) to bring this path back.
-#
-# def move_container_user_directed(
-#     container_id: str,
-#     to_location_id: str,
-#     item_id: str,
-#     quantity,
-#     token: str,
-#     org: str,
-#     location: str = None,
-#     warning_overrides: Optional[Dict[str, str]] = None,
-# ) -> dict:
-#     """UNCONFIRMED — user-directed putaway to an operator-chosen
-#     destination, per mawm_user_directed_putaway_with_warnings.md's core
-#     API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
-#     this (not the document's proven DMM Mobile Facade flow) was chosen.
-#
-#     Task-independent by design (per the document: "no task DTO, no task
-#     ID, and no allocation ID in the active move") — takes ContainerId/
-#     ItemId/Quantity/ToLocationId directly, unlike the system-directed
-#     Path C flow which is keyed by TaskId.
-#
-#     `warning_overrides`, if given, is sent the same way as
-#     commit_putaway_move()'s — a top-level `userInputs` map — which is
-#     itself an unconfirmed extrapolation there; doubly so here, since
-#     this endpoint's own warning contract is explicitly unconfirmed by
-#     the source document.
-#     """
-#     token = normalize_token(token)
-#     payload = {
-#         "ContainerId": container_id,
-#         "ToLocationId": to_location_id,
-#         "TransactionId": USER_DIRECTED_TRANSACTION_ID,
-#         "ItemId": item_id,
-#         "ScannedQty": quantity,
-#     }
-#     if warning_overrides:
-#         payload["userInputs"] = warning_overrides
-#     response = _post(
-#         PUTAWAY_USER_DIRECTED_MOVE_URL,
-#         headers=build_task_headers(token, org, location=location),
-#         json=payload,
-#     )
-#     try:
-#         body = response.json()
-#     except Exception:
-#         body = {"raw": response.text[:1200]}
-#     if response.status_code not in (200, 201):
-#         raise RuntimeError(
-#             f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
-#         )
-#     if isinstance(body, dict):
-#         body["_requestPayload"] = payload
-#     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+def move_container_user_directed(
+    container_id: str,
+    to_location_id: str,
+    item_id: str,
+    quantity,
+    token: str,
+    org: str,
+    location: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> dict:
+    """UNCONFIRMED — user-directed putaway to an operator-chosen
+    destination, per mawm_user_directed_putaway_with_warnings.md's core
+    API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
+    this (not the document's proven DMM Mobile Facade flow) was chosen.
+
+    Task-independent by design (per the document: "no task DTO, no task
+    ID, and no allocation ID in the active move") — takes ContainerId/
+    ItemId/Quantity/ToLocationId directly, unlike the system-directed
+    Path C flow which is keyed by TaskId. This is exactly why it was
+    revived for task_service.complete_container_putaway(): the no-open-
+    task iLPN case has no TaskId to key off of either.
+
+    `warning_overrides`, if given, is sent the same way as
+    commit_putaway_move()'s — a top-level `userInputs` map — which is
+    itself an unconfirmed extrapolation there; doubly so here, since
+    this endpoint's own warning contract is explicitly unconfirmed by
+    the source document.
+    """
+    token = normalize_token(token)
+    payload = {
+        "ContainerId": container_id,
+        "ToLocationId": to_location_id,
+        "TransactionId": USER_DIRECTED_TRANSACTION_ID,
+        "ItemId": item_id,
+        "ScannedQty": quantity,
+    }
+    if warning_overrides:
+        payload["userInputs"] = warning_overrides
+    response = _post(
+        PUTAWAY_USER_DIRECTED_MOVE_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
+        )
+    if isinstance(body, dict):
+        body["_requestPayload"] = payload
+    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
 
 
 def search_putaway_reason_codes(token: str, org: str, location: str = None) -> List[dict]:

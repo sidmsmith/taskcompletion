@@ -95,17 +95,64 @@ from a real captured request/response set the user supplied):
   commit endpoint is an extrapolation, flagged as such in the relevant
   docstrings.
 
-**Superseded, kept commented out for reference** — the earlier
-task-independent "user directed putaway" approach
-(`mawm_client.move_container_user_directed()`,
-`POST putaway/api/putaway/execution/container/move`, from
+**Revived 2026-08-08** — `mawm_client.move_container_user_directed()`
+(`POST putaway/api/putaway/execution/container/move`, from
 `mawm_user_directed_putaway_with_warnings.md`'s core API alternative)
-worked when tested, but was replaced by the Substitute Location +
-reason-code flow above per explicit instruction ("directed putaway is
-still used" is the more proper flow). Not deleted — commented out in
-both `mawm_client.py` (the function + its URL/transaction-id constants)
-and `task_service.py` (`_complete_putaway_line_user_directed()`) in case
-it's needed again.
+was superseded on an *existing task* by the Substitute Location +
+reason-code flow above, but turned out to be exactly the right tool for
+a container with **no task at all** — see "iLPN search" below. It's
+active again via `task_service.complete_container_putaway()`, not
+commented out. `task_service._complete_putaway_line_user_directed()` —
+the old orchestration that called it for the on-task case — remains
+commented out (superseded, not needed); uncomment it if the on-task
+case ever needs to bypass Substitute Location again.
+
+## iLPN search (2026-08-08)
+
+The search box now accepts a Task Id **or** an iLPN — one field,
+auto-detect (`task_service.resolve_search()`):
+
+1. Try the value as a Task Id.
+2. Else, try it as a container: resolve its open (not Completed/
+   Canceled) Putaway task, if one exists — **CONFIRMED live**:
+   `TaskDetail.SourceContainerId ='{id}' or TaskDetail.TargetContainerId
+   ='{id}'`, combined with `TransactionTypeId ='Putaway' and Status
+   !='8000' and Status !='9000'`, on the same `task/api/task/task/search`
+   endpoint (the nested `TaskDetail.<field>` dotted-path filter works on
+   the header search, mirroring `mawm_api_library`'s documented
+   `AsnLine.PurchaseOrderId` pattern for a different object; `Status not
+   in (...)` was tried and rejected with a 400 — chained `!=` works).
+   The `TransactionTypeId` filter matters: a real SS-DEMO container had
+   both an open Putaway task and an unrelated open "LPN Disposition"
+   task on it.
+3. Else, if it's at least a real iLPN, return `mode: "no_task"`: a
+   synthetic single line with Current Location = the iLPN's real
+   `CurrentLocationId` (**CONFIRMED live**, `dcinventory/ilpn/search`)
+   and Item/Description/Qty from its actual on-hand inventory
+   (**CONFIRMED live**, `dcinventory/inventory/search` — same
+   endpoint/shape `receivingworkbench` already uses). To Location starts
+   blank; fails cleanly if the LPN holds more than one item (mixed-LPN
+   putaway isn't handled).
+4. Completing that synthetic line goes through
+   `complete_container_putaway()` → the revived
+   `move_container_user_directed()` — **no reason code required** here
+   (unlike Substitute Location: there's no system-directed default being
+   overridden). **UNCONFIRMED**: nobody has completed a no-task
+   container through this app yet; only the read/search side has been
+   verified live.
+
+**To Location validation now applies everywhere, always** (per explicit
+instruction, not just the no-task case): `validate_storage_location()`
+(**CONFIRMED live** — `dcinventory/location/search`,
+`LocationTypeId ='STORAGE' and IsActive=true`; real putaway destinations
+`R1R20701`/`C1CS0110`/`C1CS0111` all confirmed to carry
+`LocationTypeId="STORAGE"`) backs a per-row, debounced frontend check
+(`public/app.js`'s `validateLocation()`) that gates all 3 completion
+buttons — Partial/Complete Line need the *selected* line's destination
+valid; Complete All needs every *outstanding* line's destination valid.
+Partial Complete is also unconditionally disabled in `no_task` mode — it
+isn't wired for the container flow (`complete_container_putaway()`
+always moves the full on-hand quantity, no partial-quantity concept).
 
 **Still unconfirmed**: `complete_task()` (`task/api/task/task/completeTask`,
 URL and payload both guessed — the original, generic placeholder for
@@ -138,6 +185,12 @@ The Substitute Location capture used `IBPWIBPT0105` / `LPN00760`
 — also real test data, but from the DMM stateful flow, not this app's
 core-API extrapolation; not independently verified as still outstanding
 in `SS-DEMO`.
+
+For iLPN search: `LPN00763` resolves to open task `IBPWIBPT0109`
+(confirmed live, `mode: "task"`); `LPN00076` has no open task and
+resolves to the `mode: "no_task"` synthetic line (confirmed live —
+current location `DROPR113`, item `50002217`/"Whale Logo Tie", qty
+240). Neither has been completed through the no-task path yet.
 
 ## Status badge
 

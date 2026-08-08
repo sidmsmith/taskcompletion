@@ -15,11 +15,13 @@ if str(ROOT) not in sys.path:
 
 from mawm_client import TASK_TYPES, get_manhattan_token, normalize_token, validate_org  # noqa: E402
 from task_service import (  # noqa: E402
+    complete_container_putaway,
     complete_line,
     complete_putaway_line,
-    load_task,
     preload_putaway_reason_codes,
     preload_task_transactions,
+    resolve_search,
+    validate_putaway_location,
 )
 
 app = Flask(__name__)
@@ -27,7 +29,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.2.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -151,16 +153,20 @@ def load_task_route():
     if err:
         return err
     location = (data.get("location") or data.get("facility") or "").strip() or None
-    task_id = (data.get("taskId") or data.get("task_id") or "").strip()
+    # Field name kept as taskId for minimal churn — resolve_search()
+    # accepts either a Task Id or an iLPN in the same value (see its
+    # docstring); the frontend's search box now accepts both too.
+    search_value = (data.get("taskId") or data.get("task_id") or "").strip()
     try:
-        result = load_task(token, org, task_id, location=location)
+        result = resolve_search(token, org, search_value, location=location)
         forward_usage_event(
             {
                 "app_name": APP_NAME,
                 "app_version": APP_VERSION,
                 "event_name": "load_task_completed" if result.get("success") else "load_task_failed",
                 "org": org,
-                "taskId": task_id,
+                "searchValue": search_value,
+                "mode": result.get("mode"),
                 "taskType": result.get("taskType"),
             }
         )
@@ -173,10 +179,26 @@ def load_task_route():
                 "app_version": APP_VERSION,
                 "event_name": "load_task_failed",
                 "org": org,
-                "taskId": task_id,
+                "searchValue": search_value,
                 "error": str(e),
             }
         )
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/validate_putaway_location", methods=["POST"])
+def validate_putaway_location_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    location_text = (data.get("locationText") or data.get("location_text") or "").strip()
+    try:
+        result = validate_putaway_location(token, org, location_text, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[VALIDATE_PUTAWAY_LOCATION] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -225,6 +247,7 @@ def complete_line_route():
     location = (data.get("location") or data.get("facility") or "").strip() or None
     task_id = (data.get("taskId") or data.get("task_id") or "").strip()
     task_detail_id = (data.get("taskDetailId") or data.get("task_detail_id") or "").strip()
+    container_id = (data.get("containerId") or data.get("container_id") or "").strip()
     mode = (data.get("mode") or "").strip().lower()
     quantity = data.get("quantity")
     transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
@@ -232,43 +255,58 @@ def complete_line_route():
     warning_overrides = data.get("warningOverrides") or data.get("warning_overrides") or None
     to_location_id = (data.get("toLocationId") or data.get("to_location_id") or "").strip()
     reason_code_id = (data.get("reasonCodeId") or data.get("reason_code_id") or "").strip()
-    if not task_id or not task_detail_id:
-        return jsonify({"success": False, "error": "taskId and taskDetailId required"})
-    if not transaction_id:
-        return jsonify({"success": False, "error": "Transaction ID is required"})
+
     try:
-        if mode == "full":
-            # Putaway's confirmed-by-capture full-completion path (see
-            # task_service.complete_putaway_line). Other task types aren't
-            # wired to this yet — this app currently only builds/tests
-            # Putaway, so "full" always routes here for now. A non-blank
-            # toLocationId means the user edited the grid's destination
-            # away from what was loaded — see complete_putaway_line()'s
-            # docstring for the required reasonCodeId and Substitute
-            # Location handling.
-            result = complete_putaway_line(
+        if container_id:
+            # No open task at all (resolve_search()'s mode: "no_task") —
+            # the task-independent flow, keyed by container instead.
+            if not to_location_id:
+                return jsonify({"success": False, "error": "A destination location is required"})
+            result = complete_container_putaway(
                 token,
                 org,
-                task_id,
-                task_detail_id,
-                transaction_id,
+                container_id,
+                to_location_id,
                 location=location,
                 warning_overrides=warning_overrides,
-                to_location_id=to_location_id or None,
-                reason_code_id=reason_code_id or None,
             )
         else:
-            result = complete_line(
-                token,
-                org,
-                task_id,
-                task_detail_id,
-                mode,
-                transaction_id,
-                strategy_id=strategy_id or None,
-                quantity=quantity,
-                location=location,
-            )
+            if not task_id or not task_detail_id:
+                return jsonify({"success": False, "error": "taskId and taskDetailId required"})
+            if not transaction_id:
+                return jsonify({"success": False, "error": "Transaction ID is required"})
+            if mode == "full":
+                # Putaway's confirmed-by-capture full-completion path (see
+                # task_service.complete_putaway_line). Other task types
+                # aren't wired to this yet — this app currently only
+                # builds/tests Putaway, so "full" always routes here for
+                # now. A non-blank toLocationId means the user edited the
+                # grid's destination away from what was loaded — see
+                # complete_putaway_line()'s docstring for the required
+                # reasonCodeId and Substitute Location handling.
+                result = complete_putaway_line(
+                    token,
+                    org,
+                    task_id,
+                    task_detail_id,
+                    transaction_id,
+                    location=location,
+                    warning_overrides=warning_overrides,
+                    to_location_id=to_location_id or None,
+                    reason_code_id=reason_code_id or None,
+                )
+            else:
+                result = complete_line(
+                    token,
+                    org,
+                    task_id,
+                    task_detail_id,
+                    mode,
+                    transaction_id,
+                    strategy_id=strategy_id or None,
+                    quantity=quantity,
+                    location=location,
+                )
         forward_usage_event(
             {
                 "app_name": APP_NAME,
@@ -276,7 +314,7 @@ def complete_line_route():
                 "event_name": "complete_line_completed" if result.get("success") else "complete_line_failed",
                 "org": org,
                 "taskId": task_id,
-                "taskDetailId": task_detail_id,
+                "taskDetailId": task_detail_id or container_id,
                 "mode": mode,
             }
         )
@@ -290,7 +328,7 @@ def complete_line_route():
                 "event_name": "complete_line_failed",
                 "org": org,
                 "taskId": task_id,
-                "taskDetailId": task_detail_id,
+                "taskDetailId": task_detail_id or container_id,
                 "error": str(e),
             }
         )

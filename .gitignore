@@ -1,7 +1,10 @@
 # Secrets & local
 .token
+*.token
 .env
 .env.local
+.env.*.local
+!.env.example
 
 # Python
 __pycache__/
