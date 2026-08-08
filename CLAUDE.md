@@ -749,6 +749,17 @@ whose LPN ends up in this state shows a genuinely blank Current
 Location with no `*` fallback, which is accurate, just worth knowing
 isn't the same situation as a truly consumed LPN).
 
+**Needs manual re-verification in WM after a data refresh** — user
+flagged there's a good chance `C1CS0110` not consuming `LPN00760` was
+bad/stale test data rather than a genuine Path C behavior difference.
+To re-check by hand in the mobile UI: find a fresh allocated task
+headed to `C1CS0110` (or another `InventoryReservationTypeId='LOCATION'`
+destination), complete the putaway there, and see whether WM shows the
+LPN as consumed (no longer independently adjustable) or still live.
+`IBPWIBPT0105`/`LPN00760` itself is already used up (task completed,
+LPN now at qty 9, "Not Allocated") so this needs a *different* fresh
+task, not a repeat of that exact one.
+
 ## LPN status badge, consumed-location display (2026-08-08, seventh session)
 
 - **`mawm_client.ILPN_STATUS_LABELS`/`ilpn_status_description()`** — the
