@@ -77,15 +77,23 @@ from a real captured request/response set the user supplied):
   `key`/`value` (that shape belongs to the DMM facade's own lookup
   response, not this core search endpoint).
 
-  **UNCONFIRMED (the substitution itself)**: the document only captures the DMM
-  Mobile Facade's stateful equivalent of this substitution
+  **CONFIRMED live, 2026-08-08**: the substitution itself. The document
+  only ever captured the DMM Mobile Facade's stateful equivalent
   (`SubstituteLocation` → `EnterReasonCodeForSubstituteAction` →
-  `AcceptLocationForUserDirectedPutaway`, each carrying a `workflowVO`);
-  it never captures the core `commitAndFetchNextMove` payload with an
-  overridden `ToLocationId`/`ReasonCodeId` directly, so putting a
-  `ReasonCodeId` field on `InventoryMove` is this app's own extrapolation
-  (see `_complete_putaway_line_system_directed()`'s docstring). If MAWM
-  rejects this shape, the DMM stateful flow is the documented fallback.
+  `AcceptLocationForUserDirectedPutaway`), never the core
+  `commitAndFetchNextMove` payload with an overridden
+  `ToLocationId`/`ReasonCodeId` directly — so putting a `ReasonCodeId`
+  field on `InventoryMove` was this app's own extrapolation (see
+  `_complete_putaway_line_system_directed()`'s docstring), and it works:
+  tested against task `IBPWIBPT0221` (container `LPN000000000315`,
+  item `3000223`, qty 50), substituting the planned destination
+  `A1AC0114` for `A1AC0119` with reason `Damaged Location`. `success:
+  true`, and independently confirmed — not just trusted — by
+  re-querying: the task shows `Completed`/`50 of 50`, and a direct
+  inventory search for `LocationId ='A1AC0119' and ItemId ='3000223'`
+  returns the full 50 units on hand there (the source container itself
+  goes empty, `CurrentLocationId: null`, which is expected — its
+  contents moved to the destination location, not to a new container).
 - Warning handling (`extract_warning()`) checks both documents' shapes:
   the standard `messages.Message[]` envelope and the DMM
   `workflowVO.header.state.errorVOList` shape (the source of the
@@ -272,7 +280,10 @@ The Substitute Location capture used `IBPWIBPT0105` / `LPN00760`
 (`STAGIB0204` → `C1CS0110`, substituted with reason `Damaged Location`)
 — also real test data, but from the DMM stateful flow, not this app's
 core-API extrapolation; not independently verified as still outstanding
-in `SS-DEMO`.
+in `SS-DEMO`. This app's own core-API version of that flow was
+separately confirmed live and completed against `IBPWIBPT0221` /
+`LPN000000000315` (`A1AC0114` → `A1AC0119`, reason `Damaged Location`)
+— see "Task Management domain" above.
 
 For iLPN search: `LPN00763` resolves to open task `IBPWIBPT0109`
 (confirmed live, `mode: "task"`); `LPN00076` has no open task and
