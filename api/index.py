@@ -182,8 +182,13 @@ def preload_task_transactions_route():
         return err
     location = (data.get("location") or data.get("facility") or "").strip() or None
     task_type = (data.get("taskType") or data.get("task_type") or "").strip().upper()
+    task_transaction_id = (
+        data.get("taskTransactionId") or data.get("task_transaction_id") or ""
+    ).strip()
     try:
-        result = preload_task_transactions(token, org, task_type, location=location)
+        result = preload_task_transactions(
+            token, org, task_type, location=location, task_transaction_id=task_transaction_id
+        )
         return jsonify(result)
     except Exception as e:
         print(f"[PRELOAD_TASK_TRANSACTIONS] {e}")

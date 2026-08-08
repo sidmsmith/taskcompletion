@@ -8,17 +8,33 @@ verbatim from receivingworkbench's mawm_client.py — same host, same
 that app (and supplierenablement, which it was originally copied from)
 for the pattern this follows.
 
-The Task Management endpoints below (search / transaction search /
-complete) are NOT confirmed against a live MAWM environment. Nothing in
-mawm_api_library documents the Task Management domain yet (only
-receiving's own narrower `receiving/api/task/transaction/search`,
-copied into search_task_transactions_generic() as a fallback, is
-confirmed real — see receivingworkbench). The URLs and payload/response
-shapes here are informed guesses based on MAWM's general
-search/{Query,Template,Page,Size} convention used by every other
-confirmed object in this ecosystem. Treat every function below marked
-UNCONFIRMED as a first draft to be corrected against a real RF-session
-capture, not as verified fact.
+Task Management lives under its own real MAWM component named plainly
+"task" (confirmed via cloudComponent: com-manh-cp-task-1 in live
+responses) — not "task-management" as originally guessed. Confirmed
+directly against SS-DEMO with a real TaskId (IBPWIBPT0929, a Putaway
+task):
+
+- search_task() -> POST task/api/task/task/search — CONFIRMED. Query
+  by TaskId works exactly like every other MAWM search endpoint. The
+  response nests the full line-level array under TaskDetail[] (same
+  field shape as a standalone task/api/task/taskDetail/search call —
+  confirmed identical by direct comparison), so only one call is
+  needed to load a task with its lines, mirroring how
+  receivingworkbench reads AsnLine[] nested inside its own asn/search
+  response.
+- search_task_transactions() -> POST task/api/task/transaction/search
+  — CONFIRMED (a distinct, task-component-owned transaction list, not
+  receiving's own `receiving/api/task/transaction/search`). Query by
+  TransactionTypeId, not TaskType — the Task record itself doesn't
+  carry a `TaskType` field at all; the closest real field is
+  `TransactionTypeId` (e.g. "Putaway"), which task_service.py now
+  reads directly off the loaded task instead of guessing per task type.
+- complete_task() -> STILL UNCONFIRMED. This one actually mutates task/
+  inventory state (moves a container, marks a task detail complete),
+  so it hasn't been probed against the live SS-DEMO org — unlike the
+  two search calls above, guessing wrong here risks corrupting real
+  demo data, not just a 404. Correct this against a real RF-session
+  capture (or explicit sign-off to probe live) before trusting it.
 """
 
 import os
@@ -35,19 +51,18 @@ HOST = os.getenv("MANHATTAN_API_HOST", "salep.sce.manh.com")
 HOST = f"https://{HOST}" if not HOST.startswith("http") else HOST
 AUTH_HOST = os.getenv("MANHATTAN_AUTH_HOST", "salep-auth.sce.manh.com")
 
-# --- UNCONFIRMED: Task Management endpoints ---
-# Best-guess paths following MAWM's task-management component naming.
-# Verify (and correct) each of these against a real RF task-completion
-# session capture before trusting them in production use.
-TASK_SEARCH_URL = f"{HOST}/task-management/api/task-management/task/search"
-TASK_TRANSACTION_SEARCH_URL = f"{HOST}/task-management/api/task-management/task/transaction/search"
-TASK_COMPLETE_URL = f"{HOST}/task-management/api/task-management/task/completeTask"
+# CONFIRMED live against SS-DEMO (see module docstring).
+TASK_SEARCH_URL = f"{HOST}/task/api/task/task/search"
+TASK_TRANSACTION_SEARCH_URL = f"{HOST}/task/api/task/transaction/search"
 
-# Confirmed real (copied from receivingworkbench) — receiving's own
-# transaction list, kept here only as a fallback/reference for how a
-# transaction-search response is typically shaped. Not necessarily the
-# same list as Task Management's own transactions.
-RECEIVING_TRANSACTION_SEARCH_URL = f"{HOST}/receiving/api/task/transaction/search"
+# UNCONFIRMED — a mutating call; not yet probed live. See module docstring.
+TASK_COMPLETE_URL = f"{HOST}/task/api/task/task/completeTask"
+
+# CONFIRMED (Tier 1, mawm_api_library/item/api.md) — used to hydrate each
+# line's item Description, which the Task/TaskDetail objects don't carry
+# themselves (confirmed: neither object has a Description/ItemDescription
+# field for the line's item).
+ITEM_SEARCH_URL = f"{HOST}/item-master/api/item-master/item/search"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -69,11 +84,12 @@ TASK_TYPE_LABELS = {
     "REPLENISHMENT": "Replenishment",
 }
 
-# UNCONFIRMED: placeholder default TransactionId per task type, mirroring
+# Fallback default TransactionId per task type, mirroring
 # receivingworkbench's DEFAULT_TRANSACTION_ID="Receiving" convention (a
 # default *selection* when the org's real transaction list contains a
-# match — never sent blind). Confirm the real default with the user once
-# search_task_transactions() is verified.
+# match — never sent blind). Only used if the loaded task's own
+# TransactionTypeId (confirmed present directly on every Task record,
+# e.g. "Putaway") isn't itself present in the org's transaction list.
 DEFAULT_TRANSACTION_BY_TASK_TYPE = {
     "PUTAWAY": "Putaway",
     "PICKING": "Picking",
@@ -173,13 +189,11 @@ def _response_data_list(body) -> List[dict]:
 
 
 def search_task(task_id: str, token: str, org: str, location: str = None) -> Optional[dict]:
-    """UNCONFIRMED — look up one Task by TaskId.
+    """CONFIRMED — look up one Task by TaskId (task/api/task/task/search).
 
-    Guessed payload shape follows every other confirmed MAWM search
-    endpoint in mawm_api_library (Query/Page/Size). The response's line
-    array is assumed to live under a `TaskDetail`/`Lines`-shaped key;
-    task_service._normalize_task() tries several plausible key names for
-    exactly this reason — correct both once a real response is captured.
+    Verified live against SS-DEMO with TaskId IBPWIBPT0929 (a Putaway
+    task). The response nests the full line array under TaskDetail[]
+    (each row field-identical to a standalone taskDetail/search call).
     """
     token = normalize_token(token)
     payload = {
@@ -203,18 +217,26 @@ def search_task(task_id: str, token: str, org: str, location: str = None) -> Opt
 def search_task_transactions(
     task_type: str, token: str, org: str, location: str = None
 ) -> List[dict]:
-    """UNCONFIRMED — TransactionIds available for a given TaskType.
+    """CONFIRMED — TransactionIds for a TransactionTypeId, via
+    task/api/task/transaction/search.
 
-    Mirrors receivingworkbench's search_receiving_transactions() shape
-    (each row expected to carry TransactionId + a paired StrategyId), but
-    against the guessed Task Management endpoint instead of receiving's.
-    Correct against a real capture before trusting the response shape.
+    Verified live: an empty Query returns the org's full transaction
+    list (SS-DEMO currently seeds only one row, "SelectTask", with
+    TransactionTypeId="Task"); filtering `TransactionTypeId ='Putaway'`
+    correctly returned zero rows in that same org (none seeded yet for
+    Putaway specifically) rather than erroring — confirms the field name
+    and query syntax, not that every org has per-task-type rows seeded.
+    Each row carries TransactionId + StrategyId, same shape
+    receivingworkbench's own transaction picker expects.
+
+    Confirmed wrong in the original guess: the object has no `TaskType`
+    field — `task_type` here is filtered against `TransactionTypeId`.
     """
     token = normalize_token(token)
     payload = {
-        "Query": f"TaskType ='{task_type}'" if task_type else "",
+        "Query": f"TransactionTypeId ='{task_type}'" if task_type else "",
         "Size": 1000,
-        "Sort": {"attribute": "TransactionId", "direction": "asc"},
+        "Page": 0,
     }
     response = _post(
         TASK_TRANSACTION_SEARCH_URL,
@@ -226,6 +248,41 @@ def search_task_transactions(
             f"task transaction search failed: {response.status_code} {response.text[:500]}"
         )
     return _response_data_list(response.json())
+
+
+def search_items(
+    item_ids: List[str], token: str, org: str, location: str = None
+) -> Dict[str, dict]:
+    """CONFIRMED (Tier 1) — item Description lookup, to hydrate task lines.
+
+    Neither Task nor TaskDetail carries an item description field, so
+    this is called after loading a task to fill that column in — same
+    endpoint/shape receivingworkbench already uses for the same reason.
+    """
+    clean = [str(i).strip() for i in item_ids if str(i).strip()]
+    if not clean:
+        return {}
+    quoted = ", ".join(
+        f"'{item_id.replace(chr(39), chr(39) + chr(39))}'" for item_id in clean
+    )
+    payload = {
+        "Query": f"ItemId in ({quoted})",
+        "Page": 0,
+        "Size": max(len(clean), 50),
+        "Template": {"ItemId": "", "Description": ""},
+    }
+    headers = build_task_headers(token, org, location=location)
+    headers["FacilityId"] = resolve_location(org, location)
+    try:
+        response = _post(ITEM_SEARCH_URL, headers=headers, json=payload)
+    except requests.RequestException as exc:
+        print(f"Warning: item search failed: {exc}")
+        return {}
+    if response.status_code != 200:
+        print(f"Warning: item search failed: {response.status_code}")
+        return {}
+    data = _response_data_list(response.json())
+    return {str(item.get("ItemId")): item for item in data if item.get("ItemId")}
 
 
 def complete_task(
@@ -240,12 +297,15 @@ def complete_task(
 ) -> dict:
     """UNCONFIRMED — complete (fully or partially) one Task line.
 
-    Payload shape is a placeholder — the real MAWM completion call for
-    RF-driven task types (Putaway/Picking/Cycle Count/Replenishment) has
-    not been captured yet. This exists so the frontend/service layers
-    have a real seam to call once the user supplies an RF-session capture
-    for the first task type (Putaway); expect this function's payload,
-    and possibly its URL, to change once that happens.
+    Unlike search_task()/search_task_transactions() (both confirmed live
+    against SS-DEMO this session), this call was deliberately NOT probed
+    against the live org — it mutates real state (moves a container,
+    marks a task detail complete), so guessing wrong here risks leaving
+    SS-DEMO's test data in a bad state rather than just a 404. The URL
+    follows the same task/api/task/task/{verb} shape the two confirmed
+    calls use, but is not itself confirmed. Correct this (URL and
+    payload both) against a real RF-session capture, or explicit
+    sign-off to probe it live, before trusting it.
     """
     token = normalize_token(token)
     payload = {

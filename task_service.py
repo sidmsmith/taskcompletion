@@ -3,12 +3,20 @@
 
 Mirrors receivingworkbench's rw_service.py layering: this module owns
 normalization and business rules (remaining-quantity math, full/partial/
-all-line orchestration); mawm_client.py owns raw HTTP calls. Everything
-here that touches Task Management's actual field names is UNCONFIRMED —
-see mawm_client.py's module docstring. _normalize_task_lines() tries
-several plausible key names per field for exactly that reason; once a
-real search_task() response is captured, trim it down to the one real
-shape instead of guessing across several.
+all-line orchestration); mawm_client.py owns raw HTTP calls.
+
+Field mapping in _normalize_task_lines()/load_task() is now CONFIRMED
+against a real live SS-DEMO response (TaskId IBPWIBPT0929, a Putaway
+task) — see mawm_client.py's module docstring for the confirmed
+search_task()/search_task_transactions() calls this relies on.
+_first() still tries a couple of fallback key names per field (kept
+defensive in case a different task type shapes a field differently —
+not yet confirmed one way or the other for Picking/Cycle Count/
+Replenishment), but the first-listed key in each call is the one
+observed live, not a guess.
+
+Only complete_line()'s underlying mawm_client.complete_task() call
+remains unconfirmed — see that function's docstring.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from mawm_client import (
     TASK_TYPE_LABELS,
     complete_task,
     resolve_location,
+    search_items,
     search_task,
     search_task_transactions,
 )
@@ -58,39 +67,39 @@ def default_transaction_id(task_type: str) -> str:
     return DEFAULT_TRANSACTION_BY_TASK_TYPE.get(key, "")
 
 
-def _normalize_task_lines(raw_task: dict) -> List[dict]:
-    """UNCONFIRMED field mapping — see module docstring."""
-    raw_lines = (
-        raw_task.get("TaskDetail")
-        or raw_task.get("TaskLine")
-        or raw_task.get("Lines")
-        or raw_task.get("Detail")
-        or []
-    )
+def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = None) -> List[dict]:
+    """Field mapping confirmed live (SS-DEMO, TaskId IBPWIBPT0929) — see
+    module docstring. `items` is an optional {ItemId: item-master row}
+    map (from mawm_client.search_items) used to fill in Description,
+    which TaskDetail itself doesn't carry.
+    """
+    items = items or {}
+    raw_lines = raw_task.get("TaskDetail") or []
     if not isinstance(raw_lines, list):
         raw_lines = []
 
     lines: List[dict] = []
     for idx, line in enumerate(raw_lines, start=1):
-        planned = _dec(_first(line, "PlannedQuantity", "ExpectedQuantity", "Quantity") or 0)
-        completed = _dec(
-            _first(line, "CompletedQuantity", "ActualQuantity", "CountedQuantity") or 0
-        )
+        planned = _dec(_first(line, "Quantity", "PlannedQuantity") or 0)
+        completed = _dec(_first(line, "CompletedQuantity") or 0)
         remaining = planned - completed
+        item_id = str(_first(line, "ItemId") or "")
+        item = items.get(item_id) or {}
         lines.append(
             {
                 "lineNumber": idx,
                 "taskDetailId": str(
-                    _first(line, "TaskDetailId", "TaskLineId", "PK", "Unique_Identifier") or idx
+                    _first(line, "TaskDetailId", "PK", "Unique_Identifier") or idx
                 ),
-                "itemId": str(_first(line, "ItemId") or ""),
-                "description": str(
-                    _first(line, "Description", "ItemDescription") or ""
+                "itemId": item_id,
+                "description": str(item.get("Description") or ""),
+                "fromLocationId": str(_first(line, "SourceLocationId", "FromLocationId") or ""),
+                "toLocationId": str(_first(line, "TargetLocationId", "ToLocationId") or ""),
+                "lpnId": str(
+                    _first(line, "TargetContainerId", "SourceContainerId", "WorkingContainerId")
+                    or ""
                 ),
-                "fromLocationId": str(_first(line, "FromLocationId", "SourceLocationId") or ""),
-                "toLocationId": str(_first(line, "ToLocationId", "DestinationLocationId") or ""),
-                "lpnId": str(_first(line, "LpnId", "ContainerId") or ""),
-                "uomId": str(_first(line, "UomId", "QuantityUomId") or ""),
+                "uomId": str(_first(line, "UomTypeId", "UomId", "QuantityUomId") or ""),
                 "plannedQuantity": _num(planned),
                 "completedQuantity": _num(completed),
                 "remainingQuantity": _num(remaining if remaining > 0 else 0),
@@ -112,8 +121,17 @@ def load_task(
     if not raw_task:
         return {"success": False, "error": f"Task {task_id} not found"}
 
-    task_type = str(_first(raw_task, "TaskType") or "").strip().upper()
-    lines = _normalize_task_lines(raw_task)
+    # The Task object has no dedicated `TaskType` field — confirmed live;
+    # TransactionTypeId (e.g. "Putaway") is the closest real field, with
+    # LaborActivityId as a fallback for any task type where it differs.
+    task_type = str(
+        _first(raw_task, "TransactionTypeId", "LaborActivityId") or ""
+    ).strip().upper()
+
+    raw_lines = raw_task.get("TaskDetail") or []
+    item_ids = [str(l.get("ItemId") or "") for l in raw_lines if l.get("ItemId")]
+    items = search_items(item_ids, token, org, location=dest) if item_ids else {}
+    lines = _normalize_task_lines(raw_task, items)
 
     return {
         "success": True,
@@ -121,7 +139,13 @@ def load_task(
         "facility": dest,
         "taskType": task_type,
         "taskTypeLabel": _task_type_label(task_type),
-        "taskStatus": _first(raw_task, "TaskStatus"),
+        "taskStatus": _first(raw_task, "Status"),
+        # Confirmed live: the Task record carries its own TransactionId
+        # (e.g. "Putaway") directly — preferred over the static
+        # DEFAULT_TRANSACTION_BY_TASK_TYPE guess when it's actually
+        # present in the org's transaction list (see
+        # preload_task_transactions()'s defaultTransactionId).
+        "taskTransactionId": str(_first(raw_task, "TransactionId") or ""),
         "lineCount": len(lines),
         "lines": lines,
     }
@@ -132,6 +156,7 @@ def preload_task_transactions(
     org: str,
     task_type: str,
     location: str = None,
+    task_transaction_id: str = None,
 ) -> Dict[str, Any]:
     dest = resolve_location(org, location)
     rows = search_task_transactions(task_type, token, org, location=dest)
@@ -147,11 +172,20 @@ def preload_task_transactions(
                 "description": str(_first(row, "Description") or "").strip(),
             }
         )
+    known = {e["transactionId"] for e in entries}
+    # Prefer the loaded task's own TransactionId (confirmed live on the
+    # Task record itself) when the org's transaction list actually
+    # contains it; fall back to the static per-task-type guess otherwise.
+    default = ""
+    if task_transaction_id and task_transaction_id in known:
+        default = task_transaction_id
+    elif default_transaction_id(task_type) in known:
+        default = default_transaction_id(task_type)
     return {
         "success": True,
         "count": len(entries),
         "entries": entries,
-        "defaultTransactionId": default_transaction_id(task_type),
+        "defaultTransactionId": default,
     }
 
 

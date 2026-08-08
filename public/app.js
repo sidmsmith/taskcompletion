@@ -183,8 +183,8 @@
           <td>${escapeHtml(line.fromLocationId)}</td>
           <td>${escapeHtml(line.toLocationId)}</td>
           <td>${escapeHtml(line.lpnId)}</td>
-          <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}${line.uomId ? " " + escapeHtml(line.uomId) : ""}</td>
-          <td class="col-qty-wide">${escapeHtml(line.completedQuantity)}${line.uomId ? " " + escapeHtml(line.uomId) : ""}</td>
+          <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
+          <td class="col-qty-wide">${escapeHtml(line.completedQuantity)}</td>
         </tr>`
       )
       .join("");
@@ -215,13 +215,14 @@
     updateLineActionButtons();
   }
 
-  async function preloadTransactions(taskType) {
+  async function preloadTransactions(taskType, taskTransactionId) {
     try {
       const data = await api("preload_task_transactions", {
         org: state.org,
         token: state.token,
         location: state.facility,
         taskType,
+        taskTransactionId,
       });
       if (data.success) {
         state.transactions = data.entries || [];
@@ -296,7 +297,7 @@
       <span><strong>Status</strong> ${escapeHtml(data.taskStatus || "")}</span>
     `;
     el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
-    await preloadTransactions(data.taskType);
+    await preloadTransactions(data.taskType, data.taskTransactionId);
     return true;
   }
 
