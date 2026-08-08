@@ -6,6 +6,7 @@
     facility: "",
     task: null, // last loaded task payload from /api/load_task
     selectedLineNumber: null,
+    storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
   };
 
   // Hardcoded for now — Putaway is the only task type wired to a real
@@ -152,6 +153,7 @@
       state.org = data.org || org;
       state.token = data.token;
       state.facility = state.org + "-DM1";
+      preloadStorageLocations(); // fire-and-forget, see its own docstring
       el.org.value = state.org;
       el.orgSection.style.display = "none";
       el.mainUI.style.display = "block";
@@ -253,6 +255,44 @@
   }
 
   /**
+   * Loads every active Storage location for the current facility once
+   * per session (2026-08-08, replacing a debounced live API call per
+   * keystroke, per explicit instruction) into state.storageLocations —
+   * a plain uppercased Set of both LocationId and DisplayLocation
+   * values, so validateLocation() can check it synchronously. Called
+   * fire-and-forget right after auth; validateLocation() falls back to
+   * the old live per-keystroke call if this hasn't resolved yet (or
+   * failed) when the user starts typing.
+   */
+  async function preloadStorageLocations() {
+    state.storageLocations = null;
+    try {
+      const data = await api("preload_putaway_locations", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+      });
+      if (!data.success) return;
+      const set = new Set();
+      (data.entries || []).forEach((e) => {
+        if (e.locationId) set.add(String(e.locationId).toUpperCase());
+        if (e.displayLocation) set.add(String(e.displayLocation).toUpperCase());
+      });
+      state.storageLocations = set;
+      revalidateAllLocations();
+    } catch (e) {
+      // Leave state.storageLocations null — validateLocation() falls
+      // back to the live per-keystroke check.
+    }
+  }
+
+  function revalidateAllLocations() {
+    el.linesBody
+      .querySelectorAll(".to-location-input")
+      .forEach((input) => validateLocation(input, true));
+  }
+
+  /**
    * A To Location must always resolve to a real, active Storage location
    * before any of the 3 completion buttons are usable — per explicit
    * instruction, this applies to every Putaway line, not just the
@@ -264,6 +304,21 @@
 
   function validateLocation(input, immediate) {
     clearTimeout(locationValidateTimers.get(input));
+
+    // Fast path: state.storageLocations is a preloaded Set, so this is
+    // a synchronous, in-memory check — runs on every keystroke with no
+    // artificial delay, no network round trip.
+    if (state.storageLocations) {
+      const value = input.value.trim();
+      const valid = !!value && state.storageLocations.has(value.toUpperCase());
+      input.dataset.locationValid = valid ? "true" : "false";
+      input.classList.toggle("invalid", !valid);
+      updateLineActionButtons();
+      return;
+    }
+
+    // Fallback: the preload hasn't resolved yet (or failed) — same
+    // debounced live lookup this app used before 2026-08-08.
     const run = async () => {
       const value = input.value.trim();
       if (!value) {

@@ -62,6 +62,7 @@ from mawm_client import (
     extract_warning,
     fetch_putaway_move,
     resolve_location,
+    search_all_storage_locations,
     search_container_inventory,
     search_ilpn_current_location,
     search_items,
@@ -749,6 +750,33 @@ def complete_container_putaway(
         "mawmResponse": location_resp,
         "error": None if ok else extract_message(location_resp),
     }
+
+
+def preload_putaway_locations(token: str, org: str, location: str = None) -> Dict[str, Any]:
+    """Every active Storage location for one facility, preloaded once per
+    session (2026-08-08, replacing per-keystroke debounced calls to
+    validate_putaway_location() below, per explicit instruction — see
+    mawm_client.search_all_storage_locations()'s docstring for why this
+    is safe: real facilities scope far smaller than the org-wide
+    "thousands" the old per-keystroke approach was written to avoid).
+    The frontend builds a plain Set from `entries` and checks it
+    synchronously on every keystroke instead of calling this per line.
+    """
+    dest = resolve_location(org, location)
+    rows = search_all_storage_locations(token, org, location=dest)
+    entries = []
+    for row in rows:
+        location_id = str(_first(row, "LocationId") or "").strip()
+        if not location_id:
+            continue
+        entries.append(
+            {
+                "locationId": location_id,
+                "displayLocation": str(_first(row, "DisplayLocation") or "").strip()
+                or location_id,
+            }
+        )
+    return {"success": True, "count": len(entries), "entries": entries}
 
 
 def validate_putaway_location(

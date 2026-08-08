@@ -215,17 +215,31 @@ auto-detect (`task_service.resolve_search()`):
    verified live.
 
 **To Location validation now applies everywhere, always** (per explicit
-instruction, not just the no-task case): `validate_storage_location()`
-(**CONFIRMED live** — `dcinventory/location/search`,
-`LocationTypeId ='STORAGE' and IsActive=true`; real putaway destinations
-`R1R20701`/`C1CS0110`/`C1CS0111` all confirmed to carry
-`LocationTypeId="STORAGE"`) backs a per-row, debounced frontend check
-(`public/app.js`'s `validateLocation()`) that gates all 3 completion
-buttons — Partial/Complete Line need the *selected* line's destination
-valid; Complete All needs every *outstanding* line's destination valid.
-Partial Complete is also unconditionally disabled in `no_task` mode — it
-isn't wired for the container flow (`complete_container_putaway()`
-always moves the full on-hand quantity, no partial-quantity concept).
+instruction, not just the no-task case), and is now preloaded rather
+than checked live per keystroke (**changed 2026-08-08**, per explicit
+instruction): `mawm_client.search_all_storage_locations()` /
+`task_service.preload_putaway_locations()` (**CONFIRMED live** —
+`dcinventory/location/search`, `LocationTypeId ='STORAGE' and
+IsActive=true`, unscoped by LocationId/DisplayLocation, `Size: 5000` —
+`SS-DEMO-DM1` returned **3,832** real rows, comfortably under that cap;
+if a facility ever needs more than 5000, this will silently truncate
+and needs a Page loop added) is called once per session, right after
+`authenticate()` succeeds, fire-and-forget
+(`public/app.js`'s `preloadStorageLocations()`). It builds a plain
+uppercased `Set` of every `LocationId`/`DisplayLocation`, and
+`validateLocation()` checks that Set synchronously on every keystroke —
+genuinely real-time, no network round trip, no debounce. The original
+per-keystroke live call (`validate_storage_location()` /
+`task_service.validate_putaway_location()` / `/api
+/validate_putaway_location`) is kept as-is, now only as a fallback
+inside `validateLocation()` for the brief window before the preload
+resolves (or if it fails outright) — still debounced 400ms in that
+case, same as before. Gates all 3 completion buttons — Partial/Complete
+Line need the *selected* line's destination valid; Complete All needs
+every *outstanding* line's destination valid. Partial Complete is also
+unconditionally disabled in `no_task` mode — it isn't wired for the
+container flow (`complete_container_putaway()` always moves the full
+on-hand quantity, no partial-quantity concept).
 
 **Still unconfirmed**: `complete_task()` (`task/api/task/task/completeTask`,
 URL and payload both guessed — the original, generic placeholder for

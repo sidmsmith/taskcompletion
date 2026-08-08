@@ -18,6 +18,7 @@ from task_service import (  # noqa: E402
     complete_container_putaway,
     complete_line,
     complete_putaway_line,
+    preload_putaway_locations,
     preload_putaway_reason_codes,
     preload_task_transactions,
     resolve_search,
@@ -29,7 +30,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -220,6 +221,21 @@ def preload_task_transactions_route():
         return jsonify(result)
     except Exception as e:
         print(f"[PRELOAD_TASK_TRANSACTIONS] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/preload_putaway_locations", methods=["POST"])
+def preload_putaway_locations_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    try:
+        result = preload_putaway_locations(token, org, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[PRELOAD_PUTAWAY_LOCATIONS] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

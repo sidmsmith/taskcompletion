@@ -485,6 +485,38 @@ def validate_storage_location(
     return data[0] if data else None
 
 
+def search_all_storage_locations(token: str, org: str, location: str = None) -> List[dict]:
+    """CONFIRMED live — every active STORAGE location for one facility,
+    for the frontend to preload once per task load rather than calling
+    validate_storage_location() per keystroke (2026-08-08: switched from
+    debounced live validation to this, per explicit instruction — real
+    paper-warehouse facilities run far smaller counts than the
+    org-wide "thousands" validate_storage_location()'s docstring warns
+    about, so one bulk fetch scoped to the facility header is cheap).
+    Same endpoint/`{Query,Page,Size}` convention as
+    validate_storage_location(), just unscoped by LocationId/
+    DisplayLocation and with a large Size instead of a Page loop —
+    mirrors receivingworkbench's search_staging_locations() convention
+    for its (much smaller) STAGING list.
+    """
+    token = normalize_token(token)
+    response = _post(
+        LOCATION_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "Query": f"LocationTypeId ='{STORAGE_LOCATION_TYPE_ID}' and IsActive=true",
+            "Template": {"LocationId": "", "DisplayLocation": ""},
+            "Size": 5000,
+            "Page": 0,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"location search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
+
 def search_items(
     item_ids: List[str], token: str, org: str, location: str = None
 ) -> Dict[str, dict]:
