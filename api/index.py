@@ -31,7 +31,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.7.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -319,12 +319,14 @@ def complete_line_route():
                 # now. A task-mode line is never MIXED, so at most the
                 # first itemAdjustments entry applies here — see
                 # complete_putaway_line()'s docstring for why a quantity
-                # change now goes through a Modify iLPN adjustment first
-                # (2026-08-08) rather than the old, confirmed-broken
-                # direct-partial attempt. A non-blank toLocationId means
-                # the user edited the grid's destination away from what
-                # was loaded — see complete_putaway_line()'s docstring
-                # for the required reasonCodeId and Substitute Location
+                # change now runs the Modify iLPN adjustment AFTER
+                # completing putaway (2026-08-08, sequence reversed —
+                # an LPN still allocated to an open task can't be
+                # adjusted at all), not before it as an earlier same-day
+                # attempt did. A non-blank toLocationId means the user
+                # edited the grid's destination away from what was
+                # loaded — see complete_putaway_line()'s docstring for
+                # the required reasonCodeId and Substitute Location
                 # handling.
                 adjustment = (item_adjustments or [None])[0]
                 result = complete_putaway_line(

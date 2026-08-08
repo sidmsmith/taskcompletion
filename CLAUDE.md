@@ -363,11 +363,19 @@ described above. Source: `mawm_modify_ilpn_query_and_adjustment.md`
 (reason-code lookup only — the DMM ModifyIlpn mobile workflow itself
 was explicitly out of scope, per instruction).
 
-**The mechanism** — `task_service.adjust_ilpn_quantities()`:
-correct the LPN's actual on-hand inventory *first* via
+**The mechanism** — `task_service.adjust_ilpn_quantities()`: correct
+the LPN's actual on-hand inventory via
 `POST inventory-management/api/inventory-management/adjust/endIlpn`,
-*then* run the normal, unmodified completion, which re-fetches fresh
-and so picks up whatever quantity MAWM now considers correct.
+around the normal, unmodified completion (which re-fetches fresh and so
+picks up whatever quantity MAWM now considers correct). **Superseded
+for the task-mode path in the sixth session** — see "Task-mode quantity
+correction: sequence reversed" further down: adjust-before-complete
+only works for a no-task/container LPN; a task-mode line now adjusts
+*after* completing, because an LPN still allocated to an open task
+can't be adjusted at all. Everything below in this section (the
+adjustment mechanism itself, its confirmed live tests, the reason
+codes, the MIXED accordion) is unchanged and still accurate — only the
+task-mode *ordering* moved.
 - `ScannedQuantity` on the wire is a *relative* adjustment
   (`New OnHand = Current + (ScannedQuantity - ExpectedOnHandQuantity)`),
   but since this always re-queries live inventory immediately before
@@ -597,6 +605,57 @@ left-aligned (`.action-toolbar`'s `justify-content: center` →
   directly in that branch too. Confirmed live (buttons disabled on
   reveal, re-enabled the moment a real reason was picked) before
   shipping.
+
+## Task-mode quantity correction: sequence reversed (2026-08-08, sixth session)
+
+**Per explicit domain-expertise instruction — not yet independently
+captured via HAR/API test the way most findings in this app are, but
+trusted and designed around**: an LPN still allocated to an open task
+cannot be adjusted via Modify iLPN at all. It only works once the task
+releases the LPN, which for Putaway means *after* it's been put away,
+not before. This is why the allocated-LPN test kept failing/wasn't
+reachable — `adjust_ilpn_quantities()` was being called on an LPN the
+task still owned.
+
+**`complete_putaway_line()`'s sequence is now reversed**: complete the
+full, unmodified putaway first (`desired_qty` plays no part in that
+call), and only *after* it succeeds, correct the quantity via
+`adjust_ilpn_quantities()`. That function needed no changes itself —
+it already re-queries live inventory at call time, so the same call
+works whether the LPN is fresh or was just released by completing its
+task. If putaway fails or hits a warning, that's returned exactly as
+before (adjustment never runs). If putaway succeeds but the
+*adjustment* afterward fails, the response is `"success": True` (the
+putaway really happened, can't be hidden) plus a separate
+`"adjustmentSuccess": False` / `"adjustmentError"` pair —
+`public/app.js`'s `completeLine()`/`confirmAllLines()` surface that as
+its own distinct message ("completed, but the quantity correction
+failed") rather than either a misleading plain success or a misleading
+plain failure.
+
+**Two destination-type paths, only one built**: this reversed sequence
+only makes sense for a destination that keeps LPN-level inventory after
+putaway — Reserve/Storage locations. That happens to be the *only*
+destination type this app's own `validate_storage_location()`
+(`LocationTypeId='STORAGE'`) allows through the To Location field at
+all, so every destination reachable through this app today is
+in-scope. **Explicitly out of scope, not yet built**: putting away to
+a Pick location, where MAWM is typically configured to *consume* the
+LPN into the location's own inventory record — no discrete LPN entity
+would be left afterward to run Modify iLPN against. That needs a
+different, not-yet-identified "adjust location inventory" API instead
+of `adjust_ilpn_quantities()`, being investigated separately. If this
+app ever grows Pick-location destinations, don't assume the Storage
+code path above applies — it was built and tested against Storage
+only.
+
+**Not yet live-tested**: this reversed sequence's happy path (a real
+allocated LPN, put away, then successfully corrected) — every
+previously-used allocated task (`IBPWIBPT0929`, `IBPWIBPT0221`,
+`IBPWIBPT0109`) is currently either fully completed or blocked by the
+`FWTSK::019` assignment conflict (see "Known-good test Task Id"
+below), so none were available to test against at the time this was
+built. Needs a fresh allocated task to verify live.
 
 ## Known-good test Task Id
 

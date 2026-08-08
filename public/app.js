@@ -1007,11 +1007,25 @@
         if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
       }
-      setActionStatus(
-        "Completed " + result.quantity + " " + (result.uomId || "") +
-          " on line " + line.lineNumber + ".",
-        "success"
-      );
+      if (result.adjustmentSuccess === false) {
+        // 2026-08-08: putaway itself succeeded (the LPN really did
+        // move) but the quantity correction afterward failed — a
+        // materially different situation from a plain failure, so it
+        // gets its own message rather than either a bare "Completed"
+        // (misleading — the quantity is still wrong) or a bare error
+        // (misleading — the line isn't actually stuck/failed).
+        setActionStatus(
+          "Line " + line.lineNumber + " completed, but the quantity correction failed: " +
+            (result.adjustmentError || "unknown error") + ". Correct it manually.",
+          "error"
+        );
+      } else {
+        setActionStatus(
+          "Completed " + result.quantity + " " + (result.uomId || "") +
+            " on line " + line.lineNumber + ".",
+          "success"
+        );
+      }
       await reloadCurrentSearch();
     } catch (e) {
       setActionStatus(e.message || String(e), "error");
@@ -1054,6 +1068,11 @@
     let succeeded = 0;
     let cancelled = false;
     const failures = [];
+    // 2026-08-08: a line whose putaway succeeded but whose quantity
+    // correction afterward failed counts toward `succeeded` (the LPN
+    // really did move) but also gets its own note here — distinct from
+    // `failures`, which means the line itself didn't complete at all.
+    const adjustmentIssues = [];
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
       const isNoTask = line.groupMode === "no_task";
@@ -1077,6 +1096,12 @@
         const result = await completeLineWithWarningHandling(line, itemAdjustments, toLocationId, reasonCodeId);
         if (result.success) {
           succeeded++;
+          if (result.adjustmentSuccess === false) {
+            adjustmentIssues.push(
+              "Line " + line.lineNumber + ": quantity correction failed (" +
+                (result.adjustmentError || "unknown error") + ")"
+            );
+          }
         } else if (result.cancelled) {
           cancelled = true;
           break;
@@ -1089,13 +1114,14 @@
     }
     setBusy(false);
     await reloadCurrentSearch();
+    const issues = failures.concat(adjustmentIssues);
     if (cancelled) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + " before cancelling.", "");
-    } else if (!failures.length) {
+    } else if (!issues.length) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + ".", "success");
     } else {
       setActionStatus(
-        "Completed " + succeeded + " of " + total + " lines. Failures: " + failures.join("; "),
+        "Completed " + succeeded + " of " + total + " lines. Issues: " + issues.join("; "),
         "error"
       );
     }

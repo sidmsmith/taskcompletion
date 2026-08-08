@@ -647,14 +647,18 @@ def adjust_ilpn_quantities(
     if it doesn't (the caller should treat that as "try again in a
     moment," not necessarily a hard failure).
 
-    **UNCONFIRMED against an allocated LPN**: the document's own
+    **An LPN still allocated to an open task cannot be adjusted this
+    way at all** (2026-08-08, sixth session — per explicit domain-
+    expertise instruction, not yet independently captured via HAR/API
+    test the way most findings in this app are). The document's own
     testing only ever exercised this against a *non-allocated* LPN via
-    Postman. Whether adjusting on-hand this way plays correctly with a
-    LPN that's already the target of an open task's planned quantity —
-    e.g., whether `fetchNextPutawayMoveAndStartLaborActivity` re-syncs
-    its `Quantity` to match, or still expects the original planned
-    amount — is untested. This is exactly the scenario the caller
-    (`complete_putaway_line()`) is being verified against live.
+    Postman; that turns out to matter. `complete_putaway_line()` now
+    calls this function *after* completing putaway rather than before,
+    specifically because of this — by the time it runs, the task has
+    released the LPN (assuming the destination keeps LPN-level
+    inventory at all; see that function's docstring for the Reserve/
+    Storage vs. Pick location distinction). Don't call this against an
+    LPN you know is still on an open task; it's expected to fail.
     """
     dest = resolve_location(org, location)
     rows = search_container_inventory(container_id, token, org, location=dest)
@@ -759,21 +763,48 @@ def complete_putaway_line(
 ) -> Dict[str, Any]:
     """Complete one Putaway task line in full.
 
-    **2026-08-08, superseding the same day's earlier (confirmed-broken)
-    attempt**: a `desired_qty` different from what's planned no longer
-    tries to book a partial completion directly (MAWM's core
-    `commitAndFetchNextMove` rejects that outright — see
-    `mawm_client.commit_putaway_move()`'s docstring). Instead, per
-    `mawm_modify_ilpn_query_and_adjustment.md`, it corrects the LPN's
-    actual on-hand quantity FIRST via `adjust_ilpn_quantities()`
-    (requires `item_id`/`lpn_id` — the frontend already has both off
-    the loaded line), then falls through to the normal, unmodified full
-    completion below, which re-fetches the move fresh and so picks up
-    whatever quantity MAWM now considers correct post-adjustment.
-    **UNCONFIRMED**: see `adjust_ilpn_quantities()`'s docstring — this
-    whole sequence has only ever been verified against a non-allocated
-    LPN; behavior against a line already on an open task (this case) is
-    the live test this was built for.
+    **2026-08-08, sequence REVERSED (sixth session), per explicit
+    domain-expertise instruction, not yet independently captured**: an
+    LPN still allocated to an open task cannot be adjusted via Modify
+    iLPN at all — that only works once the task releases it, which for
+    Putaway means *after* it's been put away. So a `desired_qty`
+    different from what's planned no longer runs the adjustment first
+    (that was this same day's *second* attempt at this problem, after
+    the first — a direct partial `CompletedQuantity` — was confirmed
+    broken; see `mawm_client.commit_putaway_move()`'s docstring for that
+    one). The sequence is now: complete the full, unmodified putaway
+    below FIRST (`desired_qty` plays no part in that call at all), and
+    only *after* it succeeds, correct the quantity via
+    `adjust_ilpn_quantities()` — see that function's docstring for why
+    this needed no other changes: it already re-queries live inventory
+    itself, so the same call works whether the LPN is fresh or was just
+    put away.
+
+    This currently only makes sense for a destination that keeps
+    LPN-level inventory after putaway — Reserve/Storage locations,
+    which is the *only* destination type this app's own
+    `validate_storage_location()` (`LocationTypeId='STORAGE'`) allows
+    through the To Location field today, so every destination reachable
+    through this app right now is in-scope. **Explicitly out of
+    scope, not yet built**: putting away to a Pick location, where
+    MAWM is typically configured to *consume* the LPN into the
+    location's own inventory record — no discrete LPN entity would be
+    left to run Modify iLPN against afterward. That would need a
+    different, not-yet-identified "adjust location inventory" API
+    instead of `adjust_ilpn_quantities()` — being investigated
+    separately; don't assume a Storage-location code path here applies
+    once that's added.
+
+    If the putaway itself fails or hits a warning, this returns exactly
+    that (same as before) — the adjustment step never runs, and never
+    runs partially. If putaway succeeds but the *adjustment* afterward
+    fails, the response still reports `"success": True` (the putaway,
+    the primary action, really did happen and can't be silently hidden)
+    with a separate `"adjustmentSuccess": False` /
+    `"adjustmentError"` pair so the frontend can surface that distinctly
+    — "completed, but the quantity correction failed" is a materially
+    different situation from "nothing happened," and conflating them
+    would be actively misleading.
 
     `to_location_id` is only sent by the frontend when the user actually
     edited the line's destination away from what was loaded (see
@@ -795,12 +826,36 @@ def complete_putaway_line(
     move's ToLocationId/ReasonCodeId overridden before committing when
     a substitution was requested.
     """
-    if desired_qty is not None:
-        if not item_id or not lpn_id:
+    if to_location_id and to_location_id.strip():
+        if not reason_code_id:
             return {
                 "success": False,
-                "error": "itemId and lpnId are required to adjust the completed quantity",
+                "error": "A reason code is required when changing the destination location",
             }
+    else:
+        to_location_id = None
+
+    putaway_result = _complete_putaway_line_system_directed(
+        token,
+        org,
+        task_id,
+        task_detail_id,
+        transaction_id,
+        location=location,
+        warning_overrides=warning_overrides,
+        to_location_id=to_location_id,
+        reason_code_id=reason_code_id,
+    )
+    if not putaway_result.get("success"):
+        return putaway_result
+
+    if desired_qty is not None:
+        if not item_id or not lpn_id:
+            putaway_result["adjustmentSuccess"] = False
+            putaway_result["adjustmentError"] = (
+                "itemId and lpnId are required to adjust the completed quantity"
+            )
+            return putaway_result
         adjust_result = adjust_ilpn_quantities(
             lpn_id,
             [
@@ -814,33 +869,13 @@ def complete_putaway_line(
             org,
             location=location,
         )
+        putaway_result["adjustmentSuccess"] = bool(adjust_result.get("success"))
         if not adjust_result.get("success"):
-            return {
-                "success": False,
-                "error": adjust_result.get("error") or "Inventory adjustment failed",
-                "stage": "adjust",
-            }
+            putaway_result["adjustmentError"] = (
+                adjust_result.get("error") or "Inventory adjustment failed"
+            )
 
-    if to_location_id and to_location_id.strip():
-        if not reason_code_id:
-            return {
-                "success": False,
-                "error": "A reason code is required when changing the destination location",
-            }
-    else:
-        to_location_id = None
-
-    return _complete_putaway_line_system_directed(
-        token,
-        org,
-        task_id,
-        task_detail_id,
-        transaction_id,
-        location=location,
-        warning_overrides=warning_overrides,
-        to_location_id=to_location_id,
-        reason_code_id=reason_code_id,
-    )
+    return putaway_result
 
 
 def _complete_putaway_line_system_directed(
