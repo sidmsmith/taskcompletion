@@ -110,6 +110,20 @@ from a real captured request/response set the user supplied):
   least one of the DMM-documented codes — evidence the extrapolation
   above is on the right track, though only for the read side of that
   flow; the override-and-actually-complete side is still unverified.
+- **CONFIRMED WRONG, 2026-08-08**: the `userInputs: {code: code}`
+  override, resubmitted against `LPN00953`'s `DCI::120` warning, did
+  **not** clear it — MAWM returned the identical warning again. Both
+  source documents hedged that the core endpoint's override contract
+  might not match the DMM flow's; this settles it for `container/move`
+  specifically (untested on `commitAndFetchNextMove`). A dedicated-
+  location warning currently has no way to be overridden through this
+  app. Real next step: capture what a successful override actually
+  looks like from the mobile RF client for this exact scenario — same
+  as how every other endpoint in this app got confirmed. Until then,
+  `extract_message()` (added the same day) at least surfaces the real
+  business message (`"Location permanently dedicated to a different
+  item"`) instead of the unhelpful top-level `"error.400"` when this
+  happens.
 
 **Revived 2026-08-08** — `mawm_client.move_container_user_directed()`
 (`POST putaway/api/putaway/execution/container/move`, from

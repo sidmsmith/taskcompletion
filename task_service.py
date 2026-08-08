@@ -54,6 +54,7 @@ from mawm_client import (
     TASK_TYPE_LABELS,
     commit_putaway_move,
     complete_task,
+    extract_message,
     extract_warning,
     fetch_putaway_move,
     move_container_user_directed,
@@ -581,7 +582,7 @@ def _complete_putaway_line_system_directed(
         "quantity": _num(inventory_move.get("CompletedQuantity") or 0),
         "toLocationId": inventory_move.get("ToLocationId"),
         "mawmResponse": commit_resp,
-        "error": None if ok else (commit_resp.get("message") or "Complete failed"),
+        "error": None if ok else extract_message(commit_resp),
     }
 
 
@@ -649,7 +650,7 @@ def complete_container_putaway(
         "quantity": _num(quantity),
         "toLocationId": to_location_id,
         "mawmResponse": move_resp,
-        "error": None if ok else (move_resp.get("message") or "Complete failed"),
+        "error": None if ok else extract_message(move_resp),
     }
 
 

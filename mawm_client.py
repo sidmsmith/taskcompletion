@@ -659,9 +659,15 @@ def extract_warning(body) -> Optional[Dict[str, str]]:
     (seen on every confirmed search endpoint in this app), and the DMM
     workflowVO `header.state.errorVOList` shape documented in
     mawm_putaway_api_call_set_with_warning_handling.md's Path A example
-    (PTW::120). Which shape Path C's core commit endpoint actually uses
-    for a warning has not been confirmed either way — this defensively
-    checks both rather than assuming one.
+    (PTW::120). CONFIRMED live 2026-08-08 for the standard envelope on
+    the core `container/move` endpoint specifically (`LPN00953` /
+    `DCI::120`) — but resubmitting with `userInputs: {code: code}`
+    (extract_warning()'s caller's override mechanism) did NOT clear it;
+    MAWM returned the identical DCI::120 warning again. Both source
+    documents hedged that the core endpoint's override contract might
+    differ from the DMM flow's — this is now confirmed, not just
+    suspected. The DMM stateful flow remains the fallback to implement
+    if this specific warning needs to be overridable.
     """
     if not isinstance(body, dict):
         return None
@@ -687,6 +693,29 @@ def extract_warning(body) -> Optional[Dict[str, str]]:
                 }
 
     return None
+
+
+def extract_message(body) -> str:
+    """Best-effort human-readable message for a failed response, for use
+    as the error text shown to the user. Prefers the first
+    `messages.Message[].Description` (any Type, not just WARNING —
+    unlike extract_warning()) over the generic top-level `message`/
+    `messageKey` (often just an opaque code like `"error.400"`).
+
+    Added 2026-08-08 after observing exactly this gap live: resubmitting
+    LPN00953's DCI::120 warning with an override that didn't clear it
+    fell back to `message: "error.400"` at the top level, even though
+    `messages.Message[0].Description` ("Location permanently dedicated
+    to a different item") was sitting right there, unused.
+    """
+    if not isinstance(body, dict):
+        return "Complete failed"
+    for msg in ((body.get("messages") or {}).get("Message") or []):
+        if isinstance(msg, dict):
+            text = str(msg.get("Description") or msg.get("Message") or "").strip()
+            if text:
+                return text
+    return str(body.get("message") or body.get("messageKey") or "Complete failed")
 
 
 def complete_task(
