@@ -701,18 +701,53 @@ each time:
   envelope shape (not actually triggered in either test above — both
   succeeded on the first attempt).
 
-**Not yet live-tested**: the full *integrated* branch inside
-`complete_putaway_line()` (a real allocated LPN, put away to a
-consuming destination, auto-detected and routed to
-`adjust_location_quantities()`) — every previously-used allocated task
-(`IBPWIBPT0929`, `IBPWIBPT0221`, `IBPWIBPT0109`) is currently either
-fully completed or blocked by the `FWTSK::019` assignment conflict (see
-"Known-good test Task Id" below), so none were available. Both halves
-are independently confirmed (putaway completion generally, and
-`adjust_location_quantities()` standalone against real consumed
-inventory) — just not yet chained together end to end through a live
-task. Needs a fresh allocated task headed to a consuming destination
-(e.g. `A1AC0114`/`C1CS0110`) to close the loop.
+**CONFIRMED live, 2026-08-08 (eighth session)** — the full *integrated*
+chain inside `complete_putaway_line()`, first successful end-to-end
+test: `IBPWIBPT0105` (item `50002236`, `LPN00760`, planned qty 10,
+destination `C1CS0110`), completed with `desired_qty=9`
+(`item_id`/`lpn_id` from the loaded line, `adjustment_reason_code:
+"IA"`). Result: `{"success": true, "quantity": 10, "adjustmentTarget":
+"lpn", "adjustmentSuccess": true}`. Independently re-verified, not just
+trusted: the task itself shows `Completed`/`completedQuantity: 10` (its
+own unmodified work-order record — the full putaway that ran first),
+while `LPN00760`'s own container inventory genuinely holds **9** units
+(a direct re-query, not the response body) — the correction landed on
+the LPN itself, exactly as `adjustmentTarget: "lpn"` reported.
+
+**This corrected a wrong assumption, not just confirmed the mechanism**:
+`C1CS0110` is `InventoryReservationTypeId='LOCATION'` — the earlier
+(no-task/DMM-flow) testing predicted this destination would consume the
+LPN, routing to `adjust_location_quantities()`. It didn't happen here —
+the LPN stayed a live, independently-adjustable container
+(`Ilpn.Status` came back `"3000"` / "Not Allocated," not `"9000"` /
+"Consumed"). Best current read: **task-mode completion (Path C,
+`fetchNextPutawayMoveAndStartLaborActivity`/`commitAndFetchNextMove`)
+and no-task completion (the DMM Mobile Facade's "User Directed
+Putaway," `AcceptContainer`/`AcceptLocation`) are different MAWM code
+paths and may follow different LPN-consumption rules for the very same
+destination** — one data point isn't proof of a general rule, but it's
+a direct, live contradiction of the earlier assumption, so don't trust
+`InventoryReservationTypeId` alone to predict task-mode behavior. This
+is exactly why the auto-detection checks the *LPN's actual post-putaway
+status* rather than pre-guessing from the destination's config — that
+design choice is what made this test succeed correctly despite the
+wrong assumption underneath it. **Still not live-tested**: a task-mode
+completion that *does* get auto-routed to
+`adjust_location_quantities()` (i.e., a real allocated task whose LPN
+genuinely comes back `Status: "9000"` after Path C putaway) — not yet
+observed even once; whether that's rare, or task-mode Path C simply
+never consumes the LPN at all, is still an open question.
+
+Also revealed: `search_ilpn_current_location()`'s `CurrentLocationId`
+came back `null` for this LPN too, same as a consumed LPN — but its
+`Status` was `"3000"`, not `"9000"`. So `CurrentLocationId: null` alone
+does **not** reliably mean "consumed" (`_ilpn_display_fields()`'s `*`-
+marked-previous-location fallback already only fires on `Status ==
+ILPN_CONSUMED_STATUS`, not on a blank `CurrentLocationId` by itself, so
+this doesn't change that logic — but it does mean a task-mode line
+whose LPN ends up in this state shows a genuinely blank Current
+Location with no `*` fallback, which is accurate, just worth knowing
+isn't the same situation as a truly consumed LPN).
 
 ## LPN status badge, consumed-location display (2026-08-08, seventh session)
 
