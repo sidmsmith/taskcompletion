@@ -69,11 +69,13 @@ from mawm_client import (
     extract_message,
     extract_warning,
     fetch_putaway_move,
+    ilpn_status_description,
     refresh_ilpn_read_timestamp,
     resolve_location,
     search_all_storage_locations,
     search_container_inventory,
     search_ilpn_current_location,
+    search_ilpn_statuses,
     search_items,
     search_location_inventory,
     search_putaway_reason_codes,
@@ -158,13 +160,57 @@ def default_transaction_id(task_type: str) -> str:
     return DEFAULT_TRANSACTION_BY_TASK_TYPE.get(key, "")
 
 
-def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = None) -> List[dict]:
+def _ilpn_display_fields(ilpn: Optional[dict]) -> Dict[str, Any]:
+    """Shared by both the task-mode and no-task line builders (2026-08-08,
+    seventh session, per explicit instruction — "always display LPN
+    status" — this used to be no-task-only). `ilpn` is one row from
+    search_ilpn_current_location()/search_ilpn_statuses(), or None if
+    the LPN wasn't found/looked up at all.
+
+    Returns `ilpnStatus`/`ilpnStatusLabel` (blank if `ilpn` is None —
+    e.g. a task-mode line whose own container id didn't resolve to a
+    real iLPN) and `displayLocationId`: `CurrentLocationId` normally,
+    or — confirmed live against two real consumed LPNs — a
+    `PreviousLocationId`-based fallback marked with a trailing `*` when
+    `Status == ILPN_CONSUMED_STATUS` and `CurrentLocationId` is blank
+    (a consumed LPN's own CurrentLocationId comes back null, so without
+    this there'd be nothing to show for "where did it go").
+    `displayLocationId` is only meaningful for the no-task/container
+    case, where "Current Location" is genuinely the LPN's own tracked
+    location — task-mode's own "Current Location" column is a
+    different concept (TaskDetail's SourceLocationId, where the task
+    expects to pick from) and doesn't use this.
+    """
+    if not ilpn:
+        return {"ilpnStatus": "", "ilpnStatusLabel": "", "displayLocationId": ""}
+    status = str(ilpn.get("Status") or "")
+    current_location = str(ilpn.get("CurrentLocationId") or "")
+    previous_location = str(ilpn.get("PreviousLocationId") or "")
+    display_location = current_location
+    if not display_location and status == ILPN_CONSUMED_STATUS and previous_location:
+        display_location = f"{previous_location}*"
+    return {
+        "ilpnStatus": status,
+        "ilpnStatusLabel": ilpn_status_description(status),
+        "displayLocationId": display_location,
+    }
+
+
+def _normalize_task_lines(
+    raw_task: dict,
+    items: Optional[Dict[str, dict]] = None,
+    ilpn_statuses: Optional[Dict[str, dict]] = None,
+) -> List[dict]:
     """Field mapping confirmed live (SS-DEMO, TaskId IBPWIBPT0929) — see
     module docstring. `items` is an optional {ItemId: item-master row}
     map (from mawm_client.search_items) used to fill in Description,
-    which TaskDetail itself doesn't carry.
+    which TaskDetail itself doesn't carry. `ilpn_statuses` (2026-08-08,
+    seventh session) is an optional {IlpnId: iLPN row} map (from
+    mawm_client.search_ilpn_statuses()) for each line's own LPN status
+    badge — see _ilpn_display_fields().
     """
     items = items or {}
+    ilpn_statuses = ilpn_statuses or {}
     raw_lines = raw_task.get("TaskDetail") or []
     if not isinstance(raw_lines, list):
         raw_lines = []
@@ -185,30 +231,35 @@ def _normalize_task_lines(raw_task: dict, items: Optional[Dict[str, dict]] = Non
         # ever sent anywhere — adjust_ilpn_quantities()/MAWM itself
         # only ever deal in base units.
         factor, uom_label = _package_conversion_factor(item, uom_code)
-        lines.append(
-            {
-                "lineNumber": idx,
-                "taskDetailId": str(
-                    _first(line, "TaskDetailId", "PK", "Unique_Identifier") or idx
-                ),
-                "itemId": item_id,
-                "description": str(item.get("Description") or ""),
-                "fromLocationId": str(_first(line, "SourceLocationId", "FromLocationId") or ""),
-                "toLocationId": str(_first(line, "TargetLocationId", "ToLocationId") or ""),
-                "lpnId": str(
-                    _first(line, "TargetContainerId", "SourceContainerId", "WorkingContainerId")
-                    or ""
-                ),
-                "uomId": uom_label,
-                "uomFactor": _num(factor),
-                "plannedQuantity": _num(planned_base / factor),
-                "completedQuantity": _num(completed_base / factor),
-                "remainingQuantity": _num(
-                    (remaining_base if remaining_base > 0 else Decimal("0")) / factor
-                ),
-                "mixedItems": None,  # only ever set on a no_task MIXED container line, see resolve_search()
-            }
+        lpn_id = str(
+            _first(line, "TargetContainerId", "SourceContainerId", "WorkingContainerId") or ""
         )
+        line_dict = {
+            "lineNumber": idx,
+            "taskDetailId": str(
+                _first(line, "TaskDetailId", "PK", "Unique_Identifier") or idx
+            ),
+            "itemId": item_id,
+            "description": str(item.get("Description") or ""),
+            "fromLocationId": str(_first(line, "SourceLocationId", "FromLocationId") or ""),
+            "toLocationId": str(_first(line, "TargetLocationId", "ToLocationId") or ""),
+            "lpnId": lpn_id,
+            "uomId": uom_label,
+            "uomFactor": _num(factor),
+            "plannedQuantity": _num(planned_base / factor),
+            "completedQuantity": _num(completed_base / factor),
+            "remainingQuantity": _num(
+                (remaining_base if remaining_base > 0 else Decimal("0")) / factor
+            ),
+            "mixedItems": None,  # only ever set on a no_task MIXED container line, see resolve_search()
+        }
+        ilpn_fields = _ilpn_display_fields(ilpn_statuses.get(lpn_id))
+        line_dict["ilpnStatus"] = ilpn_fields["ilpnStatus"]
+        line_dict["ilpnStatusLabel"] = ilpn_fields["ilpnStatusLabel"]
+        # Task-mode's own "Current Location" stays TaskDetail-driven —
+        # see _ilpn_display_fields()'s docstring — displayLocationId is
+        # deliberately not applied to fromLocationId here.
+        lines.append(line_dict)
     return lines
 
 
@@ -226,7 +277,16 @@ def _build_task_response(raw_task: dict, task_id: str, token: str, org: str, des
     raw_lines = raw_task.get("TaskDetail") or []
     item_ids = [str(l.get("ItemId") or "") for l in raw_lines if l.get("ItemId")]
     items = search_items(item_ids, token, org, location=dest) if item_ids else {}
-    lines = _normalize_task_lines(raw_task, items)
+    # 2026-08-08, seventh session, per explicit instruction ("always
+    # display LPN status"): batched so a multi-line task costs one
+    # extra call total, not one per line — see search_ilpn_statuses().
+    lpn_ids = [
+        str(_first(l, "TargetContainerId", "SourceContainerId", "WorkingContainerId") or "")
+        for l in raw_lines
+    ]
+    lpn_ids = [i for i in lpn_ids if i]
+    ilpn_statuses = search_ilpn_statuses(lpn_ids, token, org, location=dest) if lpn_ids else {}
+    lines = _normalize_task_lines(raw_task, items, ilpn_statuses)
 
     return {
         "success": True,
@@ -288,7 +348,7 @@ def resolve_search(
     if ilpn is None:
         return {"success": False, "error": f"No task or iLPN found for '{search_value}'"}
 
-    current_location = str(ilpn.get("CurrentLocationId") or "")
+    ilpn_fields = _ilpn_display_fields(ilpn)
     inv_rows = search_container_inventory(search_value, token, org, location=dest)
     item_ids = [str(r.get("ItemId") or "") for r in inv_rows if r.get("ItemId")]
     items = search_items(item_ids, token, org, location=dest) if item_ids else {}
@@ -345,7 +405,7 @@ def resolve_search(
         "taskDetailId": f"container:{search_value}",
         "itemId": item_id,
         "description": description,
-        "fromLocationId": current_location,
+        "fromLocationId": ilpn_fields["displayLocationId"],
         "toLocationId": "",
         "lpnId": search_value,
         "uomId": uom_label,
@@ -354,6 +414,8 @@ def resolve_search(
         "completedQuantity": 0,
         "remainingQuantity": _num(qty),
         "mixedItems": mixed_items,
+        "ilpnStatus": ilpn_fields["ilpnStatus"],
+        "ilpnStatusLabel": ilpn_fields["ilpnStatusLabel"],
     }
     return {
         "success": True,

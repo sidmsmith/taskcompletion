@@ -275,6 +275,19 @@
           </td>`;
   }
 
+  /**
+   * LPN status badge lives in the LPN column itself (2026-08-08, per
+   * explicit instruction: always show it, but without adding a new
+   * column) — the existing Task/Container column was the other
+   * candidate, but it's hidden by default for the common single-group
+   * case (see the "multi-group" CSS class), which would have silently
+   * defeated "always."
+   */
+  function lpnCellHtml(line) {
+    const badge = ilpnStatusBadgeHtml(line.ilpnStatusLabel);
+    return `<td>${escapeHtml(line.lpnId)}${badge ? "<br/>" + badge : ""}</td>`;
+  }
+
   function toLocationCellHtml(line) {
     return `
           <td>
@@ -308,7 +321,7 @@
       const summaryRow = `
         <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
           <td>${escapeHtml(line.lineNumber)}</td>
-          <td>${escapeHtml(line.lpnId)}</td>
+          ${lpnCellHtml(line)}
           ${groupCellHtml(line)}
           <td>
             <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(line.taskDetailId)}">
@@ -368,7 +381,7 @@
     return `
         <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
           <td>${escapeHtml(line.lineNumber)}</td>
-          <td>${escapeHtml(line.lpnId)}</td>
+          ${lpnCellHtml(line)}
           ${groupCellHtml(line)}
           <td>${escapeHtml(line.itemId)}</td>
           <td>${escapeHtml(line.description)}</td>
@@ -421,6 +434,26 @@
     const text = statusLabel || statusId || "";
     if (!text) return "";
     return `<span class="badge ${statusBadgeClass(statusLabel)}">${escapeHtml(text)}</span>`;
+  }
+
+  /**
+   * LPN status badge (2026-08-08) — its own color rule, distinct from
+   * statusBadgeClass() above: Consumed is grey (not a problem, just
+   * informational — per explicit instruction, not green like an
+   * ordinary active status), Lost/Canceled stay red, everything else
+   * (In Transit, Pre-Receipt/Partially/fully Allocated, Not Allocated)
+   * is green.
+   */
+  function ilpnStatusBadgeClass(statusLabel) {
+    const text = String(statusLabel || "").trim().toLowerCase();
+    if (text === "consumed") return "status-chip status-grey";
+    if (text === "lost" || text.startsWith("cancel")) return "status-chip status-red";
+    return "status-chip status-green";
+  }
+
+  function ilpnStatusBadgeHtml(statusLabel) {
+    if (!statusLabel) return "";
+    return `<span class="badge ${ilpnStatusBadgeClass(statusLabel)}">${escapeHtml(statusLabel)}</span>`;
   }
 
   /**

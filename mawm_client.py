@@ -260,6 +260,24 @@ TASK_STATUS_LABELS = {
     "9000": "Canceled",
 }
 
+# mawm_api_library's `ilpn_dc_inventory_status` domain (confirmed live,
+# 2026-08-08, sixth session — see ILPN_CONSUMED_STATUS's comment above
+# for how "9000" first got confirmed). A different status ladder from
+# TASK_STATUS_LABELS above and from receivingworkbench's own
+# LPN_STATUS_LABELS (that one's the *receiving-component* ASN-nested
+# LpnStatus domain, not this one — mawm_api_library is explicit that
+# the two must not be merged; same numeric codes mean different things).
+ILPN_STATUS_LABELS = {
+    "1000": "In Transit",
+    "2000": "Pre-Receipt Allocated",
+    "3000": "Not Allocated",
+    "4000": "Partially Allocated",
+    "5000": "Allocated",
+    "9000": "Consumed",
+    "10000": "Lost",
+    "11000": "Canceled",
+}
+
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
 REQUEST_TIMEOUT = 60
@@ -383,6 +401,14 @@ def task_status_description(status_id) -> str:
     return TASK_STATUS_LABELS.get(key) or key
 
 
+def ilpn_status_description(status_id) -> str:
+    """Human iLPN status, e.g. 'Consumed'. See ILPN_STATUS_LABELS."""
+    if status_id in (None, ""):
+        return ""
+    key = str(status_id).strip()
+    return ILPN_STATUS_LABELS.get(key) or key
+
+
 def _response_data_list(body) -> List[dict]:
     if isinstance(body, list):
         return [row for row in body if isinstance(row, dict)]
@@ -501,7 +527,14 @@ def search_ilpn_current_location(
     `ILPN_CONSUMED_STATUS`'s comment above for why: this is the signal
     task_service.complete_putaway_line() uses to tell whether an LPN
     is still a live container after putaway, or was consumed into the
-    destination location's own inventory.
+    destination location's own inventory. Also fetches
+    `PreviousLocationId` (2026-08-08, seventh session) — confirmed
+    live on two real consumed LPNs that this holds the location it was
+    consumed *into* (`CurrentLocationId` comes back null once
+    consumed, so there'd otherwise be nothing to show as "where is
+    it") — see task_service.resolve_search()'s no_task branch for how
+    the frontend displays this, marked, since it's not technically
+    where the LPN "is" anymore.
     """
     token = normalize_token(token)
     quoted = container_id.replace("'", "''")
@@ -512,7 +545,12 @@ def search_ilpn_current_location(
             "Query": f"IlpnId ='{quoted}'",
             "Size": 5,
             "Page": 0,
-            "Template": {"IlpnId": "", "CurrentLocationId": "", "Status": ""},
+            "Template": {
+                "IlpnId": "",
+                "CurrentLocationId": "",
+                "PreviousLocationId": "",
+                "Status": "",
+            },
         },
     )
     if response.status_code != 200:
@@ -521,6 +559,47 @@ def search_ilpn_current_location(
         )
     data = _response_data_list(response.json())
     return data[0] if data else None
+
+
+def search_ilpn_statuses(
+    ilpn_ids: List[str], token: str, org: str, location: str = None
+) -> Dict[str, dict]:
+    """Batched sibling of search_ilpn_current_location() (2026-08-08,
+    seventh session) — one call for several LPNs' Status/
+    CurrentLocationId/PreviousLocationId at once (same `ItemId in (...)`
+    batching convention search_items() already uses), instead of one
+    call per line. Used to show every task-mode line's own LPN status
+    badge too (per explicit instruction — "always display LPN status"),
+    not just the no-task/container search path, which already did a
+    single-LPN lookup. Returns `{IlpnId: row}`; an id with no match is
+    simply absent from the result.
+    """
+    clean = [str(i).strip() for i in ilpn_ids if str(i).strip()]
+    if not clean:
+        return {}
+    token = normalize_token(token)
+    quoted = ", ".join(f"'{i.replace(chr(39), chr(39) + chr(39))}'" for i in clean)
+    response = _post(
+        ILPN_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "Query": f"IlpnId in ({quoted})",
+            "Size": max(len(clean), 50),
+            "Page": 0,
+            "Template": {
+                "IlpnId": "",
+                "CurrentLocationId": "",
+                "PreviousLocationId": "",
+                "Status": "",
+            },
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"ilpn search failed: {response.status_code} {response.text[:500]}"
+        )
+    data = _response_data_list(response.json())
+    return {str(row.get("IlpnId")): row for row in data if row.get("IlpnId")}
 
 
 def search_container_inventory(

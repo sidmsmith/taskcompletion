@@ -714,6 +714,62 @@ inventory) — just not yet chained together end to end through a live
 task. Needs a fresh allocated task headed to a consuming destination
 (e.g. `A1AC0114`/`C1CS0110`) to close the loop.
 
+## LPN status badge, consumed-location display (2026-08-08, seventh session)
+
+- **`mawm_client.ILPN_STATUS_LABELS`/`ilpn_status_description()`** — the
+  confirmed `ilpn_dc_inventory_status` domain (1000 In Transit, 2000
+  Pre-Receipt Allocated, 3000 Not Allocated, 4000 Partially Allocated,
+  5000 Allocated, 9000 Consumed, 10000 Lost, 11000 Canceled), mirroring
+  `TASK_STATUS_LABELS`/`task_status_description()`'s existing pattern.
+  A genuinely different ladder from `TASK_STATUS_LABELS` and from
+  receivingworkbench's own `LPN_STATUS_LABELS` (that one's the
+  *receiving-component* ASN-nested `LpnStatus` domain — same numeric
+  codes, different meanings; `mawm_api_library` is explicit the two
+  must not be merged).
+- **Always shown now, both modes** — per explicit instruction ("let's
+  always display LPN status so it's consistent"). No-task/container
+  lines already did an iLPN lookup (`search_ilpn_current_location()`,
+  Template now also fetches `PreviousLocationId`); task-mode lines
+  didn't do one at all before this, so `_build_task_response()` now
+  batches one `search_ilpn_statuses()` call (new — the same `IlpnId in
+  (...)` convention `search_items()` already uses for items) covering
+  every line's own LPN in one round trip, not one call per line.
+  `_ilpn_display_fields()` is the shared helper both code paths call.
+- **Consumed-location display, confirmed live on two real LPNs**:
+  `LPN000000000006` (the user's own test case) and `LPN000000000315`
+  (this session's own earlier test) — both `Status: 9000`,
+  `CurrentLocationId: null`, and `PreviousLocationId` holding exactly
+  the location the LPN was consumed into (`A1AC0401` and `A1AC0114`
+  respectively — the latter matching exactly where this app put it
+  away earlier). When `Status == ILPN_CONSUMED_STATUS` and
+  `CurrentLocationId` is blank, the no-task line's Current Location
+  shows `PreviousLocationId` with a trailing `*` (e.g. `A1AC0401*`) —
+  the user's own suggested notation — so there's still something
+  useful to show instead of blank, while staying visually distinct
+  from a real current location. **Task-mode lines' own Current
+  Location is deliberately NOT touched by this** — that column there
+  is `TaskDetail.SourceLocationId` (where the task expects to pick
+  from), a different concept from the iLPN's own tracked location;
+  only the status badge applies to task-mode lines, not the `*`-marked
+  location fallback.
+- **Placement — the LPN column itself, not a new column**: the
+  existing "Task/Container" column was the obvious other candidate
+  (it already shows a status badge), but it's hidden by default for
+  the common single-group case (`multi-group` CSS class), which would
+  have silently broken "always display" for the majority of searches.
+  `lpnCellHtml()` puts the badge directly under the LPN id instead,
+  which is always visible regardless of group count.
+- **Color rule — its own, distinct from the task-status badge's
+  red/green split**: `ilpnStatusBadgeClass()` — Consumed is grey
+  (`.badge.status-grey`, new CSS), Lost/Canceled stay red, everything
+  else green. Per explicit instruction: Consumed is the *expected*
+  outcome after putaway, not a success or a problem, so it doesn't fit
+  either end of the existing red/green rule.
+- Confirmed live via both `resolve_search_multi()` output and a
+  browser render: `LPN000000000006` → grey "Consumed" badge +
+  `A1AC0401*`; `IBPWIBPT0109`'s line (`LPN00763`) → green "Allocated"
+  badge, `STAGIB0204` (its real TaskDetail source location) unchanged.
+
 ## Known-good test Task Id
 
 Refreshed 2026-08-08 (third session) — the demo environment's data
