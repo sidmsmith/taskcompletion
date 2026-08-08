@@ -78,6 +78,35 @@ PUTAWAY_FETCH_MOVE_URL_TEMPLATE = f"{HOST}/putaway/api/putaway/execution/task/{{
 PUTAWAY_COMMIT_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/transfer/commitAndFetchNextMove"
 PUTAWAY_EXECUTION_CRITERIA_ID = "Putaway Execution Criteria"
 
+# UNCONFIRMED — from mawm_user_directed_putaway_with_warnings.md's own
+# "Optional core API alternative" section, explicitly caveated there as
+# unconfirmed even by that document ("use this alternative only after
+# confirming the exact core endpoint contract... the core endpoint may
+# return warnings using a different response and override contract").
+# The document's actually-proven flow is the multi-call, stateful DMM
+# Mobile Facade workflow (start -> scan container -> scan location,
+# carrying a workflowVO across calls) — not used here, since this app's
+# stateless per-request Flask backend has no natural place to hold that
+# session state between a scan and the next one. This task-independent,
+# single-call alternative fits this app's TaskId-driven architecture
+# instead; see task_service.py's user-directed completion path.
+PUTAWAY_USER_DIRECTED_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/container/move"
+USER_DIRECTED_TRANSACTION_ID = "User Directed"
+
+# Tier 1 (mawm_api_library/_conventions/statuses.json, domain
+# "task_status") — CONFIRMED, and matches what was observed live:
+# IBPWIBPT0929 read back as "3000" before completion and "8000" after.
+TASK_STATUS_LABELS = {
+    "1000": "Created",
+    "2000": "Held",
+    "3000": "Ready For Assignment",
+    "5000": "Assigned",
+    "7000": "In Progress",
+    "7500": "Pending Complete",
+    "8000": "Completed",
+    "9000": "Canceled",
+}
+
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
 REQUEST_TIMEOUT = 60
@@ -191,6 +220,14 @@ def get_manhattan_token(org: str) -> Optional[str]:
 
 def validate_org(org: str) -> bool:
     return bool(re.match(r"^[A-Z0-9]+-DEMO$", org or ""))
+
+
+def task_status_description(status_id) -> str:
+    """Human Task status, e.g. 'Completed'. See TASK_STATUS_LABELS."""
+    if status_id in (None, ""):
+        return ""
+    key = str(status_id).strip()
+    return TASK_STATUS_LABELS.get(key) or key
 
 
 def _response_data_list(body) -> List[dict]:
@@ -372,6 +409,67 @@ def commit_putaway_move(
     if response.status_code not in (200, 201):
         raise RuntimeError(
             f"commitAndFetchNextMove failed: {response.status_code} {response.text[:800]}"
+        )
+    if isinstance(body, dict):
+        body["_requestPayload"] = payload
+    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+
+
+def move_container_user_directed(
+    container_id: str,
+    to_location_id: str,
+    item_id: str,
+    quantity,
+    token: str,
+    org: str,
+    location: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> dict:
+    """UNCONFIRMED — user-directed putaway to an operator-chosen
+    destination, per mawm_user_directed_putaway_with_warnings.md's core
+    API alternative. See PUTAWAY_USER_DIRECTED_MOVE_URL's comment for why
+    this (not the document's proven DMM Mobile Facade flow) was chosen.
+
+    Task-independent by design (per the document: "no task DTO, no task
+    ID, and no allocation ID in the active move") — takes ContainerId/
+    ItemId/Quantity/ToLocationId directly, unlike the system-directed
+    Path C flow which is keyed by TaskId.
+
+    TODO(reason codes): the document doesn't capture a reason-code
+    prompt anywhere in this flow, but a user overriding a system-
+    directed destination is exactly the kind of action MAWM often
+    requires one for. Not addressed here — revisit once this flow has
+    been exercised live and it's clear whether MAWM actually asks for
+    one on this endpoint.
+
+    `warning_overrides`, if given, is sent the same way as
+    commit_putaway_move()'s — a top-level `userInputs` map — which is
+    itself an unconfirmed extrapolation there; doubly so here, since
+    this endpoint's own warning contract is explicitly unconfirmed by
+    the source document.
+    """
+    token = normalize_token(token)
+    payload = {
+        "ContainerId": container_id,
+        "ToLocationId": to_location_id,
+        "TransactionId": USER_DIRECTED_TRANSACTION_ID,
+        "ItemId": item_id,
+        "ScannedQty": quantity,
+    }
+    if warning_overrides:
+        payload["userInputs"] = warning_overrides
+    response = _post(
+        PUTAWAY_USER_DIRECTED_MOVE_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
         )
     if isinstance(body, dict):
         body["_requestPayload"] = payload

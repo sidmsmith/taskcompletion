@@ -182,13 +182,52 @@
           <td>${escapeHtml(line.itemId)}</td>
           <td>${escapeHtml(line.description)}</td>
           <td>${escapeHtml(line.fromLocationId)}</td>
-          <td>${escapeHtml(line.toLocationId)}</td>
+          <td>
+            <input
+              type="text"
+              class="form-control to-location-input"
+              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              data-default-location="${escapeAttr(line.toLocationId)}"
+              value="${escapeAttr(line.toLocationId)}"
+              autocomplete="off"
+            />
+          </td>
           <td>${escapeHtml(line.lpnId)}</td>
           <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
           <td class="col-qty-wide">${escapeHtml(line.completedQuantity)}</td>
         </tr>`
       )
       .join("");
+  }
+
+  /** Completed/Canceled = red, everything else = green (for now). */
+  function statusBadgeClass(statusLabel) {
+    const text = String(statusLabel || "").trim().toLowerCase();
+    if (text === "completed" || text.startsWith("cancel")) return "status-chip status-red";
+    return "status-chip status-green";
+  }
+
+  function statusBadgeHtml(statusLabel, statusId) {
+    const text = statusLabel || statusId || "";
+    if (!text) return "";
+    return `<span class="badge ${statusBadgeClass(statusLabel)}">${escapeHtml(text)}</span>`;
+  }
+
+  /**
+   * Reads the currently-typed destination for a line and returns it only
+   * if it differs from what was originally loaded (blank/unchanged means
+   * "use the default system-directed destination", per
+   * task_service.complete_putaway_line()'s dispatch rule).
+   */
+  function getLocationOverride(taskDetailId) {
+    const input = el.linesBody.querySelector(
+      '.to-location-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (!input) return "";
+    const value = input.value.trim();
+    const original = (input.dataset.defaultLocation || "").trim();
+    if (!value || value.toUpperCase() === original.toUpperCase()) return "";
+    return value;
   }
 
   function updateLineActionButtons() {
@@ -235,7 +274,7 @@
     el.taskMeta.innerHTML = `
       <span><strong>Task</strong> ${escapeHtml(data.taskId)}</span>
       <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
-      <span><strong>Status</strong> ${escapeHtml(data.taskStatus || "")}</span>
+      <span><strong>Status</strong> ${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
     `;
     el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
     return true;
@@ -277,7 +316,7 @@
     return rem > 0 ? rem : 0;
   }
 
-  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides) {
+  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides, toLocationId) {
     return api("complete_line", {
       org: state.org,
       token: state.token,
@@ -288,6 +327,7 @@
       quantity,
       transactionId: TRANSACTION_ID,
       warningOverrides: warningOverrides || undefined,
+      toLocationId: toLocationId || undefined,
     });
   }
 
@@ -326,16 +366,16 @@
    * failure), or `{ success: false, cancelled: true }` if the user
    * cancels out of a warning.
    */
-  async function completeLineWithWarningHandling(taskDetailId, mode, quantity) {
+  async function completeLineWithWarningHandling(taskDetailId, mode, quantity, toLocationId) {
     const overrides = {};
-    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides);
+    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId);
     while (result && result.warning) {
       const confirmed = await showWarningModal(result.messageId, result.messageText);
       if (!confirmed) {
         return { success: false, cancelled: true, error: "Cancelled after warning." };
       }
       overrides[result.messageId] = result.messageId;
-      result = await callCompleteLine(taskDetailId, mode, quantity, overrides);
+      result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId);
     }
     return result;
   }
@@ -348,9 +388,10 @@
       setActionStatus("Line " + line.lineNumber + " is already complete.", "error");
       return;
     }
+    const toLocationId = getLocationOverride(line.taskDetailId);
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
-      const result = await completeLineWithWarningHandling(line.taskDetailId, "full");
+      const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId);
       if (!result.success) {
         if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
@@ -452,9 +493,10 @@
     const failures = [];
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
+      const toLocationId = getLocationOverride(line.taskDetailId);
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await completeLineWithWarningHandling(line.taskDetailId, "full");
+        const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId);
         if (result.success) {
           succeeded++;
         } else if (result.cancelled) {
@@ -498,6 +540,13 @@
     const row = e.target.closest("tr.line-row");
     if (!row) return;
     selectLine(row.dataset.lineNumber);
+  });
+  el.linesBody.addEventListener("input", (e) => {
+    const input = e.target.closest(".to-location-input");
+    if (!input) return;
+    const value = input.value.trim().toUpperCase();
+    const original = (input.dataset.defaultLocation || "").trim().toUpperCase();
+    input.classList.toggle("overridden", !!value && value !== original);
   });
 
   const partialLineModal = window.bootstrap

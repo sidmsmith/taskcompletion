@@ -26,7 +26,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -214,6 +214,7 @@ def complete_line_route():
     transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
     strategy_id = (data.get("strategyId") or data.get("strategy_id") or "").strip()
     warning_overrides = data.get("warningOverrides") or data.get("warning_overrides") or None
+    to_location_id = (data.get("toLocationId") or data.get("to_location_id") or "").strip()
     if not task_id or not task_detail_id:
         return jsonify({"success": False, "error": "taskId and taskDetailId required"})
     if not transaction_id:
@@ -223,7 +224,11 @@ def complete_line_route():
             # Putaway's confirmed-by-capture full-completion path (see
             # task_service.complete_putaway_line). Other task types aren't
             # wired to this yet — this app currently only builds/tests
-            # Putaway, so "full" always routes here for now.
+            # Putaway, so "full" always routes here for now. A non-blank
+            # toLocationId means the user edited the grid's destination
+            # away from what was loaded — see complete_putaway_line()'s
+            # docstring for how that's dispatched to the user-directed
+            # flow instead of the default system-directed one.
             result = complete_putaway_line(
                 token,
                 org,
@@ -232,6 +237,7 @@ def complete_line_route():
                 transaction_id,
                 location=location,
                 warning_overrides=warning_overrides,
+                to_location_id=to_location_id or None,
             )
         else:
             result = complete_line(

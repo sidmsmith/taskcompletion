@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Task Check In v0.1.2</title>
+  <title>Task Check In v0.1.3</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet" />
   <style>
@@ -177,6 +177,41 @@
     table.lines-table .col-loc { width: 9rem; }
     table.lines-table .col-qty-wide { width: 8rem; text-align: right; }
     tr.line-row:hover td { background: rgba(127,127,127,0.08); }
+
+    .to-location-input {
+      width: 100%;
+      min-width: 7rem;
+      font-size: 0.85rem;
+      padding: 0.2rem 0.4rem;
+    }
+    .to-location-input.overridden {
+      border-color: var(--primary);
+      color: var(--primary);
+      font-weight: 600;
+    }
+
+    /* Soft tinted status chip — same mechanism as vasexecution's
+       .status-chip, colors mapped to this app's own status rule
+       (Completed/Canceled = red, everything else = green for now). */
+    .badge.status-chip {
+      display: inline-block;
+      font-weight: 700;
+      font-size: 0.72rem;
+      line-height: 1.25;
+      letter-spacing: 0.01em;
+      padding: 0.28em 0.65em;
+      border: 1px solid transparent;
+      color: var(--status-chip-fg, var(--text)) !important;
+      -webkit-text-fill-color: var(--status-chip-fg, var(--text));
+    }
+    .badge.status-red {
+      background: rgba(220, 38, 38, 0.28) !important;
+      border-color: rgba(248, 113, 113, 0.55);
+    }
+    .badge.status-green {
+      background: rgba(22, 163, 74, 0.28) !important;
+      border-color: rgba(74, 222, 128, 0.55);
+    }
 
     .list-group-item {
       background: var(--card-bg);
