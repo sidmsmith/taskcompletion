@@ -21,7 +21,7 @@ from task_service import (  # noqa: E402
     preload_putaway_locations,
     preload_putaway_reason_codes,
     preload_task_transactions,
-    resolve_search,
+    resolve_search_multi,
     validate_putaway_location,
 )
 
@@ -30,7 +30,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -154,12 +154,15 @@ def load_task_route():
     if err:
         return err
     location = (data.get("location") or data.get("facility") or "").strip() or None
-    # Field name kept as taskId for minimal churn — resolve_search()
-    # accepts either a Task Id or an iLPN in the same value (see its
-    # docstring); the frontend's search box now accepts both too.
+    # Field name kept as taskId for minimal churn — resolve_search_multi()
+    # accepts one or more Task Ids/iLPNs in the same value, delimited by
+    # ";", "," or whitespace (see its docstring); the frontend's search
+    # box now accepts all of that too. Always returns the `groups`
+    # shape (2026-08-08), even for a single match, so the frontend has
+    # one response shape to handle instead of two.
     search_value = (data.get("taskId") or data.get("task_id") or "").strip()
     try:
-        result = resolve_search(token, org, search_value, location=location)
+        result = resolve_search_multi(token, org, search_value, location=location)
         forward_usage_event(
             {
                 "app_name": APP_NAME,
@@ -167,8 +170,7 @@ def load_task_route():
                 "event_name": "load_task_completed" if result.get("success") else "load_task_failed",
                 "org": org,
                 "searchValue": search_value,
-                "mode": result.get("mode"),
-                "taskType": result.get("taskType"),
+                "groupCount": len(result.get("groups") or []),
             }
         )
         return jsonify(result)
@@ -292,12 +294,18 @@ def complete_line_route():
             if not transaction_id:
                 return jsonify({"success": False, "error": "Transaction ID is required"})
             if mode == "full":
-                # Putaway's confirmed-by-capture full-completion path (see
+                # Putaway's confirmed-by-capture completion path (see
                 # task_service.complete_putaway_line). Other task types
                 # aren't wired to this yet — this app currently only
                 # builds/tests Putaway, so "full" always routes here for
-                # now. A non-blank toLocationId means the user edited the
-                # grid's destination away from what was loaded — see
+                # now. Despite the name, this is quantity-driven
+                # (2026-08-08): a blank/omitted quantity means the full
+                # remaining amount, same as before; the frontend's inline
+                # Completed Qty box can send a smaller value for a
+                # partial completion (replaces the old separate "partial"
+                # mode/modal for Putaway specifically). A non-blank
+                # toLocationId means the user edited the grid's
+                # destination away from what was loaded — see
                 # complete_putaway_line()'s docstring for the required
                 # reasonCodeId and Substitute Location handling.
                 result = complete_putaway_line(
@@ -310,6 +318,7 @@ def complete_line_route():
                     warning_overrides=warning_overrides,
                     to_location_id=to_location_id or None,
                     reason_code_id=reason_code_id or None,
+                    quantity=quantity,
                 )
             else:
                 result = complete_line(

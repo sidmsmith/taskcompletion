@@ -47,6 +47,7 @@ second time after its own warning override was confirmed not to work).
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -274,6 +275,80 @@ def resolve_search(
     }
 
 
+_MULTI_SEARCH_SPLIT_RE = re.compile(r"[;,\s]+")
+
+
+def resolve_search_multi(
+    token: str, org: str, raw_input: str, location: str = None
+) -> Dict[str, Any]:
+    """Wraps resolve_search() to accept more than one Task Id/iLPN at
+    once, delimited by ";", "," or whitespace (2026-08-08, per explicit
+    instruction — cycle count in particular may need to work across
+    several LPNs/tasks at once, unlike picking which typically stays
+    scoped to a single task).
+
+    Each token is resolved independently via resolve_search() — one may
+    have an open task, another may not, another may not exist at all;
+    none of that stops the others from resolving (failures collect into
+    `notFound` instead of aborting the whole search). Every line in
+    every resolved group is denormalized with that group's own
+    mode/taskId/containerId/status/etc, so the frontend can treat the
+    combined line list as flat and self-describing instead of having to
+    cross-reference back into a `groups` array for every row action
+    (selection, completion, location validation). `taskDetailId` was
+    already confirmed globally unique across groups (real GUIDs for
+    tasks, `container:{id}` for no-task containers), so no new keying
+    scheme was needed for that.
+    """
+    tokens: List[str] = []
+    seen = set()
+    for raw_token in _MULTI_SEARCH_SPLIT_RE.split(raw_input or ""):
+        token_value = raw_token.strip().upper()
+        if token_value and token_value not in seen:
+            seen.add(token_value)
+            tokens.append(token_value)
+
+    if not tokens:
+        return {"success": False, "error": "Task Id or iLPN required"}
+
+    dest = resolve_location(org, location)
+    groups: List[Dict[str, Any]] = []
+    not_found: List[str] = []
+    for token_value in tokens:
+        result = resolve_search(token, org, token_value, location=dest)
+        if not result.get("success"):
+            not_found.append(token_value)
+            continue
+        group_key = f"{result['mode']}:{result.get('taskId') or result.get('containerId')}"
+        for line in result.get("lines") or []:
+            line["groupKey"] = group_key
+            line["groupMode"] = result["mode"]
+            line["groupTaskId"] = result.get("taskId", "")
+            line["groupContainerId"] = result.get("containerId", "")
+            line["groupTaskType"] = result.get("taskType", "")
+            line["groupTaskTypeLabel"] = result.get("taskTypeLabel", "")
+            line["groupTaskStatus"] = result.get("taskStatus", "")
+            line["groupTaskStatusLabel"] = result.get("taskStatusLabel", "")
+            line["groupTaskTransactionId"] = result.get("taskTransactionId", "")
+        result["groupKey"] = group_key
+        groups.append(result)
+
+    if not groups:
+        return {
+            "success": False,
+            "error": f"No task or iLPN found for: {', '.join(not_found)}",
+        }
+
+    line_count = sum(len(g.get("lines") or []) for g in groups)
+    return {
+        "success": True,
+        "facility": dest,
+        "groups": groups,
+        "lineCount": line_count,
+        "notFound": not_found,
+    }
+
+
 def preload_task_transactions(
     token: str,
     org: str,
@@ -434,16 +509,26 @@ def complete_putaway_line(
     warning_overrides: Optional[Dict[str, str]] = None,
     to_location_id: Optional[str] = None,
     reason_code_id: Optional[str] = None,
+    quantity: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Complete one Putaway task line in full.
+    """Complete one Putaway task line — full by default. `quantity`, if
+    given (2026-08-08: the frontend's Completed Qty box, replacing the
+    separate Partial Complete button/modal), is passed through, but
+    **CONFIRMED NOT to book a genuine partial** — see
+    `_complete_putaway_line_system_directed()`'s docstring: MAWM
+    rejects `CompletedQuantity < Quantity` outright with "Quantity
+    entered is less than the system quantity." Kept wired anyway (not
+    reverted) so the frontend correctly surfaces that real rejection
+    when someone edits the box down, rather than silently disabling it —
+    consistent with how this app always lets MAWM be the final word
+    instead of guessing client-side.
 
     `to_location_id` is only sent by the frontend when the user actually
     edited the line's destination away from what was loaded (see
     public/app.js's `.to-location-input`) — its mere presence here is
-    trusted as "the user wants to substitute the destination," the same
-    way `mode` ("full"/"partial") is trusted from the caller elsewhere
-    in this module. When present, a `reason_code_id` is required — the
-    frontend enforces this via a required reason-code modal (see
+    trusted as "the user wants to substitute the destination." When
+    present, a `reason_code_id` is required — the frontend enforces
+    this via a required reason-code modal (see
     preload_putaway_reason_codes()) before ever sending toLocationId,
     so a substitution without one here means the frontend didn't
     enforce that; fail rather than silently proceeding.
@@ -474,6 +559,7 @@ def complete_putaway_line(
         warning_overrides=warning_overrides,
         to_location_id=to_location_id,
         reason_code_id=reason_code_id,
+        quantity=quantity,
     )
 
 
@@ -487,6 +573,7 @@ def _complete_putaway_line_system_directed(
     warning_overrides: Optional[Dict[str, str]] = None,
     to_location_id: Optional[str] = None,
     reason_code_id: Optional[str] = None,
+    quantity: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The confirmed-by-capture Path C sequence
     (mawm_putaway_api_call_set_with_warning_handling.md): fetch the next
@@ -498,11 +585,20 @@ def _complete_putaway_line_system_directed(
     the user actually selected and refuses to commit on a mismatch,
     rather than silently completing the wrong line.
 
-    Full completion (vs. partial, not yet wired) is expressed by setting
-    the fetched InventoryMove's CompletedQuantity equal to its Quantity
-    before committing — the document's own worked example does exactly
-    this (CompletedQuantity: 240 alongside Quantity: 240), and the
-    fetched move itself doesn't set CompletedQuantity that way.
+    Completion quantity is expressed by setting the fetched
+    InventoryMove's CompletedQuantity before committing — the document's
+    own worked example does exactly this for a full completion
+    (CompletedQuantity: 240 alongside Quantity: 240; the fetched move
+    itself doesn't set CompletedQuantity that way). `quantity`, if given
+    (2026-08-08, the frontend's inline Completed Qty box), is validated
+    against the *fetched move's own* `Quantity` (not the caller's belief
+    about remaining — the fetched move is the source of truth) and used
+    instead of the full amount — **CONFIRMED NOT to work**: see
+    mawm_client.commit_putaway_move()'s docstring — tested live against
+    `IBPWIBPT0929` with `quantity=100` of 240, MAWM rejected it with
+    "Quantity entered is less than the system quantity." Left wired
+    (not reverted) purely so that real rejection reaches the frontend
+    instead of the request silently never being attempted.
 
     Substitute Location (`to_location_id` + `reason_code_id` given):
     per mawm_substitute_location_to_user_directed_putaway.md, "directed
@@ -548,7 +644,20 @@ def _complete_putaway_line_system_directed(
     inventory_move = dict((data or {}).get("InventoryMove") or {})
     sub_type = (data or {}).get("SubType") if isinstance(data, dict) else None
     if not inventory_move or not sub_type:
-        return {"success": False, "error": "No putaway move returned for this task"}
+        # Bug fixed 2026-08-08: this used to always show the same generic
+        # text, even when the fetch actually came back with a real hard
+        # ERROR (not a WARNING — extract_warning() above correctly lets
+        # those through) carrying a real business message — confirmed
+        # live via FWTSK::019, "Task <id> cannot be assigned to user
+        # <user>." (a task-assignment conflict, not a code bug), which
+        # was being silently replaced by this generic fallback. Now
+        # prefers the real message when the response actually has one.
+        real_message = extract_message(fetch_resp)
+        fallback = "No putaway move returned for this task"
+        return {
+            "success": False,
+            "error": real_message if real_message and real_message != "Complete failed" else fallback,
+        }
 
     fetched_detail_id = str(inventory_move.get("CurrentTaskDetailId") or "")
     if fetched_detail_id and fetched_detail_id != str(task_detail_id):
@@ -564,9 +673,21 @@ def _complete_putaway_line_system_directed(
         inventory_move["ToLocationId"] = to_location_id
         inventory_move["ReasonCodeId"] = reason_code_id
 
-    # Full completion: CompletedQuantity == Quantity, per the document's
-    # own worked commit payload example.
-    inventory_move["CompletedQuantity"] = inventory_move.get("Quantity")
+    move_quantity = _dec(inventory_move.get("Quantity"))
+    if quantity is None:
+        # Full completion: CompletedQuantity == Quantity, per the
+        # document's own worked commit payload example.
+        completed_quantity = move_quantity
+    else:
+        completed_quantity = _dec(quantity)
+        if completed_quantity <= 0:
+            return {"success": False, "error": "quantity must be greater than 0"}
+        if completed_quantity > move_quantity:
+            return {
+                "success": False,
+                "error": f"quantity exceeds this move's quantity ({_num(move_quantity)})",
+            }
+    inventory_move["CompletedQuantity"] = _num(completed_quantity)
 
     commit_resp = commit_putaway_move(
         sub_type, inventory_move, token, org, location=dest, warning_overrides=warning_overrides

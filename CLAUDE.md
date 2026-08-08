@@ -267,29 +267,139 @@ quantity as a bare number with no unit suffix for this reason;
 `uomId` is still threaded through the API response for when this gets
 resolved.
 
+## Multi-LPN search, editable Completed Qty, LPN column (2026-08-08, third session)
+
+Three related UI/API changes, delivered together per explicit instruction:
+
+- **LPN column** moved between Line and Item in both the table header
+  and `renderGroups()`'s row markup — purely cosmetic, no API change.
+- **Completed Qty is now an editable inline box** (`public/app.js`'s
+  `.completed-qty-input`), defaulted to the line's remaining quantity,
+  same "only send if changed" override contract as Current Location
+  (`getCompletedQtyOverride()` mirrors `getLocationOverride()` exactly)
+  and the same client-side validity gating
+  (`validateQty()`/`isQtyValid()`, purely arithmetic — `0 < qty <=
+  remaining` — no API call needed, unlike location validation). The
+  separate **Partial Complete button/modal was removed** — editing this
+  box down is now how a partial is expressed, on the same single
+  "Complete Line" button. Locked (`disabled`) for `no_task`/container
+  rows, which always move the full on-hand quantity (no partial concept
+  there — `complete_container_putaway()`'s DMM flow doesn't take an
+  Item/Quantity input at all).
+
+  **CONFIRMED NOT to work, live**: booking a genuine partial Putaway
+  completion this way. Tested against `IBPWIBPT0929`
+  (`CompletedQuantity: 100` of `Quantity: 240`) — MAWM's core
+  `commitAndFetchNextMove` endpoint (Path C) rejected it outright:
+  *"Quantity entered is less than the system quantity."* This endpoint
+  requires the full system quantity; there is currently no known way to
+  book a genuine partial Putaway completion. The box/button are kept
+  wired anyway (not reverted) so this real rejection reaches the
+  frontend instead of silently never being attempted — consistent with
+  this app always letting MAWM be the final word rather than guessing
+  client-side. See `mawm_client.commit_putaway_move()`'s and
+  `task_service._complete_putaway_line_system_directed()`'s docstrings
+  for the full story.
+
+- **Multi-LPN search** (`task_service.resolve_search_multi()`): the
+  search box now accepts more than one Task Id/iLPN, delimited by `;`,
+  `,`, or whitespace. Each token resolves independently via the
+  existing `resolve_search()` — one may have an open task, another may
+  not, another may not exist at all (collected into `notFound` rather
+  than aborting the whole search). Every line is denormalized with its
+  owning group's identity (`groupMode`/`groupTaskId`/
+  `groupContainerId`/`groupTaskStatusLabel`/etc.) so the frontend can
+  treat the combined line list as flat and self-describing — no
+  cross-referencing back into a `groups` array anywhere in
+  `public/app.js`. `taskDetailId` was already globally unique across
+  groups (real GUIDs for tasks, `container:{id}` for no-task
+  containers), so row selection/keying just switched from `lineNumber`
+  (not unique across groups) to `taskDetailId` — this also simplified
+  the single-group case, which is now just `groups.length === 1`
+  instead of a separate code path. `/api/load_task` always returns this
+  `groups` shape now, even for one match — one response shape for the
+  frontend to handle instead of two.
+
+  **Complete All now spans every group on screen**, not just one
+  task/container (per explicit instruction). The confirmation modal
+  prefixes each line with its owning Task/Container when more than one
+  group is loaded.
+
+  **Task/Container column**: shown in the table only when more than one
+  group is loaded (`#linesTable`'s `multi-group` CSS class, toggled by
+  `renderGroups()`) — single-group results look exactly as before.
+  `renderTaskMeta()`'s header does the same: unchanged for one group,
+  a plain count summary for multiple. This is an explicitly interim
+  default — final design (whether to keep both a header and a column,
+  how picking vs. cycle count should differ) is deliberately deferred.
+
+  **CONFIRMED live end-to-end** (2026-08-08, real `SS-DEMO` data, via
+  an actual browser session against the local dev server — not just
+  direct Python calls): search `LPN00763, LPN000000000010` (a fresh
+  task-mode line + a no-task container) loaded both groups correctly,
+  the no-task row's Completed Qty was correctly locked, and running
+  **Complete All** across both — with a `DCI::120` warning firing
+  mid-loop on the no-task line and correctly pausing for Confirm — both
+  lines resolved (one success, one real failure, see below), each
+  independently verified against live inventory/task state afterward.
+
+  **Two real bugs found and fixed during this browser session** (both
+  pre-existing, not introduced today — confirmed via `git log` that the
+  first predates this session entirely):
+  - `actionStatus` was being cleared immediately after a completion's
+    success/error message was set, because `renderLines()`/
+    `renderGroups()` unconditionally cleared it on every render,
+    including the automatic refresh after a completion
+    (`reloadCurrentSearch()`). The message would flash and vanish
+    before ever being visible. Fixed by moving the clear into
+    `loadTask()` (a genuinely new search) instead of `renderGroups()`
+    (which now also runs on post-completion refreshes).
+  - A failed `fetch_putaway_move()` call (Path C, Call C1) that comes
+    back as a hard MAWM `ERROR` (not a `WARNING` — `extract_warning()`
+    correctly lets those through separately) with a real business
+    message was being silently replaced by a generic "No putaway move
+    returned for this task." Confirmed live: `IBPWIBPT0109` returned
+    `FWTSK::019`, *"Task IBPWIBPT0109 cannot be assigned to user
+    demoweb@ss-demo"* (a real task-assignment conflict in `SS-DEMO`,
+    not a code bug — same class of issue noted for this exact task
+    earlier in the project) — the app showed the generic fallback
+    instead. Fixed by preferring `extract_message()`'s real text when
+    the response actually has one, same pattern already used elsewhere
+    in this module.
+
 ## Known-good test Task Id
 
-`IBPWIBPT0929` (`SS-DEMO`, Putaway) — already **fully completed**
-(`Status: 8000`/Completed) as of this writing, from earlier live
-testing of the system-directed flow. It's still useful to confirm
-`load_task` and the status badge, but a **fresh, not-yet-completed**
-Putaway task is needed to actually exercise Complete Line / Complete
-All end to end.
+Refreshed 2026-08-08 (third session) — the demo environment's data
+drifts as tests consume it (and appears to periodically reset/reseed
+independently — several tasks below have flipped status more than once
+across sessions without this app changing anything), so treat
+"current" state here as a snapshot, not a guarantee; re-check live
+before trusting an old note over what MAWM actually returns.
 
-The Substitute Location capture used `IBPWIBPT0105` / `LPN00760`
-(`STAGIB0204` → `C1CS0110`, substituted with reason `Damaged Location`)
-— also real test data, but from the DMM stateful flow, not this app's
-core-API extrapolation; not independently verified as still outstanding
-in `SS-DEMO`. This app's own core-API version of that flow was
-separately confirmed live and completed against `IBPWIBPT0221` /
-`LPN000000000315` (`A1AC0114` → `A1AC0119`, reason `Damaged Location`)
-— see "Task Management domain" above.
+**Fully spent (Completed) as of this writing** — need a fresh task to
+exercise Complete Line / Complete All again:
+- `IBPWIBPT0929` (`LPN00076`, item `50002217`, 240 units → `R1R20701`)
+- `IBPWIBPT0221` (`LPN000000000315`/`A1AC0114`, item `3000223`, 50
+  units → `A1AC0119`, Substitute Location)
 
-For iLPN search: `LPN00763` resolves to open task `IBPWIBPT0109`
-(confirmed live, `mode: "task"`); `LPN00076` has no open task and
-resolves to the `mode: "no_task"` synthetic line (confirmed live —
-current location `DROPR113`, item `50002217`/"Whale Logo Tie", qty
-240). Neither has been completed through the no-task path yet.
+**Known live data conflict, not a code bug**: `IBPWIBPT0109`
+(`LPN00763`, 10 units remaining) reads fine (`Status: Ready For
+Assignment` via `resolve_search`), but its Path C fetch
+(`fetchNextPutawayMoveAndStartLaborActivity`) returns `FWTSK::019`,
+*"Task IBPWIBPT0109 cannot be assigned to user demoweb@ss-demo"* —
+confirmed live, 2026-08-08. Don't use this task for write-path testing
+until that clears; it's exactly the kind of thing
+`extract_message()`'s fallback fix (above) was for, not something this
+app can work around.
+
+**No open task (`mode: "no_task"`), useful for the container/DMM
+flow**: `LPN00076` (now that `IBPWIBPT0929` is Completed — its task no
+longer counts as "open" — current location `R1R20701`, following the
+completion above) and `LPN000000000010` (current location `R2R40105`,
+following live Complete-All testing above; previously used for the
+`DCI::159`/`DCI::120` warning-override tests — has now cleared
+whatever dedicated-item conflict `R2R61001`/`R2R40105` had, so it may
+no longer reproduce a warning at those specific destinations).
 
 ## Status badge
 

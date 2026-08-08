@@ -4,10 +4,21 @@
     org: "",
     token: "",
     facility: "",
-    task: null, // last loaded task payload from /api/load_task
-    selectedLineNumber: null,
+    // One entry per task/container resolved by the last search (2026-08-08,
+    // multi-LPN search) — each carries its own mode/taskId/containerId/
+    // status and its own `lines`. Every line is also denormalized with
+    // its owning group's identity (line.groupMode/groupTaskId/etc, see
+    // task_service.resolve_search_multi()) so nothing else in this file
+    // needs to cross-reference back into `groups` for a given row.
+    groups: [],
+    lastSearchValue: "", // raw search box text, re-used to refresh after a completion
+    selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
   };
+
+  function allLines() {
+    return state.groups.flatMap((g) => g.lines || []);
+  }
 
   // Hardcoded for now — Putaway is the only task type wired to a real
   // completion call. Revisit once Picking/Cycle Count/Replenishment are
@@ -29,16 +40,11 @@
     backToFilters: document.getElementById("backToFilters"),
     resultsStatus: document.getElementById("resultsStatus"),
     taskMeta: document.getElementById("taskMeta"),
+    linesTable: document.getElementById("linesTable"),
     linesBody: document.getElementById("linesBody"),
-    partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
     actionStatus: document.getElementById("actionStatus"),
-    partialLineInfo: document.getElementById("partialLineInfo"),
-    partialQtyInput: document.getElementById("partialQtyInput"),
-    partialQtyUom: document.getElementById("partialQtyUom"),
-    partialQtyHint: document.getElementById("partialQtyHint"),
-    partialLineConfirmBtn: document.getElementById("partialLineConfirmBtn"),
     allLinesList: document.getElementById("allLinesList"),
     allLinesConfirmBtn: document.getElementById("allLinesConfirmBtn"),
     warningMessageId: document.getElementById("warningMessageId"),
@@ -127,7 +133,7 @@
     if (!state.token) {
       el.matchHint.textContent = "Authenticate to begin.";
     } else if (!value) {
-      el.matchHint.textContent = "Scan or type a Task Id.";
+      el.matchHint.textContent = "Scan or type a Task Id or iLPN — separate multiple with ; , or a space.";
     } else {
       el.matchHint.textContent = "Press Enter or click Load Task.";
     }
@@ -177,15 +183,62 @@
     }
   }
 
-  function renderLines(lines) {
-    state.selectedLineNumber = null;
-    updateLineActionButtons();
-    setActionStatus("");
-    el.linesBody.innerHTML = (lines || [])
-      .map(
-        (line) => `
-        <tr class="line-row" data-line-number="${escapeAttr(line.lineNumber)}">
+  /**
+   * Single-group results keep the original header exactly as before
+   * (Task/Container + Type + Status). Multi-group results (2026-08-08,
+   * multi-LPN search) don't have one task to summarize, so this shows a
+   * plain count instead — per-row identity lives in the Task/Container
+   * column that renderGroups() shows once more than one group is
+   * loaded (see the "multi-group" CSS class on #linesTable). Final
+   * design for this is explicitly deferred; this is an interim default.
+   */
+  function renderTaskMeta() {
+    const groups = state.groups;
+    if (groups.length === 1) {
+      const g = groups[0];
+      if (g.mode === "no_task") {
+        el.taskMeta.innerHTML = `
+          <span><strong>Container</strong> ${escapeHtml(g.containerId || "")}</span>
+          <span><strong>Type</strong> ${escapeHtml(g.taskTypeLabel || g.taskType)}</span>
+          <span>${statusBadgeHtml(g.taskStatusLabel, g.taskStatus)}</span>
+        `;
+        el.transactionIdValue.textContent = "User Directed";
+      } else {
+        el.taskMeta.innerHTML = `
+          <span><strong>Task</strong> ${escapeHtml(g.taskId)}</span>
+          <span><strong>Type</strong> ${escapeHtml(g.taskTypeLabel || g.taskType)}</span>
+          <span><strong>Status</strong> ${statusBadgeHtml(g.taskStatusLabel, g.taskStatus)}</span>
+        `;
+        el.transactionIdValue.textContent = TRANSACTION_ID;
+      }
+    } else {
+      const taskCount = groups.filter((g) => g.mode === "task").length;
+      const noTaskCount = groups.filter((g) => g.mode === "no_task").length;
+      el.taskMeta.innerHTML = `
+        <span><strong>${groups.length} LPNs loaded</strong></span>
+        <span>${fmtCount(taskCount, "task")}, ${fmtCount(noTaskCount, "no-task container")}</span>
+      `;
+      el.transactionIdValue.textContent = TRANSACTION_ID;
+    }
+  }
+
+  function renderGroups() {
+    state.selectedTaskDetailId = null;
+    renderTaskMeta();
+    const multiGroup = state.groups.length > 1;
+    el.linesTable.classList.toggle("multi-group", multiGroup);
+    const lines = allLines();
+    el.linesBody.innerHTML = lines
+      .map((line) => {
+        const remaining = remainingQty(line);
+        const isNoTask = line.groupMode === "no_task";
+        const groupLabel = isNoTask
+          ? "Container " + escapeHtml(line.groupContainerId)
+          : "Task " + escapeHtml(line.groupTaskId);
+        return `
+        <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
           <td>${escapeHtml(line.lineNumber)}</td>
+          <td>${escapeHtml(line.lpnId)}</td>
           <td>${escapeHtml(line.itemId)}</td>
           <td>${escapeHtml(line.description)}</td>
           <td>${escapeHtml(line.fromLocationId)}</td>
@@ -199,15 +252,32 @@
               autocomplete="off"
             />
           </td>
-          <td>${escapeHtml(line.lpnId)}</td>
           <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
-          <td class="col-qty-wide">${escapeHtml(line.completedQuantity)}</td>
-        </tr>`
-      )
+          <td>
+            <input
+              type="number"
+              class="form-control completed-qty-input"
+              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              data-default-qty="${escapeAttr(remaining)}"
+              value="${escapeAttr(remaining)}"
+              min="0"
+              step="any"
+              ${isNoTask ? "disabled" : ""}
+            />
+          </td>
+          <td class="col-group">
+            ${groupLabel}<br/>${statusBadgeHtml(line.groupTaskStatusLabel, line.groupTaskStatus)}
+          </td>
+        </tr>`;
+      })
       .join("");
     el.linesBody
       .querySelectorAll(".to-location-input")
       .forEach((input) => validateLocation(input, true));
+    el.linesBody
+      .querySelectorAll(".completed-qty-input:not(:disabled)")
+      .forEach((input) => validateQty(input));
+    updateLineActionButtons();
   }
 
   /** Completed/Canceled = red, everything else = green (for now). */
@@ -241,10 +311,30 @@
   }
 
   function getLineByTaskDetailId(taskDetailId) {
-    if (!state.task) return null;
-    return (state.task.lines || []).find(
-      (l) => String(l.taskDetailId) === String(taskDetailId)
-    ) || null;
+    return allLines().find((l) => String(l.taskDetailId) === String(taskDetailId)) || null;
+  }
+
+  /**
+   * Mirrors getLocationOverride() exactly, same "only send if changed"
+   * contract (2026-08-08, the Completed Qty box) — an untouched box
+   * sends nothing, so the backend keeps doing a fresh full completion
+   * off whatever it fetches at submit time (the confirmed path); only
+   * an edited-down value takes the UNCONFIRMED partial-quantity path
+   * (see task_service._complete_putaway_line_system_directed()'s
+   * docstring). Deliberately not "always send the box's value" —
+   * that would make a full completion silently depend on the
+   * frontend's possibly-stale snapshot of "remaining" matching
+   * whatever the backend freshly fetches at submit time.
+   */
+  function getCompletedQtyOverride(taskDetailId) {
+    const input = el.linesBody.querySelector(
+      '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (!input || input.disabled) return undefined;
+    const value = Number(input.value);
+    const original = Number(input.dataset.defaultQty || 0);
+    if (!Number.isFinite(value) || value === original) return undefined;
+    return value;
   }
 
   function isLocationValid(taskDetailId) {
@@ -252,6 +342,32 @@
       '.to-location-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
     );
     return !!input && input.dataset.locationValid === "true";
+  }
+
+  /**
+   * Completed Qty must be > 0 and <= the remaining quantity it was
+   * defaulted to (data-default-qty), same gating role Current Location
+   * plays for the destination — a plain arithmetic check, synchronous,
+   * no API call needed unlike location validation. Locked (disabled)
+   * rows — no-task containers, which always move the full amount, see
+   * complete_container_putaway() — are always considered valid.
+   */
+  function validateQty(input) {
+    const remaining = Number(input.dataset.defaultQty || 0);
+    const value = Number(input.value);
+    const valid = Number.isFinite(value) && value > 0 && value <= remaining;
+    input.dataset.qtyValid = valid ? "true" : "false";
+    input.classList.toggle("invalid", !valid);
+    updateLineActionButtons();
+  }
+
+  function isQtyValid(taskDetailId) {
+    const input = el.linesBody.querySelector(
+      '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (!input) return false;
+    if (input.disabled) return true;
+    return input.dataset.qtyValid === "true";
   }
 
   /**
@@ -350,29 +466,35 @@
     locationValidateTimers.set(input, setTimeout(run, 400));
   }
 
+  /**
+   * Spans every group currently on screen, not just one task
+   * (2026-08-08, multi-LPN search + "Complete All" scope, per explicit
+   * instruction: Complete All acts on everything visible regardless of
+   * which task/container each line belongs to).
+   */
   function allOutstandingLinesValid() {
-    if (!state.task) return true;
-    const outstanding = (state.task.lines || []).filter((l) => remainingQty(l) > 0);
+    const outstanding = allLines().filter((l) => remainingQty(l) > 0);
     if (!outstanding.length) return true; // let the click through to show "nothing to do"
-    return outstanding.every((l) => isLocationValid(l.taskDetailId));
+    return outstanding.every(
+      (l) => isLocationValid(l.taskDetailId) && isQtyValid(l.taskDetailId)
+    );
   }
 
   function updateLineActionButtons() {
-    const hasSelection = state.selectedLineNumber !== null;
     const selectedLine = getSelectedLine();
-    const selectedValid = !!selectedLine && isLocationValid(selectedLine.taskDetailId);
-    const isNoTask = !!state.task && state.task.mode === "no_task";
-    // Partial isn't wired for the no-open-task container flow (it always
-    // moves the full on-hand quantity) — see complete_container_putaway().
-    el.partialLineBtn.disabled = !hasSelection || !selectedValid || isNoTask;
+    const hasSelection = !!selectedLine;
+    const selectedValid =
+      hasSelection &&
+      isLocationValid(selectedLine.taskDetailId) &&
+      isQtyValid(selectedLine.taskDetailId);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
     el.allLinesBtn.disabled = !allOutstandingLinesValid();
   }
 
-  function selectLine(lineNumber) {
-    state.selectedLineNumber = lineNumber;
+  function selectLine(taskDetailId) {
+    state.selectedTaskDetailId = taskDetailId;
     el.linesBody.querySelectorAll("tr.line-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.lineNumber === String(lineNumber));
+      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
     });
     updateLineActionButtons();
   }
@@ -401,26 +523,14 @@
       setStatus(data.error || "Load failed", "error");
       return false;
     }
-    state.task = data;
-    renderLines(data.lines);
-    if (data.mode === "no_task") {
-      // No open Putaway task for this container — see
-      // task_service.resolve_search()'s no_task branch.
-      el.taskMeta.innerHTML = `
-        <span><strong>Container</strong> ${escapeHtml(data.containerId || "")}</span>
-        <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
-        <span>${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
-      `;
-      el.transactionIdValue.textContent = "User Directed";
-    } else {
-      el.taskMeta.innerHTML = `
-        <span><strong>Task</strong> ${escapeHtml(data.taskId)}</span>
-        <span><strong>Type</strong> ${escapeHtml(data.taskTypeLabel || data.taskType)}</span>
-        <span><strong>Status</strong> ${statusBadgeHtml(data.taskStatusLabel, data.taskStatus)}</span>
-      `;
-      el.transactionIdValue.textContent = TRANSACTION_ID;
+    state.groups = data.groups || [];
+    state.lastSearchValue = searchValue;
+    renderGroups();
+    let statusText = fmtCount(allLines().length, "line");
+    if (data.notFound && data.notFound.length) {
+      statusText += " — not found: " + data.notFound.join(", ");
     }
-    el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
+    el.resultsStatus.textContent = statusText;
     return true;
   }
 
@@ -428,6 +538,12 @@
     const searchValue = el.taskIdInput.value.trim();
     if (!searchValue) return;
     setBusy(true, "Loading…");
+    // Only a genuinely new search clears the action status now (bug fix,
+    // 2026-08-08: this used to live in renderGroups()/renderLines(), so
+    // it also fired — and wiped the just-shown "Completed X" message —
+    // every time a completion refreshed the same search via
+    // reloadCurrentSearch()).
+    setActionStatus("");
     try {
       const ok = await fetchAndRenderTask(searchValue);
       if (ok) showResults();
@@ -448,17 +564,15 @@
     if (!el.loadTaskBtn.disabled) await loadTask();
   }
 
-  /** Re-search value to refresh the currently loaded task/container by. */
-  function currentSearchValue() {
-    if (!state.task) return "";
-    return state.task.mode === "no_task" ? state.task.containerId : state.task.taskId;
+  /** Re-runs the same raw search text to refresh everything currently loaded. */
+  async function reloadCurrentSearch() {
+    if (!state.lastSearchValue) return;
+    await fetchAndRenderTask(state.lastSearchValue);
   }
 
   function getSelectedLine() {
-    if (state.selectedLineNumber === null || !state.task) return null;
-    return (state.task.lines || []).find(
-      (l) => String(l.lineNumber) === String(state.selectedLineNumber)
-    ) || null;
+    if (state.selectedTaskDetailId === null) return null;
+    return getLineByTaskDetailId(state.selectedTaskDetailId);
   }
 
   function remainingQty(line) {
@@ -466,17 +580,25 @@
     return rem > 0 ? rem : 0;
   }
 
-  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides, toLocationId, reasonCodeId) {
-    const isNoTask = state.task.mode === "no_task";
-    const line = isNoTask ? getLineByTaskDetailId(taskDetailId) : null;
+  /**
+   * `line` (not just a taskDetailId) is required now (2026-08-08,
+   * multi-LPN search) — its own groupMode/groupTaskId carry which
+   * task/container it belongs to, since that's no longer one global
+   * value for the whole page. `mode` is always "full" now — Partial
+   * Complete was removed; the inline Completed Qty box's value (see
+   * getCompletedQtyOverride()) is what makes a "full" completion
+   * partial, only when actually edited down.
+   */
+  async function callCompleteLine(line, quantity, warningOverrides, toLocationId, reasonCodeId) {
+    const isNoTask = line.groupMode === "no_task";
     return api("complete_line", {
       org: state.org,
       token: state.token,
       location: state.facility,
-      taskId: isNoTask ? "" : state.task.taskId,
-      taskDetailId: isNoTask ? "" : taskDetailId,
-      containerId: isNoTask ? (line ? line.lpnId : "") : undefined,
-      mode,
+      taskId: isNoTask ? "" : line.groupTaskId,
+      taskDetailId: isNoTask ? "" : line.taskDetailId,
+      containerId: isNoTask ? line.lpnId : undefined,
+      mode: "full",
       quantity,
       transactionId: TRANSACTION_ID,
       warningOverrides: warningOverrides || undefined,
@@ -581,21 +703,29 @@
    * failure), or `{ success: false, cancelled: true }` if the user
    * cancels out of a warning.
    */
-  async function completeLineWithWarningHandling(taskDetailId, mode, quantity, toLocationId, reasonCodeId) {
+  async function completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId) {
     const overrides = {};
-    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId, reasonCodeId);
+    let result = await callCompleteLine(line, quantity, overrides, toLocationId, reasonCodeId);
     while (result && result.warning) {
       const confirmed = await showWarningModal(result.messageId, result.messageText);
       if (!confirmed) {
         return { success: false, cancelled: true, error: "Cancelled after warning." };
       }
       overrides[result.messageId] = result.messageId;
-      result = await callCompleteLine(taskDetailId, mode, quantity, overrides, toLocationId, reasonCodeId);
+      result = await callCompleteLine(line, quantity, overrides, toLocationId, reasonCodeId);
     }
     return result;
   }
 
-  async function completeFullLine() {
+  /**
+   * The single completion button (2026-08-08 — Partial Complete was
+   * removed; its job is now done by editing the row's Completed Qty
+   * box down from its default before clicking this). `quantity` is
+   * undefined unless the box was actually edited (see
+   * getCompletedQtyOverride()), so an untouched row behaves exactly as
+   * "Complete Line" always did.
+   */
+  async function completeLine() {
     const line = getSelectedLine();
     if (!line) return;
     const remaining = remainingQty(line);
@@ -603,8 +733,9 @@
       setActionStatus("Line " + line.lineNumber + " is already complete.", "error");
       return;
     }
+    const isNoTask = line.groupMode === "no_task";
+    const quantity = isNoTask ? undefined : getCompletedQtyOverride(line.taskDetailId);
     const toLocationId = getLocationOverride(line.taskDetailId);
-    const isNoTask = state.task.mode === "no_task";
     if (isNoTask && !toLocationId) {
       setActionStatus("Enter a destination location first.", "error");
       return;
@@ -619,7 +750,7 @@
     }
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
-      const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId, reasonCodeId);
+      const result = await completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId);
       if (!result.success) {
         if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
@@ -629,64 +760,7 @@
           " on line " + line.lineNumber + ".",
         "success"
       );
-      await fetchAndRenderTask(currentSearchValue());
-    } catch (e) {
-      setActionStatus(e.message || String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function openPartialModal() {
-    const line = getSelectedLine();
-    if (!line) return;
-    const remaining = remainingQty(line);
-    if (remaining <= 0) {
-      setActionStatus("Line " + line.lineNumber + " is already complete.", "error");
-      return;
-    }
-    el.partialLineInfo.innerHTML =
-      "<strong>Line " + escapeHtml(line.lineNumber) + "</strong> — " +
-      escapeHtml(line.itemId) + " " + escapeHtml(line.description) +
-      "<br/>Remaining: " + escapeHtml(remaining) + " " + escapeHtml(line.uomId || "");
-    el.partialQtyInput.value = remaining;
-    el.partialQtyInput.max = remaining;
-    el.partialQtyInput.min = 0;
-    el.partialQtyUom.textContent = line.uomId || "";
-    el.partialQtyHint.textContent = "";
-    partialLineModal.show();
-  }
-
-  async function confirmPartialLine() {
-    const line = getSelectedLine();
-    if (!line) {
-      partialLineModal.hide();
-      return;
-    }
-    const remaining = remainingQty(line);
-    const qty = Number(el.partialQtyInput.value);
-    if (!qty || qty <= 0) {
-      el.partialQtyHint.textContent = "Enter a quantity greater than 0.";
-      return;
-    }
-    if (qty > remaining) {
-      el.partialQtyHint.textContent = "Cannot exceed remaining quantity (" + remaining + ").";
-      return;
-    }
-    partialLineModal.hide();
-    setBusy(true, "Completing line " + line.lineNumber + "…");
-    try {
-      const result = await callCompleteLine(line.taskDetailId, "partial", qty);
-      if (!result.success) {
-        setActionStatus(result.error || "Complete failed", "error");
-        return;
-      }
-      setActionStatus(
-        "Completed " + result.quantity + " " + (result.uomId || "") +
-          " on line " + line.lineNumber + ".",
-        "success"
-      );
-      await fetchAndRenderTask(currentSearchValue());
+      await reloadCurrentSearch();
     } catch (e) {
       setActionStatus(e.message || String(e), "error");
     } finally {
@@ -696,19 +770,28 @@
 
   let allLinesPending = [];
 
+  /**
+   * Spans every group on screen (2026-08-08, per explicit instruction —
+   * "Complete All" means everything currently visible, not just one
+   * task/container).
+   */
   function openAllLinesModal() {
-    if (!state.task) return;
-    allLinesPending = (state.task.lines || []).filter((l) => remainingQty(l) > 0);
+    const multiGroup = state.groups.length > 1;
+    allLinesPending = allLines().filter((l) => remainingQty(l) > 0);
     if (!allLinesPending.length) {
       setActionStatus("No outstanding lines to complete.", "");
       return;
     }
     el.allLinesList.innerHTML = allLinesPending
-      .map(
-        (l) =>
-          "<li>Line " + escapeHtml(l.lineNumber) + " — " + escapeHtml(l.itemId) + " " +
+      .map((l) => {
+        const groupPrefix = multiGroup
+          ? (l.groupMode === "no_task" ? "Container " + l.groupContainerId : "Task " + l.groupTaskId) + " — "
+          : "";
+        return (
+          "<li>" + escapeHtml(groupPrefix) + "Line " + escapeHtml(l.lineNumber) + " — " + escapeHtml(l.itemId) + " " +
           escapeHtml(l.description) + ": " + escapeHtml(remainingQty(l)) + " " + escapeHtml(l.uomId || "") + "</li>"
-      )
+        );
+      })
       .join("");
     allLinesModal.show();
   }
@@ -719,14 +802,15 @@
     let succeeded = 0;
     let cancelled = false;
     const failures = [];
-    const isNoTask = state.task.mode === "no_task";
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
+      const isNoTask = line.groupMode === "no_task";
       const toLocationId = getLocationOverride(line.taskDetailId);
       if (isNoTask && !toLocationId) {
         cancelled = true;
         break;
       }
+      const quantity = isNoTask ? undefined : getCompletedQtyOverride(line.taskDetailId);
       let reasonCodeId = null;
       if (toLocationId && !isNoTask) {
         setBusy(false);
@@ -738,7 +822,7 @@
       }
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await completeLineWithWarningHandling(line.taskDetailId, "full", undefined, toLocationId, reasonCodeId);
+        const result = await completeLineWithWarningHandling(line, quantity, toLocationId, reasonCodeId);
         if (result.success) {
           succeeded++;
         } else if (result.cancelled) {
@@ -752,7 +836,7 @@
       }
     }
     setBusy(false);
-    await fetchAndRenderTask(currentSearchValue());
+    await reloadCurrentSearch();
     if (cancelled) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + " before cancelling.", "");
     } else if (!failures.length) {
@@ -781,20 +865,26 @@
   el.linesBody.addEventListener("click", (e) => {
     const row = e.target.closest("tr.line-row");
     if (!row) return;
-    selectLine(row.dataset.lineNumber);
+    selectLine(row.dataset.taskDetailId);
   });
   el.linesBody.addEventListener("input", (e) => {
-    const input = e.target.closest(".to-location-input");
-    if (!input) return;
-    const value = input.value.trim().toUpperCase();
-    const original = (input.dataset.defaultLocation || "").trim().toUpperCase();
-    input.classList.toggle("overridden", !!value && value !== original);
-    validateLocation(input);
+    const locInput = e.target.closest(".to-location-input");
+    if (locInput) {
+      const value = locInput.value.trim().toUpperCase();
+      const original = (locInput.dataset.defaultLocation || "").trim().toUpperCase();
+      locInput.classList.toggle("overridden", !!value && value !== original);
+      validateLocation(locInput);
+      return;
+    }
+    const qtyInput = e.target.closest(".completed-qty-input");
+    if (qtyInput) {
+      const value = Number(qtyInput.value);
+      const original = Number(qtyInput.dataset.defaultQty || 0);
+      qtyInput.classList.toggle("overridden", Number.isFinite(value) && value !== original);
+      validateQty(qtyInput);
+    }
   });
 
-  const partialLineModal = window.bootstrap
-    ? new window.bootstrap.Modal(document.getElementById("partialLineModal"))
-    : null;
   const allLinesModal = window.bootstrap
     ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
     : null;
@@ -803,9 +893,7 @@
   const reasonCodeModalEl = document.getElementById("reasonCodeModal");
   const reasonCodeModal = window.bootstrap ? new window.bootstrap.Modal(reasonCodeModalEl) : null;
 
-  el.fullLineBtn.addEventListener("click", completeFullLine);
-  el.partialLineBtn.addEventListener("click", openPartialModal);
-  el.partialLineConfirmBtn.addEventListener("click", confirmPartialLine);
+  el.fullLineBtn.addEventListener("click", completeLine);
   el.allLinesBtn.addEventListener("click", openAllLinesModal);
   el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
 

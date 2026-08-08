@@ -606,9 +606,20 @@ def commit_putaway_move(
 ) -> dict:
     """CONFIRMED-by-user-provided-capture — commit a fetched putaway move
     (Path C, Call C2). `inventory_move` should already have its
-    CompletedQuantity set by the caller (full vs. partial completion is
-    decided by that value, per the document's worked example — the
-    fetched move itself doesn't set it).
+    CompletedQuantity set by the caller (the fetched move itself doesn't
+    set it). **CONFIRMED NOT to work, 2026-08-08**: setting
+    `CompletedQuantity < Quantity` to express a genuine partial putaway
+    (an extrapolation from the field names — the document's only worked
+    example is a full completion, 240/240) was tested live against
+    `IBPWIBPT0929` (`CompletedQuantity: 100` of `Quantity: 240`) and
+    MAWM rejected it outright with a real business message: "Quantity
+    entered is less than the system quantity." This endpoint requires
+    the full system quantity; there is currently no known way to book a
+    genuine partial Putaway completion through Path C. The task was
+    left unaffected by the failed attempt (still 240 remaining, 0
+    completed) — only its status flipped to "In Progress", an expected
+    side effect of Call C1 (`fetchNextPutawayMoveAndStartLaborActivity`)
+    itself, unrelated to the rejected commit.
 
     `warning_overrides`, if given, is sent as a top-level `userInputs`
     map ({code: code}) — UNCONFIRMED extension of the document's Path A
