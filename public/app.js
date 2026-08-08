@@ -35,8 +35,6 @@
     { key: "Lost in cycle count", value: "LC" },
     { key: "Mass Inventory Movement", value: "MM" },
   ];
-  const DEFAULT_REASON_CODE = "IA";
-
   async function preloadAdjustmentReasonCodes() {
     try {
       const data = await api("preload_adjustment_reason_codes", {});
@@ -47,14 +45,20 @@
     }
   }
 
-  function reasonCodeOptionsHtml(selected) {
+  /**
+   * Always starts on the "Select Reason" placeholder (2026-08-08, per
+   * explicit instruction) — no default reason code is pre-picked
+   * anymore, forcing an actual choice. `.reason-code-select`'s own
+   * `invalid` class (styled red, see index.html) starts applied in the
+   * row templates and is cleared once a real value is chosen — see the
+   * delegated `change` handler and isReasonValid().
+   */
+  function reasonCodeOptionsHtml() {
     const codes = state.adjustmentReasonCodes || FALLBACK_REASON_CODES;
-    return codes
-      .map(
-        (c) =>
-          `<option value="${escapeAttr(c.value)}"${c.value === selected ? " selected" : ""}>${escapeHtml(c.key)}</option>`
-      )
+    const realOptions = codes
+      .map((c) => `<option value="${escapeAttr(c.value)}">${escapeHtml(c.key)}</option>`)
       .join("");
+    return '<option value="" selected>Select Reason</option>' + realOptions;
   }
 
   // Hardcoded for now — Putaway is the only task type wired to a real
@@ -296,6 +300,11 @@
    */
   function renderLineRow(line) {
     if (line.mixedItems) {
+      // Only worth showing at the summary level if every real item
+      // agrees (2026-08-08, per explicit instruction) — a mix of units
+      // has nothing coherent to show until expanded.
+      const uomIds = line.mixedItems.map((item) => item.uomId || "");
+      const commonUom = uomIds.every((u) => u === uomIds[0]) ? uomIds[0] : "";
       const summaryRow = `
         <tr class="line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
           <td>${escapeHtml(line.lineNumber)}</td>
@@ -310,7 +319,7 @@
           <td>${escapeHtml(line.fromLocationId)}</td>
           ${toLocationCellHtml(line)}
           <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
-          <td class="col-uom"></td>
+          <td class="col-uom">${escapeHtml(commonUom)}</td>
           <td><span class="text-muted">see items below</span></td>
           <td class="col-reason"></td>
         </tr>`;
@@ -342,11 +351,11 @@
           </td>
           <td class="col-reason">
             <select
-              class="form-select reason-code-select"
+              class="form-select reason-code-select invalid"
               data-parent-task-detail-id="${escapeAttr(line.taskDetailId)}"
               data-item-id="${escapeAttr(item.itemId)}"
             >
-              ${reasonCodeOptionsHtml(DEFAULT_REASON_CODE)}
+              ${reasonCodeOptionsHtml()}
             </select>
           </td>
         </tr>`
@@ -380,8 +389,8 @@
             />
           </td>
           <td class="col-reason">
-            <select class="form-select reason-code-select" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
-              ${reasonCodeOptionsHtml(DEFAULT_REASON_CODE)}
+            <select class="form-select reason-code-select invalid" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+              ${reasonCodeOptionsHtml()}
             </select>
           </td>
         </tr>`;
@@ -499,7 +508,7 @@
         return {
           itemId: item.itemId,
           desiredQty: baseValue,
-          reasonCode: select ? select.value : DEFAULT_REASON_CODE,
+          reasonCode: select ? select.value : "",
         };
       });
     }
@@ -516,7 +525,7 @@
       {
         itemId: line.itemId,
         desiredQty: override * factor,
-        reasonCode: reasonSelect ? reasonSelect.value : DEFAULT_REASON_CODE,
+        reasonCode: reasonSelect ? reasonSelect.value : "",
       },
     ];
   }
@@ -560,6 +569,45 @@
       '.completed-qty-input[data-task-detail-id="' + CSS.escape(String(line.taskDetailId)) + '"]'
     );
     return !!input && input.dataset.qtyValid === "true";
+  }
+
+  /**
+   * A reason code is only required once its Completed Qty box is
+   * actually overridden (see `.overridden` — the select is invisible
+   * otherwise) — but once shown, it must be a real selection, not the
+   * "Select Reason" placeholder (2026-08-08, per explicit instruction).
+   * Checks every mixed sub-item independently, since each one has its
+   * own qty box and reason select.
+   */
+  function isReasonValid(line) {
+    if (line.mixedItems) {
+      return line.mixedItems.every((item) => {
+        const qtyInput = el.linesBody.querySelector(
+          '.mixed-qty-input[data-parent-task-detail-id="' +
+            CSS.escape(line.taskDetailId) +
+            '"][data-item-id="' +
+            CSS.escape(item.itemId) +
+            '"]'
+        );
+        if (!qtyInput || !qtyInput.classList.contains("overridden")) return true;
+        const reasonSelect = el.linesBody.querySelector(
+          '.reason-code-select[data-parent-task-detail-id="' +
+            CSS.escape(line.taskDetailId) +
+            '"][data-item-id="' +
+            CSS.escape(item.itemId) +
+            '"]'
+        );
+        return !!(reasonSelect && reasonSelect.value);
+      });
+    }
+    const qtyInput = el.linesBody.querySelector(
+      '.completed-qty-input[data-task-detail-id="' + CSS.escape(line.taskDetailId) + '"]'
+    );
+    if (!qtyInput || !qtyInput.classList.contains("overridden")) return true;
+    const reasonSelect = el.linesBody.querySelector(
+      '.reason-code-select[data-task-detail-id="' + CSS.escape(line.taskDetailId) + '"]'
+    );
+    return !!(reasonSelect && reasonSelect.value);
   }
 
   /**
@@ -667,14 +715,19 @@
   function allOutstandingLinesValid() {
     const outstanding = allLines().filter((l) => remainingQty(l) > 0);
     if (!outstanding.length) return true; // let the click through to show "nothing to do"
-    return outstanding.every((l) => isLocationValid(l.taskDetailId) && isQtyValid(l));
+    return outstanding.every(
+      (l) => isLocationValid(l.taskDetailId) && isQtyValid(l) && isReasonValid(l)
+    );
   }
 
   function updateLineActionButtons() {
     const selectedLine = getSelectedLine();
     const hasSelection = !!selectedLine;
     const selectedValid =
-      hasSelection && isLocationValid(selectedLine.taskDetailId) && isQtyValid(selectedLine);
+      hasSelection &&
+      isLocationValid(selectedLine.taskDetailId) &&
+      isQtyValid(selectedLine) &&
+      isReasonValid(selectedLine);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
     el.allLinesBtn.disabled = !allOutstandingLinesValid();
   }
@@ -692,12 +745,19 @@
     el.resultsScreen.classList.add("active");
   }
 
+  /**
+   * Keeps the search box's value on "Scan Another" (2026-08-08, per
+   * explicit instruction — especially useful for repeat testing) —
+   * previously cleared it. Selects the text so typing/scanning
+   * immediately replaces it, same as a fresh field would feel, without
+   * losing the last value if the user just wants to reload it.
+   */
   function showFilters() {
     el.resultsScreen.classList.remove("active");
     el.filtersScreen.classList.add("active");
-    el.taskIdInput.value = "";
     updateLoadButton();
     el.taskIdInput.focus();
+    el.taskIdInput.select();
   }
 
   async function fetchAndRenderTask(searchValue) {
@@ -1092,10 +1152,12 @@
       return;
     }
     // Mixed-item sub-row quantity (2026-08-08) — same override/reason-
-    // select behavior as the normal Completed Qty box, but no gating
-    // role in updateLineActionButtons() (see isQtyValid()'s docstring);
-    // the min="0" input attribute plus this class is just visual
-    // feedback here, not a submission block.
+    // select behavior as the normal Completed Qty box. The quantity
+    // itself still has no gating role in updateLineActionButtons() (see
+    // isQtyValid()'s docstring), but its reason code does once shown
+    // (see isReasonValid()) — the min="0" input attribute plus this
+    // class is just visual feedback for the quantity, not a submission
+    // block on its own.
     const mixedQtyInput = e.target.closest(".mixed-qty-input");
     if (mixedQtyInput) {
       const value = Number(mixedQtyInput.value);
@@ -1104,7 +1166,27 @@
       mixedQtyInput.classList.toggle("overridden", overridden);
       mixedQtyInput.classList.toggle("invalid", !(Number.isFinite(value) && value >= 0));
       toggleReasonSelect(mixedQtyInput, overridden);
+      // Bug fixed 2026-08-08 (live-tested): unlike validateQty() for the
+      // single-item box, nothing here re-evaluated button state, so
+      // revealing an invalid reason select didn't actually disable
+      // Complete Line/Complete All until something else happened to
+      // call updateLineActionButtons() afterward.
+      updateLineActionButtons();
     }
+  });
+
+  /**
+   * A shown reason-code select starts on the "Select Reason" placeholder
+   * (2026-08-08, per explicit instruction) — red/`invalid` until the
+   * user actually picks a real code, which also gates the completion
+   * buttons (see isReasonValid()) so a quantity can't be submitted with
+   * no reason attached.
+   */
+  el.linesBody.addEventListener("change", (e) => {
+    const select = e.target.closest(".reason-code-select");
+    if (!select) return;
+    select.classList.toggle("invalid", !select.value);
+    updateLineActionButtons();
   });
 
   function toggleReasonSelect(qtyInput, visible) {

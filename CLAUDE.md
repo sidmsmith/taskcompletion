@@ -566,6 +566,38 @@ padding.
 left-aligned (`.action-toolbar`'s `justify-content: center` →
 `flex-start`), per explicit instruction.
 
+## Required reason code, "Scan Another" retains search, mixed header UOM (2026-08-08, sixth session)
+
+- **"Scan Another" (`showFilters()`) no longer clears the search box** —
+  per explicit instruction ("especially for testing!"). Also selects
+  the retained text so typing/scanning still immediately replaces it.
+- **MIXED accordion summary row now shows a UOM** in its own column
+  when every real item underneath happens to share the same one (blank
+  if they differ, same as before) — `renderLineRow()` computes this
+  from `line.mixedItems[].uomId` at render time, no backend change.
+- **Reason code is now required, not defaulted** — `.reason-code-select`
+  starts on a "Select Reason" placeholder (`value=""`), styled red via
+  the same `.invalid` class/CSS every other input here already uses,
+  instead of silently pre-picking `IA`. `isReasonValid()` (mirrors
+  `isQtyValid()`) gates `Complete Line`/`Complete All` alongside
+  location and quantity validity: a reason is only required once its
+  row's Completed Qty is actually overridden (the select is invisible
+  otherwise), but once shown, the placeholder blocks submission until a
+  real code is chosen — checked independently per item for a MIXED
+  container's accordion. A `change` listener toggles `.invalid` off
+  once a real value is picked and re-evaluates button state.
+
+  **Real bug caught live while testing this**: the `.mixed-qty-input`
+  input handler toggled the reason select's visibility/styling but
+  never called `updateLineActionButtons()` afterward (unlike the
+  single-item box, where `validateQty()` already does) — so editing a
+  MIXED item's quantity revealed an invalid reason select without
+  actually disabling the buttons until something unrelated happened to
+  re-evaluate them. Fixed by calling `updateLineActionButtons()`
+  directly in that branch too. Confirmed live (buttons disabled on
+  reveal, re-enabled the moment a real reason was picked) before
+  shipping.
+
 ## Known-good test Task Id
 
 Refreshed 2026-08-08 (third session) — the demo environment's data
