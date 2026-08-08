@@ -673,18 +673,33 @@ a raw JSON array body — an object wrapper causes a
 iLPN's `ScannedQuantity`, this endpoint's `Quantity` is a genuine
 signed **delta** (`New OnHand = Current + Quantity`) with no
 absolute-value shortcut, so the function computes
-`delta = desired − current` itself. **CONFIRMED live, both
-directions**, independently verified by re-query: `A1AC0114` item
-`3000223`, 50 → 51 (add) → 49 (subtract) → 50 (restored). Multiple
-inventory records for the same item at one location are **not**
-disambiguated (the document says to use distinguishing attributes from
-"the selected record," but this app has no concept of picking a
-specific record — takes the first match; not yet hit in testing).
-`DCI::313` (stale record) handling is best-effort/**UNCONFIRMED** — the
-document only describes it in prose, no captured error response body
-exists, so the retry trigger is a text-match on
-`LOCATION_ADJUSTMENT_STALE_RECORD_CODE` rather than a confirmed
-envelope shape.
+`delta = desired − current` itself. **CONFIRMED live, both directions,
+against two different locations**, independently verified by re-query
+each time:
+- `A1AC0114` item `3000223` (a single clean inventory record): 50 → 51
+  (add) → 49 (subtract) → 50 (restored).
+- `C1CS0110` item `50002236` — a real example of the "multiple
+  inventory records for the same item at one location" case the
+  document warns about: 4 records, all identical attributes (batch,
+  product status, country of origin, `InventoryAttribute1` all null —
+  nothing to distinguish them by), `OnHand` 0/10/10/10. This app's
+  code doesn't disambiguate (takes the first match — see
+  `adjust_location_quantities()`'s docstring), and it worked correctly
+  anyway: the same record (by `InventoryId`) came back first across
+  three separate queries (baseline, post-add, post-subtract), so
+  0 → 1 (add) → 0 (subtract) landed on that one record consistently,
+  confirmed by checking every record's `InventoryId` individually, not
+  just the location's total. **This is empirical, not a documented
+  guarantee** — MAWM's search result ordering happened to be stable
+  across this test, but nothing confirms it's *always* stable, so a
+  location with genuinely ambiguous duplicate records is still a real
+  risk for a future call, just a lower one than initially assumed.
+  `DCI::313` (stale record) handling is best-effort/**UNCONFIRMED** —
+  the document only describes it in prose, no captured error response
+  body exists, so the retry trigger is a text-match on
+  `LOCATION_ADJUSTMENT_STALE_RECORD_CODE` rather than a confirmed
+  envelope shape (not actually triggered in either test above — both
+  succeeded on the first attempt).
 
 **Not yet live-tested**: the full *integrated* branch inside
 `complete_putaway_line()` (a real allocated LPN, put away to a
