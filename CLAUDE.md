@@ -749,16 +749,27 @@ whose LPN ends up in this state shows a genuinely blank Current
 Location with no `*` fallback, which is accurate, just worth knowing
 isn't the same situation as a truly consumed LPN).
 
-**Needs manual re-verification in WM after a data refresh** — user
-flagged there's a good chance `C1CS0110` not consuming `LPN00760` was
-bad/stale test data rather than a genuine Path C behavior difference.
-To re-check by hand in the mobile UI: find a fresh allocated task
-headed to `C1CS0110` (or another `InventoryReservationTypeId='LOCATION'`
-destination), complete the putaway there, and see whether WM shows the
-LPN as consumed (no longer independently adjustable) or still live.
-`IBPWIBPT0105`/`LPN00760` itself is already used up (task completed,
-LPN now at qty 9, "Not Allocated") so this needs a *different* fresh
-task, not a repeat of that exact one.
+**Repeated with a second, independent task/LPN — same result.**
+`IBPWIBPT0110` (item `50002236`, `LPN00764`, planned qty 10, same
+destination `C1CS0110`), `desired_qty=9`: `adjustmentTarget: "lpn"`
+again, and re-queried directly (not just trusted): `LPN00764` stayed
+`Status: "3000"` (not consumed), its own container inventory shows
+`OnHand: 9.0` (the correction landed on the LPN), and `C1CS0110`'s
+location inventory for `50002236` was untouched by the adjustment —
+still the same 0/10/10/10 rows (one row's `UpdatedTimestamp` lines up
+with this putaway move and stayed at `0.0`, so that's the move itself
+touching a location-level shadow record, not the adjustment logic
+firing). Two different tasks/LPNs to the same `LOCATION`-typed
+destination now agree, which weighs against this being a one-off
+bad-data artifact — but per the user, still worth confirming by hand
+in WM after a refresh, since two data points from the same test
+environment/config could still share a root cause. To re-check
+manually: find a fresh allocated task headed to `C1CS0110` (or another
+`InventoryReservationTypeId='LOCATION'` destination), complete the
+putaway there, and see whether WM shows the LPN as consumed (no longer
+independently adjustable) or still live. `IBPWIBPT0105`/`LPN00760` and
+`IBPWIBPT0110`/`LPN00764` are both already used up, so this needs a
+*different* fresh task.
 
 ## LPN status badge, consumed-location display (2026-08-08, seventh session)
 
