@@ -56,10 +56,13 @@ from mawm_client import (
     ADJUSTMENT_REASON_CODES,
     DEFAULT_ADJUSTMENT_REASON_CODE,
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
+    ILPN_CONSUMED_STATUS,
+    LOCATION_ADJUSTMENT_STALE_RECORD_CODE,
     PUTAWAY_WORKFLOW_SCRIPT_NAME,
     TASK_TYPE_LABELS,
     USER_DIRECTED_TRANSACTION_ID,
     adjust_ilpn_inventory,
+    adjust_location_inventory,
     apply_warning_overrides,
     commit_putaway_move,
     complete_task,
@@ -72,6 +75,7 @@ from mawm_client import (
     search_container_inventory,
     search_ilpn_current_location,
     search_items,
+    search_location_inventory,
     search_putaway_reason_codes,
     search_task,
     search_task_id_for_container,
@@ -746,6 +750,186 @@ def adjust_ilpn_quantities(
     }
 
 
+def adjust_location_quantities(
+    location_id: str,
+    adjustments: List[Dict[str, Any]],
+    token: str,
+    org: str,
+    location: str = None,
+) -> Dict[str, Any]:
+    """Adjust Location: correct `location_id`'s own on-hand quantity for
+    each item in `adjustments` (`[{"itemId", "desiredQty", "reasonCode"}]`)
+    to the given value, per `mawm_adjust_location_api.md` (2026-08-08,
+    sixth session). This is the fallback for a putaway destination that
+    consumes the LPN into the location's own inventory record rather
+    than keeping LPN-level inventory — see `ILPN_CONSUMED_STATUS`'s
+    comment in mawm_client.py for the confirmed live signal
+    `complete_putaway_line()` uses to choose this over
+    `adjust_ilpn_quantities()`.
+
+    Unlike Modify iLPN's `ScannedQuantity`, this endpoint's `Quantity`
+    is a genuine signed delta with no absolute-value shortcut — always
+    re-queries live location inventory first (never trusts a caller's
+    belief about current on-hand) and computes
+    `delta = desired - current` per item.
+
+    Items already at their desired quantity are silently skipped (not
+    sent at all, same convention as adjust_ilpn_quantities()). Returns
+    `{"success": True, "adjusted": False}` if nothing needed to change.
+
+    **Multiple inventory records for the same item at one location are
+    NOT disambiguated** — the document says to use distinguishing
+    attributes (batch, product status, ConsumptionPriorityDate, etc.)
+    from "the selected record" when this happens, but this app has no
+    concept of the operator picking a specific record, only an item +
+    desired quantity. This takes the first matching row and carries its
+    attributes; if a location genuinely holds more than one inventory
+    detail for the same item (different batches/attributes), the
+    adjustment could land against the wrong one. Not yet hit in
+    testing; revisit if it comes up.
+
+    **`DCI::313` (stale record) handling is best-effort, UNCONFIRMED**
+    — see `mawm_client.adjust_location_inventory()`'s docstring: no
+    captured error response body exists for this endpoint's stale-record
+    case, so this checks the response for
+    `LOCATION_ADJUSTMENT_STALE_RECORD_CODE` (`extract_message()`'s text,
+    or the raw body as a last resort) and, if found, re-queries location
+    inventory once and retries the whole payload once with fresh
+    `InventoryReadOnHand`/attributes — same one-retry shape as Modify
+    iLPN's null-timestamp refresh, not an open-ended loop.
+
+    No async note in the document the way Modify iLPN's endIlpn has one,
+    but "allow for the adjustment to complete before verifying" reads
+    the same way — waits briefly, then re-queries once to verify,
+    returning `success: False` with the mismatched item ids if it
+    doesn't match yet (treat as "try again shortly," not a hard
+    failure, same as adjust_ilpn_quantities()).
+    """
+    dest = resolve_location(org, location)
+
+    def _by_item(rows: List[dict]) -> Dict[str, dict]:
+        by_item: Dict[str, dict] = {}
+        for r in rows:
+            item_id = str(r.get("ItemId") or "")
+            if item_id and item_id not in by_item:
+                by_item[item_id] = r
+        return by_item
+
+    rows = search_location_inventory(location_id, token, org, location=dest)
+    by_item = _by_item(rows)
+
+    to_send = []
+    for adj in adjustments:
+        item_id = str(adj.get("itemId") or "").strip()
+        if not item_id:
+            continue
+        desired = _dec(adj.get("desiredQty"))
+        row = by_item.get(item_id)
+        current = _dec(row.get("OnHand")) if row else Decimal("0")
+        if desired == current:
+            continue
+        if not row:
+            return {
+                "success": False,
+                "adjusted": False,
+                "error": f"{item_id} not found at {location_id}",
+            }
+        to_send.append(
+            {
+                "itemId": item_id,
+                "desired": desired,
+                "current": current,
+                "row": row,
+                "reasonCode": str(adj.get("reasonCode") or "").strip()
+                or DEFAULT_ADJUSTMENT_REASON_CODE,
+            }
+        )
+
+    if not to_send:
+        return {"success": True, "adjusted": False}
+
+    def _build_payload(items: List[dict]) -> List[dict]:
+        payload = []
+        for item in items:
+            row = item["row"]
+            delta = item["desired"] - item["current"]
+            payload.append(
+                {
+                    "SourceContainerId": location_id,
+                    "SourceContainerType": "LOCATION",
+                    "SourceLocationId": location_id,
+                    "EventSource": "INVENTORY_MANAGEMENT",
+                    "TransactionType": "INVENTORY_ADJUSTMENT",
+                    "InventoryTypeId": row.get("InventoryTypeId"),
+                    "CountryOfOrigin": row.get("CountryOfOrigin"),
+                    "ProductStatusId": row.get("ProductStatusId"),
+                    "BatchNumber": row.get("BatchNumber"),
+                    "ReasonCode": item["reasonCode"],
+                    "ReferenceText": None,
+                    "SecondaryReferenceText": None,
+                    "InventoryAttribute1": row.get("InventoryAttribute1"),
+                    "InventoryAttribute2": row.get("InventoryAttribute2"),
+                    "InventoryAttribute3": row.get("InventoryAttribute3"),
+                    "InventoryAttribute4": row.get("InventoryAttribute4"),
+                    "InventoryAttribute5": row.get("InventoryAttribute5"),
+                    "ItemId": item["itemId"],
+                    "AddItemUOM": None,
+                    "RemoveItemUOM": None,
+                    "AddItemRemainder": _num(delta) if delta > 0 else None,
+                    "RemoveItemRemainder": _num(-delta) if delta < 0 else None,
+                    "caseTrackingLpn": "",
+                    "ConsumptionPriorityDate": row.get("ConsumptionPriorityDate"),
+                    "PixEventName": "INVENTORY_ADJUSTMENT",
+                    "PixTransactionType": "ADJUST_UI",
+                    "ExpirationDate": row.get("ExpirationDate"),
+                    "ManufacturedDate": row.get("ManufacturedDate"),
+                    "PackUomQuantity": row.get("PackUomQuantity"),
+                    "PackUomTypeId": row.get("PackUomTypeId"),
+                    "Quantity": _num(delta),
+                    "InventoryReadOnHand": _num(item["current"]),
+                }
+            )
+        return payload
+
+    adjust_resp = adjust_location_inventory(_build_payload(to_send), token, org, location=dest)
+
+    stale = LOCATION_ADJUSTMENT_STALE_RECORD_CODE in (
+        extract_message(adjust_resp) + " " + str(adjust_resp)
+    )
+    if stale:
+        rows = search_location_inventory(location_id, token, org, location=dest)
+        by_item = _by_item(rows)
+        for item in to_send:
+            fresh_row = by_item.get(item["itemId"])
+            if fresh_row:
+                item["row"] = fresh_row
+                item["current"] = _dec(fresh_row.get("OnHand"))
+        adjust_resp = adjust_location_inventory(_build_payload(to_send), token, org, location=dest)
+
+    time.sleep(1.5)
+    verify_rows = search_location_inventory(location_id, token, org, location=dest)
+    verify_by_item = _by_item(verify_rows)
+    mismatches = []
+    for item in to_send:
+        new_row = verify_by_item.get(item["itemId"])
+        new_onhand = _dec(new_row.get("OnHand")) if new_row else Decimal("0")
+        if new_onhand != item["desired"]:
+            mismatches.append(item["itemId"])
+
+    return {
+        "success": not mismatches,
+        "adjusted": True,
+        "mismatches": mismatches,
+        "error": (
+            "Adjustment not yet verified for: " + ", ".join(mismatches) + " — this may just need "
+            "a moment longer, or the request itself may have failed: "
+            + extract_message(adjust_resp)
+        )
+        if mismatches
+        else None,
+    }
+
+
 def complete_putaway_line(
     token: str,
     org: str,
@@ -780,20 +964,25 @@ def complete_putaway_line(
     itself, so the same call works whether the LPN is fresh or was just
     put away.
 
-    This currently only makes sense for a destination that keeps
-    LPN-level inventory after putaway — Reserve/Storage locations,
-    which is the *only* destination type this app's own
-    `validate_storage_location()` (`LocationTypeId='STORAGE'`) allows
-    through the To Location field today, so every destination reachable
-    through this app right now is in-scope. **Explicitly out of
-    scope, not yet built**: putting away to a Pick location, where
-    MAWM is typically configured to *consume* the LPN into the
-    location's own inventory record — no discrete LPN entity would be
-    left to run Modify iLPN against afterward. That would need a
-    different, not-yet-identified "adjust location inventory" API
-    instead of `adjust_ilpn_quantities()` — being investigated
-    separately; don't assume a Storage-location code path here applies
-    once that's added.
+    **Which of two APIs to use is now decided automatically, per
+    explicit domain-expertise instruction, confirmed live 2026-08-08**:
+    `LocationTypeId='STORAGE'` (the only destination type this app's
+    own `validate_storage_location()` allows) does NOT by itself mean
+    the destination keeps LPN-level inventory — that's a genuinely
+    independent property (`Location.InventoryReservationTypeId`, "LPN"
+    vs "LOCATION"). Some Storage locations consume the LPN into their
+    own location-level inventory record just like a Pick location
+    would (confirmed live: `A1AC0114`/`C1CS0110` are both
+    `LocationTypeId='STORAGE'` but `InventoryReservationTypeId=
+    'LOCATION'`). Rather than pre-checking the destination location,
+    this checks the *LPN itself* after putaway — the real, observed
+    outcome rather than an inferred one: `search_ilpn_current_location()`
+    now also fetches `Status`; `Status == ILPN_CONSUMED_STATUS` ("9000",
+    MAWM's own `ilpn_dc_inventory_status` domain, confirmed live against
+    both a consumed and a still-live LPN) means the LPN was consumed
+    into the destination's own inventory, so
+    `adjust_location_quantities()` runs against the destination
+    location instead of `adjust_ilpn_quantities()` against the LPN.
 
     If the putaway itself fails or hits a warning, this returns exactly
     that (same as before) — the adjustment step never runs, and never
@@ -856,19 +1045,34 @@ def complete_putaway_line(
                 "itemId and lpnId are required to adjust the completed quantity"
             )
             return putaway_result
-        adjust_result = adjust_ilpn_quantities(
-            lpn_id,
-            [
-                {
-                    "itemId": item_id,
-                    "desiredQty": desired_qty,
-                    "reasonCode": adjustment_reason_code,
-                }
-            ],
-            token,
-            org,
-            location=location,
-        )
+
+        dest = resolve_location(org, location)
+        ilpn = search_ilpn_current_location(lpn_id, token, org, location=dest)
+        consumed = bool(ilpn) and str(ilpn.get("Status") or "") == ILPN_CONSUMED_STATUS
+
+        adjustment = [
+            {
+                "itemId": item_id,
+                "desiredQty": desired_qty,
+                "reasonCode": adjustment_reason_code,
+            }
+        ]
+        if consumed:
+            final_location_id = str(putaway_result.get("toLocationId") or "").strip()
+            if not final_location_id:
+                putaway_result["adjustmentSuccess"] = False
+                putaway_result["adjustmentError"] = (
+                    "Could not determine the putaway destination to adjust"
+                )
+                return putaway_result
+            putaway_result["adjustmentTarget"] = "location"
+            adjust_result = adjust_location_quantities(
+                final_location_id, adjustment, token, org, location=dest
+            )
+        else:
+            putaway_result["adjustmentTarget"] = "lpn"
+            adjust_result = adjust_ilpn_quantities(lpn_id, adjustment, token, org, location=dest)
+
         putaway_result["adjustmentSuccess"] = bool(adjust_result.get("success"))
         if not adjust_result.get("success"):
             putaway_result["adjustmentError"] = (

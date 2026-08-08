@@ -174,8 +174,64 @@ DEFAULT_ADJUSTMENT_REASON_CODE = "IA"
 # C1CS0111) all carry LocationTypeId="STORAGE" — used to validate a
 # user-typed "To Location" is a real storage location, per explicit
 # instruction that button-gating depend on this, not just non-blank text.
+# NOTE (2026-08-08, sixth session): LocationTypeId="STORAGE" does NOT
+# imply LPN-level inventory tracking — see InventoryReservationTypeId
+# below, a genuinely independent field. C1CS0110 is LocationTypeId=
+# STORAGE but InventoryReservationTypeId=LOCATION (putaway there
+# consumes the LPN); an earlier note here claiming it "tracks LPNs" was
+# wrong.
 LOCATION_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/location/search"
 STORAGE_LOCATION_TYPE_ID = "STORAGE"
+
+# CONFIRMED live, 2026-08-08 (sixth session) — the real signal for
+# task_service.complete_putaway_line()'s decision between adjusting the
+# LPN (adjust_ilpn_quantities()) vs. the destination location
+# (adjust_location_quantities()) after completing a putaway. A
+# location's own InventoryReservationTypeId ("LPN" vs "LOCATION",
+# dcinventory/location/search) predicts it, but the ground-truth check
+# used here is simpler and doesn't require a separate location lookup:
+# after putaway, re-query the LPN itself (search_ilpn_current_location(),
+# Template extended to include Status) — Status == "9000" means MAWM
+# already consumed it into the destination's own location-level
+# inventory (CurrentLocationId comes back null at that point), matching
+# mawm_api_library's ilpn_dc_inventory_status domain ("9000" =
+# "Consumed"; contrast "3000" = "Not Allocated", seen on every LPN that
+# stayed a live container after putaway in this app's testing so far).
+ILPN_CONSUMED_STATUS = "9000"
+
+# CONFIRMED-by-user-capture (mawm_adjust_location_api.md, 2026-08-08,
+# sixth session) — the fallback for exactly the case above: once an LPN
+# is consumed, there's no more discrete LPN-level inventory record to
+# run Modify iLPN against, so the destination *location's own*
+# inventory record for the item has to be adjusted directly instead.
+# Confirmed test sequence: (1) POST dcinventory/inventory/search with a
+# LocationId-only Query to read the location's current inventory
+# detail (OnHand, Allocated, ConsumptionPriorityDate, distinguishing
+# attributes, all needed to build step 2's payload) — see
+# search_location_inventory() below, same endpoint/shape
+# search_container_inventory() already uses, just queried by LocationId
+# instead of InventoryContainerId. (2) POST adjustInventory (a genuinely
+# different endpoint from Modify iLPN's endIlpn) with a **raw JSON
+# array**, not an object wrapper — the document notes an object wrapper
+# causes a NullPointerException. Delta-based, not absolute:
+# `New OnHand = Current OnHand + Quantity` — the caller must convert an
+# absolute desired quantity into a signed delta before building the
+# payload (contrast Modify iLPN's ScannedQuantity, which collapses to
+# an absolute value in this app's usage since Original==Expected==
+# current there; this endpoint has no such shortcut).
+# `AddItemRemainder`/`RemoveItemRemainder` must agree with the delta's
+# sign. `InventoryReadOnHand` is this endpoint's optimistic-concurrency
+# check (parallel to Modify iLPN's InventoryReadTimestamp) — a stale
+# value returns `DCI::313`, requiring a fresh location-inventory query
+# and a resubmit with the current OnHand/attributes.
+# **UNCONFIRMED**: the document only ever describes DCI::313 in prose
+# ("MAWM reports that the inventory record changed") — no captured JSON
+# error response body for it exists to confirm the exact shape
+# extract_message()/extract_warning() would need to recognize it
+# reliably; see adjust_location_inventory()'s docstring for how this is
+# handled defensively pending a real capture of that error case.
+ADJUST_LOCATION_INVENTORY_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/adjustInventory"
+LOCATION_ADJUSTMENT_STALE_RECORD_CODE = "DCI::313"
 
 # CONFIRMED live against SS-DEMO — the document's own
 # `/api/putaway/config/services/reasonCodes/list` guess (hedged there as
@@ -440,6 +496,12 @@ def search_ilpn_current_location(
 ) -> Optional[dict]:
     """CONFIRMED live (Tier 1, mawm_api_library/ilpn/api.md) — one iLPN
     row (for its CurrentLocationId), or None if the iLPN doesn't exist.
+
+    Template extended 2026-08-08 to also fetch `Status` — see
+    `ILPN_CONSUMED_STATUS`'s comment above for why: this is the signal
+    task_service.complete_putaway_line() uses to tell whether an LPN
+    is still a live container after putaway, or was consumed into the
+    destination location's own inventory.
     """
     token = normalize_token(token)
     quoted = container_id.replace("'", "''")
@@ -450,7 +512,7 @@ def search_ilpn_current_location(
             "Query": f"IlpnId ='{quoted}'",
             "Size": 5,
             "Page": 0,
-            "Template": {"IlpnId": "", "CurrentLocationId": ""},
+            "Template": {"IlpnId": "", "CurrentLocationId": "", "Status": ""},
         },
     )
     if response.status_code != 200:
@@ -485,6 +547,86 @@ def search_container_inventory(
             f"inventory search failed: {response.status_code} {response.text[:500]}"
         )
     return _response_data_list(response.json())
+
+
+def search_location_inventory(
+    location_id: str, token: str, org: str, location: str = None
+) -> List[dict]:
+    """CONFIRMED-by-user-capture (mawm_adjust_location_api.md,
+    2026-08-08, sixth session) — step 1 of the Adjust Location flow:
+    every inventory detail row directly at `location_id` (not scoped to
+    any container — this is for location-level inventory, the case
+    where putaway has consumed the LPN into the location's own record).
+    Same endpoint/shape as search_container_inventory(), just queried
+    by LocationId instead of InventoryContainerId. More than one row
+    for the same ItemId means distinguishing attributes (batch, product
+    status, ConsumptionPriorityDate, etc.) matter for picking the right
+    one — see adjust_location_quantities()'s docstring for how (or
+    rather, whether) this app disambiguates that today.
+    """
+    token = normalize_token(token)
+    quoted = location_id.replace("'", "''")
+    response = _post(
+        INVENTORY_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "Query": f"LocationId ='{quoted}'",
+            "Size": 20,
+            "Page": 0,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"location inventory search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
+
+def adjust_location_inventory(inventory_lines: List[dict], token: str, org: str, location: str = None) -> dict:
+    """CONFIRMED-by-user-capture (mawm_adjust_location_api.md,
+    2026-08-08, sixth session) — step 2: apply a delta-based adjustment
+    directly to a location's own inventory record for an item, via the
+    core DCI endpoint (a different one from Modify iLPN's endIlpn — no
+    IlpnId/TransactionId wrapper here at all). `inventory_lines` are
+    dicts already shaped like the document's payload (SourceContainerId/
+    SourceContainerType="LOCATION"/SourceLocationId, ItemId, ReasonCode,
+    the distinguishing attributes, AddItemRemainder/RemoveItemRemainder,
+    Quantity as a signed delta, InventoryReadOnHand) — see
+    task_service.adjust_location_quantities() for how those are built.
+
+    **The request body is the raw list itself, not `{"...": [...]}`** —
+    the document is explicit that wrapping it in an object causes a
+    server-side `NullPointerException`.
+
+    **UNCONFIRMED**: the document only describes the `DCI::313`
+    stale-record error in prose ("MAWM reports that the inventory
+    record changed"), with no captured JSON error response body — so
+    the exact shape isn't confirmed the way most error handling in this
+    app is. This always hands back the parsed response body (never
+    raises except when genuinely unparseable, same non-raise-on-non-2xx
+    pattern as every other warning-capable call in this app) and lets
+    the caller inspect it — adjust_location_quantities() checks the
+    stringified body for `LOCATION_ADJUSTMENT_STALE_RECORD_CODE` as a
+    best-effort match pending a real capture of this error case.
+    """
+    token = normalize_token(token)
+    response = _post(
+        ADJUST_LOCATION_INVENTORY_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=inventory_lines,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]} if response.text else {}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
+        raise RuntimeError(
+            f"adjustInventory failed: {response.status_code} {response.text[:800]}"
+        )
+    body["_httpStatus"] = response.status_code
+    return body
 
 
 def refresh_ilpn_read_timestamp(container_id: str, token: str, org: str, location: str = None) -> None:

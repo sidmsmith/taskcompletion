@@ -606,56 +606,98 @@ left-aligned (`.action-toolbar`'s `justify-content: center` →
   reveal, re-enabled the moment a real reason was picked) before
   shipping.
 
-## Task-mode quantity correction: sequence reversed (2026-08-08, sixth session)
+## Task-mode quantity correction: sequence reversed, two-API branch (2026-08-08, sixth session)
 
-**Per explicit domain-expertise instruction — not yet independently
-captured via HAR/API test the way most findings in this app are, but
-trusted and designed around**: an LPN still allocated to an open task
-cannot be adjusted via Modify iLPN at all. It only works once the task
-releases the LPN, which for Putaway means *after* it's been put away,
-not before. This is why the allocated-LPN test kept failing/wasn't
-reachable — `adjust_ilpn_quantities()` was being called on an LPN the
-task still owned.
+**Per explicit domain-expertise instruction**: an LPN still allocated
+to an open task cannot be adjusted via Modify iLPN at all. It only
+works once the task releases the LPN, which for Putaway means *after*
+it's been put away, not before. This is why the allocated-LPN test kept
+failing/wasn't reachable — `adjust_ilpn_quantities()` was being called
+on an LPN the task still owned.
 
-**`complete_putaway_line()`'s sequence is now reversed**: complete the
+**`complete_putaway_line()`'s sequence is reversed**: complete the
 full, unmodified putaway first (`desired_qty` plays no part in that
-call), and only *after* it succeeds, correct the quantity via
-`adjust_ilpn_quantities()`. That function needed no changes itself —
-it already re-queries live inventory at call time, so the same call
-works whether the LPN is fresh or was just released by completing its
-task. If putaway fails or hits a warning, that's returned exactly as
-before (adjustment never runs). If putaway succeeds but the
-*adjustment* afterward fails, the response is `"success": True` (the
-putaway really happened, can't be hidden) plus a separate
-`"adjustmentSuccess": False` / `"adjustmentError"` pair —
-`public/app.js`'s `completeLine()`/`confirmAllLines()` surface that as
-its own distinct message ("completed, but the quantity correction
-failed") rather than either a misleading plain success or a misleading
-plain failure.
+call), and only *after* it succeeds, correct the quantity. If putaway
+fails or hits a warning, that's returned exactly as before (no
+adjustment ever runs). If putaway succeeds but the *adjustment*
+afterward fails, the response is `"success": True` (the putaway really
+happened, can't be hidden) plus a separate `"adjustmentSuccess": False`
+/ `"adjustmentError"` pair (and `"adjustmentTarget"`, `"lpn"` or
+`"location"` — see below) — `public/app.js`'s
+`completeLine()`/`confirmAllLines()` surface that as its own distinct
+message ("completed, but the quantity correction failed") rather than
+either a misleading plain success or failure.
 
-**Two destination-type paths, only one built**: this reversed sequence
-only makes sense for a destination that keeps LPN-level inventory after
-putaway — Reserve/Storage locations. That happens to be the *only*
-destination type this app's own `validate_storage_location()`
-(`LocationTypeId='STORAGE'`) allows through the To Location field at
-all, so every destination reachable through this app today is
-in-scope. **Explicitly out of scope, not yet built**: putting away to
-a Pick location, where MAWM is typically configured to *consume* the
-LPN into the location's own inventory record — no discrete LPN entity
-would be left afterward to run Modify iLPN against. That needs a
-different, not-yet-identified "adjust location inventory" API instead
-of `adjust_ilpn_quantities()`, being investigated separately. If this
-app ever grows Pick-location destinations, don't assume the Storage
-code path above applies — it was built and tested against Storage
-only.
+**Which of two APIs to use is decided automatically — CONFIRMED live,
+correcting an earlier wrong assumption**: `LocationTypeId='STORAGE'`
+(the only destination type `validate_storage_location()` allows) does
+**not** by itself mean the destination keeps LPN-level inventory — an
+earlier note here claimed "every destination reachable through this
+app today is in-scope" for Modify iLPN, which was wrong.
+`Location.InventoryReservationTypeId` ("LPN" vs "LOCATION") is a
+genuinely independent property from `LocationTypeId`; confirmed live
+that `A1AC0114`/`C1CS0110` are both `LocationTypeId='STORAGE'` but
+`InventoryReservationTypeId='LOCATION'` — putaway there consumes the
+LPN into the location's own inventory record, same as a Pick location
+would.
 
-**Not yet live-tested**: this reversed sequence's happy path (a real
-allocated LPN, put away, then successfully corrected) — every
-previously-used allocated task (`IBPWIBPT0929`, `IBPWIBPT0221`,
-`IBPWIBPT0109`) is currently either fully completed or blocked by the
-`FWTSK::019` assignment conflict (see "Known-good test Task Id"
-below), so none were available to test against at the time this was
-built. Needs a fresh allocated task to verify live.
+Rather than pre-checking the destination location's config, the app
+checks the *LPN itself* after putaway — confirmed live as a clean,
+reliable signal:
+
+| LPN | Destination `InventoryReservationTypeId` | Post-putaway `Ilpn.Status` |
+|---|---|---|
+| `LPN000000000315` → `A1AC0114` | `LOCATION` | **9000 ("Consumed")**, `CurrentLocationId` → `null` |
+| `LPN000000000010` → `R2R40105` | `LPN` | 3000 ("Not Allocated"), still a live container |
+| `LPN00076` → `R1R20701` | `LPN` | 3000 |
+| `0000099999000008672` → `R2R40105` | `LPN` | 3000 |
+
+`search_ilpn_current_location()`'s Template now also fetches `Status`
+(`mawm_api_library`'s `ilpn_dc_inventory_status` domain — `9000` =
+"Consumed", `3000` = "Not Allocated"; that library documents the status
+ladder but has no prose anywhere explaining `IsClosed`,
+`ConsumeOnLocate`, or PICK/STORAGE/RESERVE tracking behavior — this
+table is net-new, from live testing, not something already written
+down). `complete_putaway_line()` checks this right after putaway
+succeeds: `Status == ILPN_CONSUMED_STATUS` routes to
+`adjust_location_quantities()` (new — see below) against the actual
+destination used (`putaway_result["toLocationId"]`, correct whether
+default or Substitute-Location-overridden); otherwise
+`adjust_ilpn_quantities()` (unchanged) against the LPN, same as before.
+
+**`adjust_location_quantities()` / `mawm_client.adjust_location_inventory()`**
+— per `mawm_adjust_location_api.md`, a **third** distinct MAWM API in
+this app (`POST dcinventory/api/dcinventory/inventory/adjustInventory`,
+a raw JSON array body — an object wrapper causes a
+`NullPointerException`, confirmed in the document). Unlike Modify
+iLPN's `ScannedQuantity`, this endpoint's `Quantity` is a genuine
+signed **delta** (`New OnHand = Current + Quantity`) with no
+absolute-value shortcut, so the function computes
+`delta = desired − current` itself. **CONFIRMED live, both
+directions**, independently verified by re-query: `A1AC0114` item
+`3000223`, 50 → 51 (add) → 49 (subtract) → 50 (restored). Multiple
+inventory records for the same item at one location are **not**
+disambiguated (the document says to use distinguishing attributes from
+"the selected record," but this app has no concept of picking a
+specific record — takes the first match; not yet hit in testing).
+`DCI::313` (stale record) handling is best-effort/**UNCONFIRMED** — the
+document only describes it in prose, no captured error response body
+exists, so the retry trigger is a text-match on
+`LOCATION_ADJUSTMENT_STALE_RECORD_CODE` rather than a confirmed
+envelope shape.
+
+**Not yet live-tested**: the full *integrated* branch inside
+`complete_putaway_line()` (a real allocated LPN, put away to a
+consuming destination, auto-detected and routed to
+`adjust_location_quantities()`) — every previously-used allocated task
+(`IBPWIBPT0929`, `IBPWIBPT0221`, `IBPWIBPT0109`) is currently either
+fully completed or blocked by the `FWTSK::019` assignment conflict (see
+"Known-good test Task Id" below), so none were available. Both halves
+are independently confirmed (putaway completion generally, and
+`adjust_location_quantities()` standalone against real consumed
+inventory) — just not yet chained together end to end through a live
+task. Needs a fresh allocated task headed to a consuming destination
+(e.g. `A1AC0114`/`C1CS0110`) to close the loop.
 
 ## Known-good test Task Id
 
