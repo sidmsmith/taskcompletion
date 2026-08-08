@@ -6,13 +6,13 @@
     facility: "",
     task: null, // last loaded task payload from /api/load_task
     selectedLineNumber: null,
-    transactions: [], // [{transactionId, strategyId, description}]
-    selectedTransactionId: "",
-    selectedStrategyId: "",
-    defaultTransactionId: "",
   };
 
-  const TRANSACTION_STORAGE_KEY = "tc_transaction_id";
+  // Hardcoded for now — Putaway is the only task type wired to a real
+  // completion call. Revisit once Picking/Cycle Count/Replenishment are
+  // wired (each will likely need its own TransactionId, driven by
+  // taskType — see mawm_client.DEFAULT_TRANSACTION_BY_TASK_TYPE).
+  const TRANSACTION_ID = "Putaway";
 
   const el = {
     filtersScreen: document.getElementById("filtersScreen"),
@@ -32,8 +32,6 @@
     partialLineBtn: document.getElementById("partialLineBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
-    transactionIdSelect: document.getElementById("transactionIdSelect"),
-    transactionIdHint: document.getElementById("transactionIdHint"),
     actionStatus: document.getElementById("actionStatus"),
     partialLineInfo: document.getElementById("partialLineInfo"),
     partialQtyInput: document.getElementById("partialQtyInput"),
@@ -42,6 +40,9 @@
     partialLineConfirmBtn: document.getElementById("partialLineConfirmBtn"),
     allLinesList: document.getElementById("allLinesList"),
     allLinesConfirmBtn: document.getElementById("allLinesConfirmBtn"),
+    warningMessageId: document.getElementById("warningMessageId"),
+    warningMessageText: document.getElementById("warningMessageText"),
+    warningConfirmBtn: document.getElementById("warningConfirmBtn"),
     busyOverlay: document.getElementById("busyOverlay"),
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
@@ -190,71 +191,11 @@
       .join("");
   }
 
-  // --- Transaction ID ---
-
-  function populateTransactionSelect() {
-    const options = ['<option value="">-- Select --</option>'].concat(
-      state.transactions.map(
-        (t) => `<option value="${escapeAttr(t.transactionId)}">${escapeHtml(t.transactionId)}</option>`
-      )
-    );
-    el.transactionIdSelect.innerHTML = options.join("");
-  }
-
-  function evaluateTransactionSelection() {
-    const value = el.transactionIdSelect.value;
-    const match = state.transactions.find((t) => t.transactionId === value);
-    state.selectedTransactionId = match ? match.transactionId : "";
-    state.selectedStrategyId = match ? match.strategyId : "";
-    const valid = !!match;
-    el.transactionIdSelect.classList.toggle("invalid", !valid);
-    el.transactionIdHint.textContent = valid ? "" : "Required.";
-    if (valid) {
-      localStorage.setItem(TRANSACTION_STORAGE_KEY + ":" + (state.task ? state.task.taskType : ""), match.transactionId);
-    }
-    updateLineActionButtons();
-  }
-
-  async function preloadTransactions(taskType, taskTransactionId) {
-    try {
-      const data = await api("preload_task_transactions", {
-        org: state.org,
-        token: state.token,
-        location: state.facility,
-        taskType,
-        taskTransactionId,
-      });
-      if (data.success) {
-        state.transactions = data.entries || [];
-        state.defaultTransactionId = data.defaultTransactionId || "";
-      }
-    } catch (e) {
-      // Non-fatal here — evaluateTransactionSelection() will still correctly
-      // leave the field blank/required if nothing loaded.
-    }
-    populateTransactionSelect();
-    applyTransactionIdBoot(taskType);
-  }
-
-  function applyTransactionIdBoot(taskType) {
-    const known = new Set(state.transactions.map((t) => t.transactionId));
-    let value = "";
-    const saved = localStorage.getItem(TRANSACTION_STORAGE_KEY + ":" + taskType);
-    if (saved && known.has(saved)) {
-      value = saved;
-    } else if (known.has(state.defaultTransactionId)) {
-      value = state.defaultTransactionId;
-    }
-    el.transactionIdSelect.value = value;
-    evaluateTransactionSelection();
-  }
-
   function updateLineActionButtons() {
     const hasSelection = state.selectedLineNumber !== null;
-    const transactionOk = !!state.selectedTransactionId;
-    el.partialLineBtn.disabled = !hasSelection || !transactionOk;
-    el.fullLineBtn.disabled = !hasSelection || !transactionOk;
-    el.allLinesBtn.disabled = !transactionOk;
+    el.partialLineBtn.disabled = !hasSelection;
+    el.fullLineBtn.disabled = !hasSelection;
+    el.allLinesBtn.disabled = false;
   }
 
   function selectLine(lineNumber) {
@@ -297,7 +238,6 @@
       <span><strong>Status</strong> ${escapeHtml(data.taskStatus || "")}</span>
     `;
     el.resultsStatus.textContent = fmtCount(data.lineCount || 0, "line");
-    await preloadTransactions(data.taskType, data.taskTransactionId);
     return true;
   }
 
@@ -337,7 +277,7 @@
     return rem > 0 ? rem : 0;
   }
 
-  async function callCompleteLine(taskDetailId, mode, quantity) {
+  async function callCompleteLine(taskDetailId, mode, quantity, warningOverrides) {
     return api("complete_line", {
       org: state.org,
       token: state.token,
@@ -346,9 +286,58 @@
       taskDetailId,
       mode,
       quantity,
-      transactionId: state.selectedTransactionId || "",
-      strategyId: state.selectedStrategyId || "",
+      transactionId: TRANSACTION_ID,
+      warningOverrides: warningOverrides || undefined,
     });
+  }
+
+  /** Resolves true (Confirm) or false (Cancel / closed / backdrop). */
+  function showWarningModal(messageId, messageText) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      function finish(result) {
+        if (resolved) return;
+        resolved = true;
+        el.warningConfirmBtn.removeEventListener("click", onConfirm);
+        warningModalEl.removeEventListener("hidden.bs.modal", onHidden);
+        resolve(result);
+      }
+      function onConfirm() {
+        warningModal.hide();
+        finish(true);
+      }
+      function onHidden() {
+        finish(false);
+      }
+      el.warningMessageId.textContent = messageId || "";
+      el.warningMessageText.textContent = messageText || "";
+      el.warningConfirmBtn.addEventListener("click", onConfirm);
+      warningModalEl.addEventListener("hidden.bs.modal", onHidden);
+      warningModal.show();
+    });
+  }
+
+  /**
+   * Calls complete_line, and if the response comes back with a MAWM
+   * warning (`result.warning === true`), shows the Confirm/Cancel modal
+   * and — on Confirm — retries with that warning's code added to
+   * warningOverrides. Loops in case a second, different warning follows
+   * the first confirmation. Returns the final result (success or a plain
+   * failure), or `{ success: false, cancelled: true }` if the user
+   * cancels out of a warning.
+   */
+  async function completeLineWithWarningHandling(taskDetailId, mode, quantity) {
+    const overrides = {};
+    let result = await callCompleteLine(taskDetailId, mode, quantity, overrides);
+    while (result && result.warning) {
+      const confirmed = await showWarningModal(result.messageId, result.messageText);
+      if (!confirmed) {
+        return { success: false, cancelled: true, error: "Cancelled after warning." };
+      }
+      overrides[result.messageId] = result.messageId;
+      result = await callCompleteLine(taskDetailId, mode, quantity, overrides);
+    }
+    return result;
   }
 
   async function completeFullLine() {
@@ -361,9 +350,9 @@
     }
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
-      const result = await callCompleteLine(line.taskDetailId, "full");
+      const result = await completeLineWithWarningHandling(line.taskDetailId, "full");
       if (!result.success) {
-        setActionStatus(result.error || "Complete failed", "error");
+        if (!result.cancelled) setActionStatus(result.error || "Complete failed", "error");
         return;
       }
       setActionStatus(
@@ -459,14 +448,18 @@
     allLinesModal.hide();
     const total = allLinesPending.length;
     let succeeded = 0;
+    let cancelled = false;
     const failures = [];
     for (let i = 0; i < total; i++) {
       const line = allLinesPending[i];
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
-        const result = await callCompleteLine(line.taskDetailId, "full");
+        const result = await completeLineWithWarningHandling(line.taskDetailId, "full");
         if (result.success) {
           succeeded++;
+        } else if (result.cancelled) {
+          cancelled = true;
+          break;
         } else {
           failures.push("Line " + line.lineNumber + ": " + (result.error || "failed"));
         }
@@ -476,7 +469,9 @@
     }
     setBusy(false);
     await fetchAndRenderTask(state.task.taskId);
-    if (!failures.length) {
+    if (cancelled) {
+      setActionStatus("Completed " + fmtCount(succeeded, "line") + " before cancelling.", "");
+    } else if (!failures.length) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + ".", "success");
     } else {
       setActionStatus(
@@ -511,14 +506,14 @@
   const allLinesModal = window.bootstrap
     ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
     : null;
+  const warningModalEl = document.getElementById("warningModal");
+  const warningModal = window.bootstrap ? new window.bootstrap.Modal(warningModalEl) : null;
 
   el.fullLineBtn.addEventListener("click", completeFullLine);
   el.partialLineBtn.addEventListener("click", openPartialModal);
   el.partialLineConfirmBtn.addEventListener("click", confirmPartialLine);
   el.allLinesBtn.addEventListener("click", openAllLinesModal);
   el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
-
-  el.transactionIdSelect.addEventListener("change", evaluateTransactionSelection);
 
   if (window.InspectionThemes) {
     // Theme=N hides the picker; Theme=<key> (case-insensitive) pre-selects a theme.

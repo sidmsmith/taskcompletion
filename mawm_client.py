@@ -39,6 +39,7 @@ task):
 
 import os
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -63,6 +64,19 @@ TASK_COMPLETE_URL = f"{HOST}/task/api/task/task/completeTask"
 # themselves (confirmed: neither object has a Description/ItemDescription
 # field for the line's item).
 ITEM_SEARCH_URL = f"{HOST}/item-master/api/item-master/item/search"
+
+# Confirmed-by-user-provided-capture (Path C, "core task API alternative")
+# from mawm_putaway_api_call_set_with_warning_handling.md — a two-call
+# fetch-then-commit sequence keyed by TaskId, distinct from the DMM mobile
+# facade's stateful scan workflow (Path A in that same document, not used
+# here — it requires preserving a workflowVO context between calls the
+# way this app's stateless Flask backend doesn't). This is the real
+# completion mechanism for Putaway; see complete_putaway_line() in
+# task_service.py for the orchestration and warning handling built on
+# top of these two calls.
+PUTAWAY_FETCH_MOVE_URL_TEMPLATE = f"{HOST}/putaway/api/putaway/execution/task/{{task_id}}/fetchNextPutawayMoveAndStartLaborActivity"
+PUTAWAY_COMMIT_MOVE_URL = f"{HOST}/putaway/api/putaway/execution/transfer/commitAndFetchNextMove"
+PUTAWAY_EXECUTION_CRITERIA_ID = "Putaway Execution Criteria"
 
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
@@ -283,6 +297,122 @@ def search_items(
         return {}
     data = _response_data_list(response.json())
     return {str(item.get("ItemId")): item for item in data if item.get("ItemId")}
+
+
+def fetch_putaway_move(
+    task_id: str, transaction_id: str, token: str, org: str, location: str = None
+) -> dict:
+    """CONFIRMED-by-user-provided-capture — fetch the next putaway move for
+    a task and start labor activity (Path C, Call C1 in
+    mawm_putaway_api_call_set_with_warning_handling.md).
+
+    Returns whatever move is "next" for this TaskId, not a move scoped to
+    a specific TaskDetailId — task_service.complete_putaway_line() checks
+    the returned CurrentTaskDetailId against the line the user actually
+    selected before committing anything.
+    """
+    token = normalize_token(token)
+    url = PUTAWAY_FETCH_MOVE_URL_TEMPLATE.format(task_id=task_id)
+    payload = {
+        "StartTime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+        "TransactionId": transaction_id,
+        "PutawayExecutionCriteriaId": PUTAWAY_EXECUTION_CRITERIA_ID,
+        "IgnoreSourceLocationForTravel": False,
+        "HandleMultiContainerForChaining": False,
+        "GenerateChainingEnabledLaborMessage": False,
+    }
+    response = _post(url, headers=build_task_headers(token, org, location=location), json=payload)
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"fetchNextPutawayMoveAndStartLaborActivity failed: {response.status_code} {response.text[:800]}"
+        )
+    return body if isinstance(body, dict) else {"data": body}
+
+
+def commit_putaway_move(
+    sub_type: str,
+    inventory_move: dict,
+    token: str,
+    org: str,
+    location: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> dict:
+    """CONFIRMED-by-user-provided-capture — commit a fetched putaway move
+    (Path C, Call C2). `inventory_move` should already have its
+    CompletedQuantity set by the caller (full vs. partial completion is
+    decided by that value, per the document's worked example — the
+    fetched move itself doesn't set it).
+
+    `warning_overrides`, if given, is sent as a top-level `userInputs`
+    map ({code: code}) — UNCONFIRMED extension of the document's Path A
+    warning-override pattern to this core endpoint. The document is
+    explicit that Path C's warning contract hasn't been confirmed to
+    match Path A's DMM workflowVO shape; if a real warning response from
+    this endpoint doesn't look like what extract_warning() expects, or a
+    resubmitted `userInputs` doesn't actually clear the warning, this is
+    the one piece to correct next.
+    """
+    token = normalize_token(token)
+    payload = {"SubType": sub_type, "InventoryMove": inventory_move}
+    if warning_overrides:
+        payload["userInputs"] = warning_overrides
+    response = _post(
+        PUTAWAY_COMMIT_MOVE_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"commitAndFetchNextMove failed: {response.status_code} {response.text[:800]}"
+        )
+    if isinstance(body, dict):
+        body["_requestPayload"] = payload
+    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+
+
+def extract_warning(body) -> Optional[Dict[str, str]]:
+    """Best-effort scan for an overrideable WARNING in a MAWM response.
+
+    Checks two shapes: the standard MAWM `messages.Message[]` envelope
+    (seen on every confirmed search endpoint in this app), and the DMM
+    workflowVO `header.state.errorVOList` shape documented in
+    mawm_putaway_api_call_set_with_warning_handling.md's Path A example
+    (PTW::120). Which shape Path C's core commit endpoint actually uses
+    for a warning has not been confirmed either way — this defensively
+    checks both rather than assuming one.
+    """
+    if not isinstance(body, dict):
+        return None
+
+    for msg in ((body.get("messages") or {}).get("Message") or []):
+        if not isinstance(msg, dict):
+            continue
+        category = str(msg.get("Type") or msg.get("Category") or "").upper()
+        if category == "WARNING":
+            return {
+                "code": str(msg.get("Code") or msg.get("MessageKey") or ""),
+                "text": str(msg.get("Description") or msg.get("Message") or ""),
+            }
+
+    workflow_vo = body.get("workflowVO")
+    if isinstance(workflow_vo, dict):
+        state = ((workflow_vo.get("header") or {}).get("state") or {})
+        for err in state.get("errorVOList") or []:
+            if isinstance(err, dict) and str(err.get("errorCategory") or "").upper() == "WARNING":
+                return {
+                    "code": str(err.get("errorCode") or ""),
+                    "text": str(err.get("errorMessage") or ""),
+                }
+
+    return None
 
 
 def complete_task(

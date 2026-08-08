@@ -14,14 +14,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mawm_client import TASK_TYPES, get_manhattan_token, normalize_token, validate_org  # noqa: E402
-from task_service import complete_line, load_task, preload_task_transactions  # noqa: E402
+from task_service import (  # noqa: E402
+    complete_line,
+    complete_putaway_line,
+    load_task,
+    preload_task_transactions,
+)
 
 app = Flask(__name__)
 
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -208,22 +213,38 @@ def complete_line_route():
     quantity = data.get("quantity")
     transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
     strategy_id = (data.get("strategyId") or data.get("strategy_id") or "").strip()
+    warning_overrides = data.get("warningOverrides") or data.get("warning_overrides") or None
     if not task_id or not task_detail_id:
         return jsonify({"success": False, "error": "taskId and taskDetailId required"})
     if not transaction_id:
         return jsonify({"success": False, "error": "Transaction ID is required"})
     try:
-        result = complete_line(
-            token,
-            org,
-            task_id,
-            task_detail_id,
-            mode,
-            transaction_id,
-            strategy_id=strategy_id or None,
-            quantity=quantity,
-            location=location,
-        )
+        if mode == "full":
+            # Putaway's confirmed-by-capture full-completion path (see
+            # task_service.complete_putaway_line). Other task types aren't
+            # wired to this yet — this app currently only builds/tests
+            # Putaway, so "full" always routes here for now.
+            result = complete_putaway_line(
+                token,
+                org,
+                task_id,
+                task_detail_id,
+                transaction_id,
+                location=location,
+                warning_overrides=warning_overrides,
+            )
+        else:
+            result = complete_line(
+                token,
+                org,
+                task_id,
+                task_detail_id,
+                mode,
+                transaction_id,
+                strategy_id=strategy_id or None,
+                quantity=quantity,
+                location=location,
+            )
         forward_usage_event(
             {
                 "app_name": APP_NAME,

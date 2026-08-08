@@ -15,8 +15,12 @@ not yet confirmed one way or the other for Picking/Cycle Count/
 Replenishment), but the first-listed key in each call is the one
 observed live, not a guess.
 
-Only complete_line()'s underlying mawm_client.complete_task() call
-remains unconfirmed — see that function's docstring.
+complete_putaway_line() implements full-line Putaway completion via the
+confirmed-by-user-capture Path C sequence documented in
+mawm_putaway_api_call_set_with_warning_handling.md (fetch next move,
+then commit — see mawm_client.fetch_putaway_move()/commit_putaway_move()).
+complete_line()'s underlying mawm_client.complete_task() call remains a
+separate, still-unconfirmed placeholder for non-Putaway task types.
 """
 
 from __future__ import annotations
@@ -27,7 +31,10 @@ from typing import Any, Dict, List, Optional
 from mawm_client import (
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
     TASK_TYPE_LABELS,
+    commit_putaway_move,
     complete_task,
+    extract_warning,
+    fetch_putaway_move,
     resolve_location,
     search_items,
     search_task,
@@ -276,4 +283,95 @@ def complete_line(
         "uomId": line["uomId"],
         "mawmResponse": result,
         "error": None if ok else (result.get("message") or result.get("error") or "Complete failed"),
+    }
+
+
+def complete_putaway_line(
+    token: str,
+    org: str,
+    task_id: str,
+    task_detail_id: str,
+    transaction_id: str,
+    location: str = None,
+    warning_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Complete one Putaway task line in full, via the confirmed-by-capture
+    Path C sequence (mawm_putaway_api_call_set_with_warning_handling.md):
+    fetch the next move for the task, then commit it.
+
+    fetchNextPutawayMoveAndStartLaborActivity returns whatever move is
+    "next" for the TaskId, not one scoped to a specific TaskDetailId — so
+    this checks the fetched move's CurrentTaskDetailId against the line
+    the user actually selected and refuses to commit on a mismatch,
+    rather than silently completing the wrong line.
+
+    Full completion (vs. partial, not yet wired) is expressed by setting
+    the fetched InventoryMove's CompletedQuantity equal to its Quantity
+    before committing — the document's own worked example does exactly
+    this (CompletedQuantity: 240 alongside Quantity: 240), and the
+    fetched move itself doesn't set CompletedQuantity that way.
+
+    If either call surfaces an overrideable WARNING (see
+    mawm_client.extract_warning()) and the matching code isn't already
+    present in `warning_overrides`, this returns a `warning: True`
+    response instead of proceeding — the frontend shows a Cancel/Confirm
+    modal and, on Confirm, retries this same function with that code
+    added to `warning_overrides`.
+    """
+    if not transaction_id:
+        return {"success": False, "error": "Transaction ID is required"}
+
+    dest = resolve_location(org, location)
+    fetch_resp = fetch_putaway_move(task_id, transaction_id, token, org, location=dest)
+
+    warning = extract_warning(fetch_resp)
+    if warning and warning["code"] not in (warning_overrides or {}):
+        return {
+            "success": False,
+            "warning": True,
+            "messageId": warning["code"],
+            "messageText": warning["text"],
+            "stage": "fetch",
+        }
+
+    data = fetch_resp.get("data") if isinstance(fetch_resp, dict) else None
+    inventory_move = dict((data or {}).get("InventoryMove") or {})
+    sub_type = (data or {}).get("SubType") if isinstance(data, dict) else None
+    if not inventory_move or not sub_type:
+        return {"success": False, "error": "No putaway move returned for this task"}
+
+    fetched_detail_id = str(inventory_move.get("CurrentTaskDetailId") or "")
+    if fetched_detail_id and fetched_detail_id != str(task_detail_id):
+        return {
+            "success": False,
+            "error": (
+                f"Task Management returned a different line ({fetched_detail_id}) "
+                f"than the one selected ({task_detail_id}) — not completing it."
+            ),
+        }
+
+    # Full completion: CompletedQuantity == Quantity, per the document's
+    # own worked commit payload example.
+    inventory_move["CompletedQuantity"] = inventory_move.get("Quantity")
+
+    commit_resp = commit_putaway_move(
+        sub_type, inventory_move, token, org, location=dest, warning_overrides=warning_overrides
+    )
+    commit_warning = extract_warning(commit_resp)
+    if commit_warning and commit_warning["code"] not in (warning_overrides or {}):
+        return {
+            "success": False,
+            "warning": True,
+            "messageId": commit_warning["code"],
+            "messageText": commit_warning["text"],
+            "stage": "commit",
+        }
+
+    ok = commit_resp.get("success", True) if isinstance(commit_resp, dict) else True
+    return {
+        "success": bool(ok),
+        "taskDetailId": task_detail_id,
+        "quantity": _num(inventory_move.get("CompletedQuantity") or 0),
+        "mawmResponse": commit_resp,
+        "error": None if ok else (commit_resp.get("message") or "Complete failed"),
     }
