@@ -94,6 +94,22 @@ from a real captured request/response set the user supplied):
   DMM flow specifically — extending that same mechanism to the core
   commit endpoint is an extrapolation, flagged as such in the relevant
   docstrings.
+- **Bug fixed 2026-08-08**: `fetch_putaway_move()`/`commit_putaway_move()`/
+  `move_container_user_directed()` all raised a hard `RuntimeError` on
+  any non-2xx HTTP status *before* the caller ever got to run
+  `extract_warning()` on the body — and MAWM returns at least some
+  warnings over a non-2xx status (confirmed: `LPN00953`'s no-task
+  Substitute-Location test returned `DCI::120`, "Location permanently
+  dedicated to a different item," the same code the DMM document
+  captured, via the standard `messages.Message[]` envelope — but over a
+  non-200 status, so it was surfacing as a raw error instead of the
+  Confirm/Cancel modal). All three now always return the parsed body
+  and let the caller's existing warning/success check decide, instead
+  of raising early. Only a genuinely unparseable response still raises.
+  This confirms the core API *does* use the standard envelope for at
+  least one of the DMM-documented codes — evidence the extrapolation
+  above is on the right track, though only for the read side of that
+  flow; the override-and-actually-complete side is still unverified.
 
 **Revived 2026-08-08** — `mawm_client.move_container_user_directed()`
 (`POST putaway/api/putaway/execution/container/move`, from

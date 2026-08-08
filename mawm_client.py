@@ -505,11 +505,21 @@ def fetch_putaway_move(
         body = response.json()
     except Exception:
         body = {"raw": response.text[:1200]}
-    if response.status_code not in (200, 201):
+    # Bug fixed 2026-08-08: this used to raise immediately on any non-200
+    # status, before the caller ever got a chance to inspect the body for
+    # a WARNING (see extract_warning()) — MAWM appears to return at least
+    # some warnings with a non-2xx status too (confirmed for FWTSK::019,
+    # an ERROR, via HTTP 400), so a real warning here was being converted
+    # into a hard failure instead of surfacing the Confirm/Cancel modal.
+    # Now: always hand back the parsed body when we have one; only raise
+    # when there's truly nothing usable to return.
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
         raise RuntimeError(
             f"fetchNextPutawayMoveAndStartLaborActivity failed: {response.status_code} {response.text[:800]}"
         )
-    return body if isinstance(body, dict) else {"data": body}
+    return body
 
 
 def commit_putaway_move(
@@ -548,13 +558,16 @@ def commit_putaway_move(
         body = response.json()
     except Exception:
         body = {"raw": response.text[:1200]}
-    if response.status_code not in (200, 201):
+    # See fetch_putaway_move()'s comment — same fix, same reason: don't
+    # raise before the caller can check the body for a WARNING.
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
         raise RuntimeError(
             f"commitAndFetchNextMove failed: {response.status_code} {response.text[:800]}"
         )
-    if isinstance(body, dict):
-        body["_requestPayload"] = payload
-    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+    body["_requestPayload"] = payload
+    return body
 
 
 def move_container_user_directed(
@@ -604,13 +617,18 @@ def move_container_user_directed(
         body = response.json()
     except Exception:
         body = {"raw": response.text[:1200]}
-    if response.status_code not in (200, 201):
+    # See fetch_putaway_move()'s comment — same fix, same reason. This is
+    # the exact function LPN00953's Substitute-Location-with-no-open-task
+    # test hit: a real WARNING came back over a non-2xx status and was
+    # being raised as a hard error before extract_warning() ever saw it.
+    if not isinstance(body, dict):
+        body = {"data": body}
+    if response.status_code not in (200, 201) and "raw" in body and len(body) == 1:
         raise RuntimeError(
             f"user-directed putaway move failed: {response.status_code} {response.text[:800]}"
         )
-    if isinstance(body, dict):
-        body["_requestPayload"] = payload
-    return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+    body["_requestPayload"] = payload
+    return body
 
 
 def search_putaway_reason_codes(token: str, org: str, location: str = None) -> List[dict]:
