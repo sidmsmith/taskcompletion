@@ -1110,7 +1110,15 @@ def complete_putaway_line(
 
         dest = resolve_location(org, location)
         ilpn = search_ilpn_current_location(lpn_id, token, org, location=dest)
-        consumed = bool(ilpn) and str(ilpn.get("Status") or "") == ILPN_CONSUMED_STATUS
+        # No ILPN record at all means `lpn_id` was never a real container
+        # (e.g. a loose/location-direct putaway where the task's "LPN" is
+        # just the destination location id) — same as a consumed LPN,
+        # there is no LPN-level inventory to adjust, so this must route
+        # to the location. Confirmed live, 2026-08-08 (IBPWIBPT0052):
+        # treating "not found" as "not consumed" here sent this down the
+        # LPN branch, which crashed trying to refresh a read-timestamp on
+        # a container that doesn't exist.
+        route_to_location = ilpn is None or str(ilpn.get("Status") or "") == ILPN_CONSUMED_STATUS
 
         adjustment = [
             {
@@ -1119,7 +1127,7 @@ def complete_putaway_line(
                 "reasonCode": adjustment_reason_code,
             }
         ]
-        if consumed:
+        if route_to_location:
             final_location_id = str(putaway_result.get("toLocationId") or "").strip()
             if not final_location_id:
                 putaway_result["adjustmentSuccess"] = False
@@ -1128,12 +1136,20 @@ def complete_putaway_line(
                 )
                 return putaway_result
             putaway_result["adjustmentTarget"] = "location"
-            adjust_result = adjust_location_quantities(
-                final_location_id, adjustment, token, org, location=dest
-            )
+            try:
+                adjust_result = adjust_location_quantities(
+                    final_location_id, adjustment, token, org, location=dest
+                )
+            except Exception as exc:  # noqa: BLE001 - putaway already committed; must not crash the response
+                adjust_result = {"success": False, "error": str(exc)}
         else:
             putaway_result["adjustmentTarget"] = "lpn"
-            adjust_result = adjust_ilpn_quantities(lpn_id, adjustment, token, org, location=dest)
+            try:
+                adjust_result = adjust_ilpn_quantities(
+                    lpn_id, adjustment, token, org, location=dest
+                )
+            except Exception as exc:  # noqa: BLE001 - putaway already committed; must not crash the response
+                adjust_result = {"success": False, "error": str(exc)}
 
         putaway_result["adjustmentSuccess"] = bool(adjust_result.get("success"))
         if not adjust_result.get("success"):

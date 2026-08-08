@@ -771,6 +771,37 @@ independently adjustable) or still live. `IBPWIBPT0105`/`LPN00760` and
 `IBPWIBPT0110`/`LPN00764` are both already used up, so this needs a
 *different* fresh task.
 
+**Third test (`IBPWIBPT0052`) found a real bug, not bad data** — this
+task was structurally different from the first two: `taskTransactionId:
+"Storage Putaway"` (not `"Putaway"`), `lpnId` equal to `toLocationId`
+itself (`A1AC0212`), `ilpnStatus` blank, `uomId: "Units"` not `"LPN"`.
+`search_ilpn_current_location('A1AC0212', ...)` returned `null` — there
+was never a real ILPN container for this line at all; it's a loose/
+location-direct putaway. The routing logic's `consumed` check
+(`bool(ilpn) and Status == "9000"`) treated "no record found" the same
+as "not consumed," so it wrongly went down the LPN-adjustment branch —
+which then threw an **uncaught `RuntimeError`** trying to refresh a
+read-timestamp on a container that doesn't exist (MAWM returned a raw
+500, "Could not commit JPA transaction"). The putaway itself had
+already committed by that point (task went to `Completed`,
+`completedQuantity: 10`) — only the follow-up adjustment crashed, and
+it crashed the whole call instead of degrading gracefully.
+
+Fixed in `complete_putaway_line()`: `ilpn is None` now routes to the
+location branch (renamed `consumed` → `route_to_location`), on the
+reasoning that no ILPN record at all means there's no LPN-level
+inventory to adjust — same effective situation as a consumed LPN, just
+arrived at differently. Also wrapped both adjustment calls in
+`try/except` so a crash there degrades to `adjustmentSuccess: False` +
+`adjustmentError` instead of taking down the whole response, since the
+putaway has already committed by that point regardless. **Not yet
+re-verified live** — `A1AC0212`'s inventory is already muddled by this
+test (two existing rows, 40.0/20.0, now including this task's
+uncorrected 10 units merged in somewhere) and the task itself is
+already `Completed`, so a clean re-test needs a fresh task, which lines
+up with the user's own plan to create new manual putaway tasks after a
+data refresh rather than keep testing against old data.
+
 ## LPN status badge, consumed-location display (2026-08-08, seventh session)
 
 - **`mawm_client.ILPN_STATUS_LABELS`/`ilpn_status_description()`** — the
