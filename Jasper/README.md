@@ -22,11 +22,14 @@ rediscover all of this from scratch.
   `net.sf.jasperreports.json.data.JsonDataSource` (JasperReports 7.x's
   package location).
 - **`cyclecountsheet.jrxml`** — the **WMS deployment** copy. Same report,
-  translated to classic JRXML syntax for the WMS's older engine, using
-  `net.sf.jasperreports.engine.data.JsonDataSource` (the pre-7.x package
-  location). **Never open/save this one in Jaspersoft Studio** — Studio
-  will silently rewrite it back into the newer format and break it again.
-  It carries an inline XML comment at the top saying the same thing.
+  translated to classic JRXML syntax for the WMS's older engine
+  (confirmed to be **JasperReports 6.4.0**, per MAWM's own supported-Jasper
+  guidance), using `language="jsonql"` and
+  `net.sf.jasperreports.engine.data.JsonQLDataSource` — see "JsonQL vs
+  plain JSON" below. **Never open/save this one in Jaspersoft Studio** —
+  Studio will silently rewrite it back into the newer format and break it
+  again. It carries an inline XML comment at the top saying the same
+  thing.
 - **`location_inventory_sample.json`** — sample payload used by Studio's
   "Location Inventory JSON" data adapter for Preview. Root shape:
   `{ "Locations": [ { LocationId, DisplayLocation, LocationBarcode,
@@ -38,9 +41,10 @@ rediscover all of this from scratch.
 ## The core problem: two JasperReports versions, two file formats
 
 Jaspersoft Studio installed on this machine bundles **JasperReports
-7.0.6**. The WMS runs a **noticeably older** JasperReports engine (exact
-version unknown, but old enough to predate several 7.0 changes — see
-evidence below). These two engines disagree on:
+7.0.6**. The WMS runs **JasperReports 6.4.0** (confirmed via MAWM's own
+supported-Jasper documentation — see "JsonQL vs plain JSON" below for how
+this was pinned down after initially just knowing it was "older"). These
+two engines disagree on:
 
 1. **JRXML syntax itself.** Studio 7.0.6 introduced a newer "compact"
    JRXML format (`<element kind="textField" ...>`, bare `<expression>`
@@ -50,13 +54,18 @@ evidence below). These two engines disagree on:
    older "classic" format (`<textField><reportElement/><textElement/>
    <textFieldExpression/></textField>`, namespaced root element). The
    WMS's older engine only understands the classic format.
-2. **Where `JsonDataSource` lives.** JasperReports relocated JSON data
-   source support from `net.sf.jasperreports.engine.data.JsonDataSource`
-   to `net.sf.jasperreports.json.data.JsonDataSource` as part of the 7.0
-   modularization. Studio 7.0.6 only has the new location; the WMS's
-   engine only has the old one. **This is why the two `.jrxml` files
-   must permanently differ on that one line** — there is no single class
-   reference that satisfies both engines at once.
+2. **Where `JsonDataSource` lives, and which data-source class MAWM
+   actually wants.** JasperReports relocated JSON data source support
+   from `net.sf.jasperreports.engine.data.JsonDataSource` to
+   `net.sf.jasperreports.json.data.JsonDataSource` as part of the 7.0
+   modularization — Studio 7.0.6 only has the new location. But MAWM's
+   own supported-Jasper guidance additionally specifies that JasperReports
+   6.4.0 should use **`JsonQLDataSource`** (`language="jsonql"`), not the
+   plain `JsonDataSource` (`language="json"`), for list/subreport data —
+   see "JsonQL vs plain JSON" below. **This is why the two `.jrxml` files
+   must permanently differ on both the query language and the
+   data-source class** — there is no single combination that satisfies
+   both engines at once.
 
 Evidence the WMS is on an older version (in case this ever needs
 re-confirming, or matters for a future report): its schema validator
@@ -64,7 +73,61 @@ rejects a `uuid` attribute on the root `<jasperReport>` element (a
 Studio-only convenience attribute, safe to just omit) and enforces
 `isBold`/`isForPrompting`-style naming rather than the newer
 `bold`/`forPrompting` shorthand — both consistent with a schema that
-predates several 7.x-era conventions.
+predates several 7.x-era conventions. (This was later confirmed precisely
+as JasperReports 6.4.0 via MAWM's own documentation, rather than left as
+"some older version.")
+
+## JsonQL vs plain JSON (`cyclecountsheet.jrxml` only)
+
+MAWM's supported-Jasper guidance for 6.4.0 says list/subreport data
+should use **JsonQL**, not the plain JSON data adapter this report
+originally used. Two-line change:
+
+- `<queryString language="json">` → `<queryString language="jsonql">`
+- `((net.sf.jasperreports.engine.data.JsonDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")`
+  → `((net.sf.jasperreports.engine.data.JsonQLDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")`
+
+**Update — the two-line change alone was not enough.** The report
+uploaded and printed successfully (proving the JRXML structure and the
+`JsonQLDataSource` class reference were both fine), but every field came
+back **blank** — not garbled or duplicated, just empty. The `.*` question
+above was never actually the cause; the real cause was that
+**`JsonQLDataSource` does not auto-map field names to same-named JSON
+keys the way the plain `JsonDataSource` does.** Every `<field>` needs an
+explicit property naming the JSON key it should read, even when the
+field name and the key are identical:
+
+```xml
+<field name="LocationId" class="java.lang.String">
+    <property name="net.sf.jasperreports.jsonql.field.expression" value="LocationId"/>
+</field>
+```
+
+**Get this exact property name right — `jsonql`, not `json`.** Glean's
+first pass at this fix used `net.sf.jasperreports.json.field.expression`
+(no "ql"). That property name is real, but it belongs to the *plain*
+`JsonDataSource`, not `JsonQLDataSource` — confirmed directly from
+JasperReports' own source (`JsonQLDataSource.java`:
+`PROPERTY_FIELD_EXPRESSION = JRPropertiesUtil.PROPERTY_PREFIX +
+"jsonql.field.expression"`, i.e. `net.sf.jasperreports.jsonql.field.expression`).
+Since this file uses `JsonQLDataSource` throughout, every field mapping
+must use the `jsonql` variant. The `<property>` element goes as the
+*first* child inside `<field>`, before any `<propertyExpression>`/
+`<fieldDescription>` (confirmed against JasperReports' own bundled
+classic `jasperreport.xsd`).
+
+The `.*`-suffix question from the original research (whether `Locations`
+needs to become `Locations.*` to iterate array elements as separate
+records) was never actually confirmed as the cause of the blank-data
+symptom — the field-mapping properties above are the diagnosed fix, and
+have not yet been re-tested against the WMS as of this writing. If a
+future upload with these field mappings in place *still* comes back
+blank or shows only one row, the `.*` suffix is the next thing to try.
+
+Since Studio 7.0.6 doesn't have `JsonQLDataSource` at all (JsonQL support
+was restructured again in the 7.x line), none of this can be verified
+locally — the WMS upload is the only ground truth, same as everything
+else in this document.
 
 ## Classic JRXML syntax notes (for the WMS-bound file)
 
@@ -139,15 +202,23 @@ WMS's own validator error messages:
   whatever `Locations[]` the JSON payload contains.
 - The QR code is built by accumulating a report `<variable>`
   (`resetType="Report"`, `calculation="Nothing"`) across every detail
-  record, then only rendering it in a **Summary/Title band** — the one
-  place that sees the fully-accumulated value. A `<title>` band prints
-  before any records are processed and a `<summary>` band after all of
-  them, so which one you use determines whether you need the
-  accumulator to already be complete — in this report the QR moved to
-  the **Title** band per a later request, which works because
-  JasperReports evaluates the variable across the *whole* fill and the
-  title/summary text field just reads its final value at render time
-  regardless of which band displays it.
+  record, then rendering it in the **Summary band only — never the
+  Title band.** (An earlier version of this note claimed the title band
+  would work too, reasoning that JasperReports evaluates a variable
+  "across the whole fill" regardless of which band displays it — **that
+  was wrong**, confirmed both by an actual blank-QR symptom on a real
+  WMS run and independently by Glean's diagnosis of the same file. A
+  `<title>` band is filled and printed *before* any detail records are
+  processed at all, so a variable referenced there only ever sees its
+  initial value — it is not retroactively updated once later bands fill
+  it in. Only a `<summary>` band, which prints after every detail record
+  has run, actually sees the fully-accumulated value. If a design
+  request ever asks to move the QR back to the title/header area for
+  layout reasons, that's a real tension with no clean answer — either
+  keep it in the summary band and accept it printing at the end, or
+  find a different way to pre-compute all location IDs before the
+  report starts filling (e.g. a two-pass query) rather than
+  accumulating them during the fill.
 
 ## Runtime library dependencies (separate from the JRXML file itself)
 
@@ -207,10 +278,21 @@ Jaspersoft Studio's classes reachable. Outside Studio, it always returns
    handing it back — safer than editing blind).
 2. Confirm it looks right in Studio's Preview.
 3. Port the same logical change into `cyclecountsheet.jrxml` by hand (or
-   ask Claude to), remembering: classic syntax, and the
-   `net.sf.jasperreports.engine.data.JsonDataSource` package on that one
-   line stays as the pre-7.0 path — don't copy Studio's version of that
-   line over.
+   ask Claude to), remembering: classic syntax, and the query
+   language/data-source line stays `language="jsonql"` +
+   `net.sf.jasperreports.engine.data.JsonQLDataSource` — don't copy
+   Studio's `language="json"` + `json.data.JsonDataSource` line over.
+   **Any new `<field>` needs its own
+   `<property name="net.sf.jasperreports.jsonql.field.expression"
+   value="TheJsonKeyName"/>`** — `JsonQLDataSource` won't auto-map a
+   field to a same-named JSON key the way Studio's plain `JsonDataSource`
+   does, so a field added on the Studio side without this property will
+   silently come back blank on the WMS side, exactly like the original
+   bug this section documents. If you add a *new* subreport/list table
+   (not just editing this one), its `dataSourceExpression`/
+   `subDataSource()` call needs the same JsonQL treatment — see "JsonQL
+   vs plain JSON" above, including the
+   unresolved `.*` question.
 4. Re-upload `cyclecountsheet.jrxml` to the WMS and treat whatever error
    (if any) comes back as authoritative — that engine's exact version
    and available modules aren't fully known, so each new upload attempt

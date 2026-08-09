@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- WMS DEPLOYMENT COPY - do not sync this file's JsonDataSource cast from location_inventory_report.jrxml.
-     The WMS runs a pre-7.0 JasperReports engine (net.sf.jasperreports.engine.data.JsonDataSource),
-     while Jaspersoft Studio here bundles 7.0.6 (net.sf.jasperreports.json.data.JsonDataSource) -
-     these two files must intentionally differ on that one line. -->
+<!-- WMS DEPLOYMENT COPY - do not sync this file's data-source query language/class from
+     location_inventory_report.jrxml. MAWM's supported Jasper version is 6.4.0, which uses
+     JsonQLDataSource (language="jsonql") rather than JsonDataSource (language="json") for
+     list/subreport data - Jaspersoft Studio here bundles 7.0.6 and previews with plain JSON
+     (net.sf.jasperreports.json.data.JsonDataSource, language="json"). These two files must
+     intentionally differ on the queryString language and the subDataSource() cast. See
+     README.md's "JsonQL vs plain JSON" section before changing either. -->
 <jasperReport xmlns="http://jasperreports.sourceforge.net/jasperreports"
               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
               xmlns:jr="http://jasperreports.sourceforge.net/jasperreports/components"
@@ -27,20 +30,32 @@
     <style name="Detail" fontName="SansSerif" fontSize="9"/>
 
     <subDataset name="ItemDataset" uuid="d7b4f02f-4b0e-45f4-9b26-0c36aa6ef8cb">
-        <field name="ItemId" class="java.lang.String"/>
-        <field name="ItemDescription" class="java.lang.String"/>
-        <field name="OnHandQty" class="java.lang.Double"/>
-        <field name="OnHandDisplay" class="java.lang.String"/>
+        <field name="ItemId" class="java.lang.String">
+            <property name="net.sf.jasperreports.jsonql.field.expression" value="ItemId"/>
+        </field>
+        <field name="ItemDescription" class="java.lang.String">
+            <property name="net.sf.jasperreports.jsonql.field.expression" value="ItemDescription"/>
+        </field>
+        <field name="OnHandQty" class="java.lang.Double">
+            <property name="net.sf.jasperreports.jsonql.field.expression" value="OnHandQty"/>
+        </field>
+        <field name="OnHandDisplay" class="java.lang.String">
+            <property name="net.sf.jasperreports.jsonql.field.expression" value="OnHandDisplay"/>
+        </field>
     </subDataset>
 
     <parameter name="REPORT_TITLE" class="java.lang.String" isForPrompting="false">
         <defaultValueExpression><![CDATA["Cycle Count Sheet"]]></defaultValueExpression>
     </parameter>
 
-    <queryString language="json"><![CDATA[Locations]]></queryString>
+    <queryString language="jsonql"><![CDATA[Locations]]></queryString>
 
-    <field name="LocationId" class="java.lang.String"/>
-    <field name="DisplayLocation" class="java.lang.String"/>
+    <field name="LocationId" class="java.lang.String">
+        <property name="net.sf.jasperreports.jsonql.field.expression" value="LocationId"/>
+    </field>
+    <field name="DisplayLocation" class="java.lang.String">
+        <property name="net.sf.jasperreports.jsonql.field.expression" value="DisplayLocation"/>
+    </field>
 
     <variable name="AllLocationsCsv" class="java.lang.String" resetType="Report" calculation="Nothing">
         <variableExpression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></variableExpression>
@@ -48,7 +63,7 @@
     </variable>
 
     <title>
-        <band height="96" splitType="Stretch">
+        <band height="42" splitType="Stretch">
             <textField>
                 <reportElement x="0" y="0" width="540" height="24" uuid="a4c09dc2-55da-49bd-82b6-4e46b6bfbf0a"/>
                 <textElement textAlignment="Center" verticalAlignment="Middle">
@@ -63,12 +78,6 @@
                 </textElement>
                 <text><![CDATA[Generated from the Location Inventory JSON payload]]></text>
             </staticText>
-            <componentElement>
-                <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
-                <jr:QRCode>
-                    <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
-                </jr:QRCode>
-            </componentElement>
         </band>
     </title>
 
@@ -87,7 +96,7 @@
                 <jr:table>
                     <datasetRun subDataset="ItemDataset" uuid="15db0c7b-d128-4a56-9e1a-5d6dc78603f2">
                         <dataSourceExpression><![CDATA[
-                            ((net.sf.jasperreports.engine.data.JsonDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")
+                            ((net.sf.jasperreports.engine.data.JsonQLDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")
                         ]]></dataSourceExpression>
                     </datasetRun>
                     <jr:column width="105" uuid="11a38b91-81dd-47f3-9195-0b3a24aa3db6">
@@ -182,6 +191,13 @@
     </pageFooter>
 
     <summary>
-        <band height="160"/>
+        <band height="98">
+            <componentElement>
+                <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
+                <jr:QRCode>
+                    <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
+                </jr:QRCode>
+            </componentElement>
+        </band>
     </summary>
 </jasperReport>
