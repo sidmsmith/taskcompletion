@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Task Check In v0.10.3</title>
+  <title>Task Check In v0.10.4</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet" />
   <style>
@@ -181,6 +181,19 @@
     table.lines-table .col-qty-wide { width: 8rem; text-align: right; }
     table.lines-table .col-uom { width: 3.5rem; text-align: left; color: var(--text-secondary); }
     table.lines-table .col-reason { width: 9rem; }
+    /* Cycle Count's own Description/Status columns (2026-08-08, per
+       explicit instruction) — Description doesn't need as much room as
+       putaway's, freeing width for a wider Status column showing 3
+       stacked lines (status / before→after / variance). Truncates with
+       an ellipsis instead of wrapping/overflowing when a real
+       description is long enough to exceed it. */
+    table.lines-table .col-desc-narrow {
+      max-width: 12rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    table.lines-table .col-cc-result { width: 16rem; }
     /* Task/Container column only makes sense once a search can span more
        than one task/container (multi-LPN search, 2026-08-08) — hidden
        for the common single-group case, shown via the "multi-group"
@@ -382,6 +395,11 @@
       font-size: 0.8em;
       margin-left: 0.3em;
     }
+    /* Three stacked lines — status / before→after / variance
+       (2026-08-08, per explicit instruction) — inside the widened
+       .col-cc-result cell. */
+    .cc-result-line { line-height: 1.35; }
+    .cc-result-status { font-weight: 600; }
     /* Matches the two-arrow "cycle count pending" icon shown in the
        real WM UI next to a locked location (2026-08-08, per explicit
        instruction) — see cycleCountLockIconHtml() in app.js. */
@@ -480,11 +498,9 @@
               <th class="col-line">Line</th>
               <th class="col-loc">Location</th>
               <th class="col-item">Item</th>
-              <th>Description</th>
+              <th class="col-desc-narrow">Description</th>
               <th class="col-qty-wide">Qty</th>
-              <th class="col-qty-wide">Previous Qty</th>
-              <th class="col-qty-wide">Variance</th>
-              <th class="col-reason">Status</th>
+              <th class="col-cc-result">Status</th>
             </tr>
           </thead>
           <tbody id="cycleCountLinesBody"></tbody>

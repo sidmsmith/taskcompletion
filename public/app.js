@@ -923,7 +923,7 @@
               autocomplete="off"
             />
           </td>
-          <td>${escapeHtml(line.description)}</td>
+          <td><div class="col-desc-narrow" title="${escapeAttr(line.description)}">${escapeHtml(line.description)}</div></td>
           <td class="col-qty-wide">
             <input
               type="number"
@@ -933,9 +933,7 @@
               step="any"
             />
           </td>
-          <td class="col-qty-wide cc-previous-qty" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
-          <td class="col-qty-wide cc-variance" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
-          <td class="col-reason cc-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
+          <td class="col-cc-result cc-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
         </tr>`;
   }
 
@@ -960,7 +958,7 @@
         <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}">
           <td>${escapeHtml(lines[0].lineNumber)}</td>
           <td>${escapeHtml(group.locationId) + cycleCountLockIconHtml(groupKey, group.locationLocked)}</td>
-          <td colspan="6">
+          <td colspan="4">
             <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(groupKey)}">
               <i class="fas fa-caret-right"></i> MIXED (${lines.length} items)
             </button>
@@ -1104,42 +1102,27 @@
   }
 
   /**
-   * "10 ($50)" — the dollar variance in smaller grey text to the right
-   * of the quantity variance (2026-08-08, per explicit instruction),
-   * rounded to whole dollars, accounting-style parens for negative (no
-   * explicit minus sign inside — matches the requested example
-   * literally) rather than a plain "-$50".
+   * "($50)" — the dollar variance in smaller grey text to the right of
+   * the quantity variance (2026-08-08, per explicit instruction).
+   * Always parenthesized regardless of sign (2026-08-08, revised per
+   * explicit instruction — not just accounting-style parens-for-
+   * negative anymore), rounded to whole dollars.
    */
   function formatVarianceValueHtml(varianceValue) {
     if (varianceValue == null) return "";
     const rounded = Math.round(Math.abs(Number(varianceValue)));
-    const text = Number(varianceValue) < 0 ? "($" + rounded + ")" : "$" + rounded;
-    return ' <span class="cc-variance-value">' + text + "</span>";
+    return ' <span class="cc-variance-value">($' + rounded + ")</span>";
   }
 
   /**
-   * Fills in the Previous Qty / Variance columns alongside the Status
-   * cell (2026-08-08, per explicit instruction — "show the previous/
-   * counted qty and the variances from the count details so the user
-   * can see the full result") and the location lock icon, from either
-   * completeCycleCountLine()'s or check_cycle_count_status()'s
-   * identically-shaped result. The two endpoints name the lock flag
-   * differently (`locationLocked` for a live status check vs.
-   * `locationLockedAfter` for a fresh completion) — normalized here.
+   * Applies the location lock icon and the Status cell (2026-08-08,
+   * per explicit instruction) from either completeCycleCountLine()'s
+   * or check_cycle_count_status()'s identically-shaped result. The two
+   * endpoints name the lock flag differently (`locationLocked` for a
+   * live status check vs. `locationLockedAfter` for a fresh
+   * completion) — normalized here.
    */
   function applyCycleCountResultToRow(taskDetailId, result) {
-    const prevCell = el.cycleCountLinesBody.querySelector(
-      '.cc-previous-qty[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
-    );
-    const varCell = el.cycleCountLinesBody.querySelector(
-      '.cc-variance[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
-    );
-    if (prevCell) prevCell.textContent = result.previousQty != null ? result.previousQty : "";
-    if (varCell) {
-      varCell.innerHTML =
-        (result.varianceQty != null ? escapeHtml(result.varianceQty) : "") +
-        formatVarianceValueHtml(result.varianceValue);
-    }
     const locked = result.locationLocked !== undefined ? result.locationLocked : result.locationLockedAfter;
     if (locked !== undefined) setCycleCountLockIcon(taskDetailId, locked);
     setCycleCountResultCell(taskDetailId, cycleCountResultText(result), cycleCountResultKind(result), result.success);
@@ -1228,32 +1211,39 @@
    * done) since it's plausible the count itself should be re-entered,
    * not just resubmitted as-is.
    *
-   * **Cleaned up 2026-08-08, per explicit instruction** — was a long
-   * prose sentence ("Pending supervisor booking (out of tolerance):
-   * was 20, counted 10 (variance -10). Location locked — not yet
-   * applied."); now a terse "Pending Booking 20 → ~~10~~ (variance
-   * -10)" with the not-yet-applied counted qty struck through (per
-   * explicit instruction — arrow kept from the Booked case for visual
-   * consistency, strikethrough on the counted side signals "attempted,
-   * not applied" without the previous, still-current value getting
-   * struck). Returns HTML (see setCycleCountResultCell()'s innerHTML
-   * usage) — free-text portions (MAWM's own error/failure-reason
-   * strings) are escaped, but the numeric qty/variance fields aren't
-   * (they're never user-typed free text, always straight from the
+   * **Three stacked lines, 2026-08-08, per explicit instruction** —
+   * status / before→after / variance, replacing the old single-line
+   * message plus two separate Previous Qty/Variance columns (folded
+   * into this wider column instead). The not-yet-applied counted qty
+   * is struck through for any non-`success` status that still carries
+   * real qty data (in-flight statuses like "Count Initiated" included,
+   * not just "Pending Booking" specifically — none of them have
+   * actually applied yet). Returns HTML (see setCycleCountResultCell()'s
+   * innerHTML usage) — free-text portions (MAWM's own error/failure-
+   * reason strings) are escaped, but the numeric qty/variance fields
+   * aren't (never user-typed free text, always straight from the
    * count-result API response).
    */
   function cycleCountResultText(result) {
-    if (result.status === "Pending Booking") {
-      return (
-        "Pending Booking " + result.previousQty + " → <s>" + result.countedQty + "</s> (variance " +
-        result.varianceQty + ")"
+    if (!result.status) {
+      return '<div class="cc-result-line">' + escapeHtml(result.bookingFailureReason || result.error || "Failed") + "</div>";
+    }
+    const lines = ['<div class="cc-result-line cc-result-status">' + escapeHtml(result.status) + "</div>"];
+    if (result.previousQty != null && result.countedQty != null) {
+      const countedHtml = result.success
+        ? escapeHtml(result.countedQty)
+        : "<s>" + escapeHtml(result.countedQty) + "</s>";
+      lines.push('<div class="cc-result-line">' + escapeHtml(result.previousQty) + " → " + countedHtml + "</div>");
+    }
+    if (result.varianceQty != null) {
+      lines.push(
+        '<div class="cc-result-line cc-result-variance">' +
+          escapeHtml(result.varianceQty) +
+          formatVarianceValueHtml(result.varianceValue) +
+          "</div>"
       );
     }
-    if (result.success) {
-      const varied = Number(result.varianceQty) ? " (variance " + result.varianceQty + ")" : "";
-      return "Booked: " + result.previousQty + " → " + result.countedQty + varied;
-    }
-    return escapeHtml(result.bookingFailureReason || result.error || "Failed");
+    return lines.join("");
   }
 
   function cycleCountResultKind(result) {

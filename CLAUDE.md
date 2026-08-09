@@ -1214,6 +1214,38 @@ the real WM UI)**:
   Booking 574 → ~~200~~ (variance -374)" in red, and "-374 ($1870)" in
   the Variance column.
 
+**Consolidated into 3 stacked lines + always-parens variance
+(2026-08-08, same session, per explicit follow-up instruction)**:
+
+- The separate Previous Qty and Variance *columns* are gone — folded
+  into the Status column (`.col-cc-result`, widened to `16rem`) as
+  three stacked `<div class="cc-result-line">` rows: status label /
+  `before → after` (counted struck through unless `success`) /
+  `variance (variance-value)`. Applies uniformly to every real status
+  MAWM returns, not just "Booked"/"Pending Booking" — confirmed live:
+  an in-flight "Count Initiated" result already showed all three lines
+  ("Booked" / "20 → 15" / "-5 ($0)" once resolved).
+  `setCycleCountResultCell()` switched to `innerHTML` for this (see
+  above); `cycleCountResultText()` builds the three divs directly.
+- `formatVarianceValueHtml()` now **always** parenthesizes the dollar
+  value regardless of sign (2026-08-08, revised again per explicit
+  instruction — the first cut only did accounting-style parens for
+  negative) — confirmed live showing `($0)` for a zero-value variance,
+  not a bare `$0`.
+- Description column narrowed (`.col-desc-narrow`, `max-width: 12rem`)
+  to give the wider Status column room; overflowing text truncates
+  with an ellipsis and the full text is still available via a `title`
+  tooltip. **Real CSS gotcha found and fixed while verifying this
+  live**: `max-width`/`overflow`/`text-overflow` applied directly to
+  the `<td>` silently does nothing in a normal (auto-layout) HTML
+  table — confirmed via direct DOM measurement
+  (`scrollWidth === clientWidth`, i.e. no truncation happening at all)
+  before the fix. Wrapping the text in an inner `<div>` and applying
+  the truncation styles to *that* div instead fixed it (confirmed via
+  the same measurement after the fix, `scrollWidth 497 > clientWidth
+  192`, using a synthetic M&M-candy-length description since no real
+  item in this demo org has one long enough to trigger it naturally).
+
 **Open, unexplained, and deliberately not chased further**:
 `A1AC0124` (an item location with 24+ pre-existing `inventoryCountRun`
 rows already on it — clearly reused/heavily-seeded demo data, not a
