@@ -80,6 +80,7 @@ from mawm_client import (
     resolve_location,
     search_all_storage_locations,
     search_container_inventory,
+    search_ilpn_activity_history,
     search_ilpn_current_location,
     search_ilpn_statuses,
     search_inventory_count_results,
@@ -202,6 +203,104 @@ def _ilpn_display_fields(ilpn: Optional[dict]) -> Dict[str, Any]:
         "ilpnStatus": status,
         "ilpnStatusLabel": ilpn_status_description(status),
         "displayLocationId": display_location,
+    }
+
+
+def select_terminal_ilpn_activity(records: List[dict]) -> Optional[dict]:
+    """CONFIRMED-by-user-capture (mawm_lpn_history_api_and_selection_logic.md,
+    2026-08-09) — turns search_ilpn_activity_history()'s raw, unfiltered
+    event list into the single record that best represents "what item,
+    how much, and where did it end up" for a consumed LPN.
+
+    1. Group rows representing the same business event — confirmed live
+       that a single Modify iLPN adjustment can be split across two
+       published rows sharing `TraceId` + `ActivityDateTime` +
+       `TransactionTypeId` + `TransactionId`, each carrying different
+       fields (one had `SourceLocationId`, the other the resulting
+       `Quantity`) — merged here so no field gets lost to whichever row
+       happened to be picked.
+    2. Prefer an event whose transaction explicitly represents
+       consumption, if one exists — **not confirmed to actually occur**;
+       the source document's own example never had one (its terminal
+       record was `TransactionTypeId: "Putaway"`/`TransactionId: "User
+       Directed"` that happened to carry `NewStatus: "9000"`), but
+       checked first in case a different LPN's history does.
+    3. Otherwise, the latest `ActivityDateTime` event that moved the LPN
+       to `ILPN_CONSUMED_STATUS` — falling back to the latest event
+       overall if none did (so this never returns nothing just because
+       the consuming event isn't recognizable by status).
+    """
+    if not records:
+        return None
+
+    groups: Dict[tuple, dict] = {}
+    order: List[tuple] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        key = (
+            str(rec.get("TraceId") or ""),
+            str(rec.get("ActivityDateTime") or ""),
+            str(rec.get("TransactionTypeId") or ""),
+            str(rec.get("TransactionId") or ""),
+        )
+        if key not in groups:
+            groups[key] = dict(rec)
+            order.append(key)
+        else:
+            merged = groups[key]
+            for field_key, field_value in rec.items():
+                if field_value not in (None, "") and not merged.get(field_key):
+                    merged[field_key] = field_value
+    events = [groups[k] for k in order]
+    if not events:
+        return None
+
+    consume_event = next(
+        (
+            e
+            for e in events
+            if "consume" in str(e.get("TransactionTypeId") or "").lower()
+            or "consume" in str(e.get("TransactionId") or "").lower()
+        ),
+        None,
+    )
+    if consume_event:
+        return consume_event
+
+    terminal_events = [e for e in events if str(e.get("NewStatus") or "") == ILPN_CONSUMED_STATUS]
+    candidates = terminal_events or events
+    return max(candidates, key=lambda e: str(e.get("ActivityDateTime") or ""))
+
+
+def _consumed_ilpn_history_fields(
+    container_id: str, token: str, org: str, location: str = None
+) -> Dict[str, Any]:
+    """Wraps search_ilpn_activity_history()+select_terminal_ilpn_activity()
+    for resolve_search()'s no_task branch — a consumed LPN's own
+    inventory/location come back empty, so this is the only place left
+    to find what item/quantity actually moved. Never raises (a failed
+    or empty history lookup just means the existing blank/`*`-location-
+    only display stays as it is — the LPN is still fully readable,
+    just without this extra detail).
+    """
+    try:
+        records = search_ilpn_activity_history(container_id, token, org, location=location)
+    except Exception:  # noqa: BLE001
+        return {}
+    terminal = select_terminal_ilpn_activity(records)
+    if not terminal:
+        return {}
+    item_id = str(terminal.get("ItemId") or "")
+    if not item_id:
+        return {}
+    qty = terminal.get("CompletedQuantity")
+    if qty in (None, ""):
+        qty = terminal.get("Quantity")
+    return {
+        "itemId": item_id,
+        "quantity": _dec(qty) if qty not in (None, "") else None,
+        "targetLocationId": str(terminal.get("TargetLocationId") or ""),
     }
 
 
@@ -409,6 +508,32 @@ def resolve_search(
         description = ""
         qty = Decimal("0")
 
+    # A consumed LPN's own inventory/location come back empty — there's
+    # nothing in inv_rows to have populated item_id/description/qty
+    # above (2026-08-09, per explicit instruction: reuse the existing
+    # Item/Qty columns for this, the same way Current Location already
+    # gets a `*`-marked PreviousLocationId fallback, rather than new
+    # dedicated fields). qty_display carries the marked string past the
+    # numeric `_num()` conversion below when history was found —
+    # `_num("6*")` would silently collapse to 0 (`_dec()` swallows the
+    # parse failure), so the marked case is built as a plain string
+    # directly instead.
+    qty_display = None
+    if not inv_rows and ilpn_fields["ilpnStatus"] == ILPN_CONSUMED_STATUS:
+        history = _consumed_ilpn_history_fields(search_value, token, org, location=dest)
+        hist_item_id = history.get("itemId")
+        if hist_item_id:
+            item_id = f"{hist_item_id}*"
+            hist_item = items.get(hist_item_id)
+            if hist_item is None:
+                hist_item = search_items([hist_item_id], token, org, location=dest).get(hist_item_id) or {}
+            description = str(hist_item.get("Description") or "")
+            if history.get("quantity") is not None:
+                factor, uom_label = _package_conversion_factor(
+                    hist_item, str(hist_item.get("DisplayUomId") or "")
+                )
+                qty_display = f"{_num(history['quantity'] / factor)}*"
+
     line = {
         "lineNumber": 1,
         "taskDetailId": f"container:{search_value}",
@@ -419,9 +544,9 @@ def resolve_search(
         "lpnId": search_value,
         "uomId": uom_label,
         "uomFactor": _num(factor),
-        "plannedQuantity": _num(qty),
+        "plannedQuantity": qty_display if qty_display is not None else _num(qty),
         "completedQuantity": 0,
-        "remainingQuantity": _num(qty),
+        "remainingQuantity": qty_display if qty_display is not None else _num(qty),
         "mixedItems": mixed_items,
         "ilpnStatus": ilpn_fields["ilpnStatus"],
         "ilpnStatusLabel": ilpn_fields["ilpnStatusLabel"],

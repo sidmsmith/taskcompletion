@@ -891,10 +891,70 @@ single check:
 - Confirmed via browser render too: both inputs correctly greyed out,
   Complete Line correctly disabled, no red "invalid" flash on the
   disabled To Location.
-- **Not yet handled**: the user is separately researching a linked
-  history record that would surface the last item/qty/etc. a now-
-  read-only consumed LPN actually held, for display purposes — noted
-  as a likely near-future addition once that's found, not built here.
+## Consumed LPN item/qty history (2026-08-09, tenth session)
+
+The gap flagged above — a consumed LPN's own inventory/location come
+back empty, so there was nothing to show for what it actually held —
+is now filled in, via a genuinely different MAWM component (DMUI
+Search's Activity Tracking view, not dcinventory/task/inventory-
+management like everything else in this app).
+
+- **`mawm_client.search_ilpn_activity_history(container_id, ...)`** —
+  `POST dmui-search/api/dmui-search/entity/search`, filtered only by
+  `ContainerId` (no item/transaction/date filter, per the source
+  document — deliberately returns the LPN's complete event history so
+  the selection logic below can pick the right one). A different shape
+  from every other call in this app: `Filters`/`ViewName` instead of
+  `Query`/`Template`, and the real rows live under `data.Results`, not
+  `data` directly.
+- **`task_service.select_terminal_ilpn_activity(records)`** — the
+  confirmed-by-user-capture selection logic
+  (`mawm_lpn_history_api_and_selection_logic.md`): group rows
+  representing the same business event (same `TraceId` +
+  `ActivityDateTime` + `TransactionTypeId` + `TransactionId` — a single
+  Modify iLPN adjustment can be split across two published rows, each
+  carrying different fields, merged here so nothing gets lost to
+  whichever row got picked); prefer a row whose transaction explicitly
+  represents consumption if one exists (not confirmed to ever actually
+  occur — the source document's own example never had one); otherwise
+  the latest `ActivityDateTime` row that moved the LPN to
+  `ILPN_CONSUMED_STATUS`.
+- **Wired into `resolve_search()`'s no_task branch, per explicit
+  instruction to reuse the existing Item/Qty columns** — the same way
+  Current Location already gets a `*`-marked `PreviousLocationId`
+  fallback, not new dedicated fields. `itemId`/`plannedQuantity`/
+  `remainingQuantity` all get a trailing `*` when populated this way
+  (`"5000221*"`, `"6*"`) — the user's own words: "we can do the same
+  for item and qty for now until I see it working and then perhaps we
+  can remove the * indicator." `plannedQuantity`/`remainingQuantity`
+  become **strings** in this case (`_num("6*")` would silently
+  collapse to 0 — `_dec()` swallows the parse failure — so the marked
+  value bypasses `_num()` entirely) — confirmed this doesn't break
+  anything downstream: a consumed line is already excluded from
+  `remainingQty()`-based gating via `isConsumedLine()` checks
+  everywhere that matters, and the one place `remainingQty()` still
+  runs unconditionally (`Number("6*") → NaN → 0`) degrades to exactly
+  the right answer anyway ("nothing remaining" is correct for an
+  already-consumed line).
+- **CONFIRMED live, twice, plus a clean negative case**:
+  - `LPN000000000006` (the source document's own example) — live API
+    call, not the document's cached response — returned exactly
+    `itemId: "5000221*"`, `description: "Floral Print Dress"`,
+    `fromLocationId: "A1AC0401*"`, `plannedQuantity: "6*"`, matching
+    the document's derivation precisely. Confirmed rendering correctly
+    through the real browser UI too.
+  - Most *other* consumed LPNs in this org (`LPN00479`,
+    `LPN000000000496`, `LPN01007`, etc.) have **no**
+    `PreviousLocationId` at all, unlike `LPN000000000006` — a real
+    stress test for whether activity history could find something the
+    old location-only fallback couldn't. It didn't: `LPN00479` has
+    **zero** Activity Tracking records (confirmed directly — real
+    seed/imported demo data has no transactional history, not a bug).
+    Correctly degrades to the same blank fields as before this
+    feature existed, no crash, no regression.
+  - A normal non-consumed LPN with real inventory (`LPN00760`)
+    confirmed completely unaffected — plain numeric quantity, no `*`,
+    exactly as before.
 
 ## Known-good test Task Id
 
@@ -1413,5 +1473,66 @@ real UI end to end:
   Count Initiated) — status will keep updating.") rather than a bare
   "Complete failed."
 
-Also not yet built: the tasked (non-ad-hoc) Cycle Count flow —
-explicitly deferred by the user until ad hoc counts are solid.
+## Tasked (non-ad-hoc) Cycle Count — investigation started (2026-08-09, tenth session)
+
+Ad hoc counting confirmed solid, so investigation moved to real WM-
+scheduled Cycle Count tasks (`TransactionTypeId ='Cycle Count'` in
+`task/api/task/task/search`, same generic Task Management endpoint
+Putaway uses). 44 total in `SS-DEMO`, all but 2 already `Status: 8000`
+(Completed). Of the 2 open ones, only one was a genuine candidate —
+`CCNTINM0000000021` turned out to be leftover byproduct state from
+this session's own earlier ad hoc single-item test at `A1AC0139` (its
+`TransactionId: "Cycle Count Active-API"` and `AssignedTaskPoolId:
+"SystemTaskPool"` match the ad hoc flow exactly, not a real
+WM-generated task).
+
+**The real candidate**: `CCNTINM000023`, `Status: 3000` (Ready For
+Assignment), `Description: "Recount Forward Picking"`,
+`TransactionId: "Recount"`, `AssignedTaskPoolId: "Task Interleaving"`,
+pointing at `C1CS0111` (`LocationTypeId: STORAGE`,
+`InventoryReservationTypeId: LOCATION` — non-LPN-tracked, confirmed).
+`TaskDetail` carries no item (`ItemId: null`, `Quantity: 0`) — per
+explicit instruction, this is expected: "when WM creates count tasks,
+it is for the entire location," so the app is expected to look the
+item(s) up from the location itself, exactly like ad hoc already does
+via `search_location_inventory()` — `resolve_cycle_count_location()`
+needs no changes for this. `C1CS0111` holds one real item (`123459`,
+"Pima Cotton Sweater", OnHand 150) and was already locked
+(`CycleCountPending: true`) purely from the task's existence — zero
+prior `inventoryCountRun` records, confirming the lock flag can be set
+by WM's own task-creation process independent of the ad hoc
+`initiateCount` flow entirely.
+
+**Confirmed live: the completion mechanism is shared.** Calling the
+exact same ad hoc `initiate_count('C1CS0111', ...)` — no task
+parameter, nothing cycle-count-task-specific — auto-detected and
+tried to claim the real task by name. First attempt failed with
+`FWTSK::019`, *"Task CCNTINM000023 cannot be assigned to user
+sdtadmin@ss-demo"* (a live task-assignment conflict, same error class
+already documented for Putaway tasks earlier in this project — not a
+code bug). After the user manually reassigned the task, the identical
+call succeeded and returned `CountRunId: "CNT000800"` tied to
+`TaskId: "CCNTINM000023"` — confirming this is genuinely the same
+underlying task, not a coincidence.
+
+Ran the full remaining chain (validate/accept/persist/end,
+exact-match count, 150 no variance) — all clean 200s. The count itself
+resolved correctly: `inventoryCountResult.Status: "Booked"`, real
+on-hand confirmed unchanged at 150, `locationCountInfo.CycleCountPending`
+cleared to `false`.
+
+**But the task itself never closed.** `CCNTINM000023` stayed at
+`Status: "7000"` (In Progress), its `TaskDetail.Status` stayed `"1000"`
+(Created), and `CompletedQuantity`/`Quantity` never got populated with
+the real counted values — confirmed genuinely stuck, not async lag
+(polled every 3s for 15s straight, zero change). **This is the real
+open gap**: the ad hoc `initiateCount`→...→`endCount` chain only
+handles the inventory-count side (booking the count into inventory);
+it does not close out the Task Management record. Some separate,
+currently-unknown call is needed — parallel to how Putaway needed its
+own task-completion mechanism beyond just moving inventory, and
+matching this codebase's own still-unconfirmed `complete_task()`
+(flagged elsewhere as never having been probed live). No captured
+reference exists yet for what that call looks like for Cycle Count
+tasks specifically — the user is investigating further before this
+continues.

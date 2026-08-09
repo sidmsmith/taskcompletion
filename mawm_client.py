@@ -137,6 +137,21 @@ PUTAWAY_WORKFLOW_SCRIPT_NAME = "Putaway"
 ILPN_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/ilpn/search"
 INVENTORY_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/search"
 
+# CONFIRMED-by-user-capture (mawm_lpn_history_api_and_selection_logic.md,
+# 2026-08-09) — DMUI Search's Activity Tracking view, the only place
+# that still has an item/quantity/target-location record for a
+# *consumed* LPN (its own CurrentLocationId/on-hand come back empty
+# once consumed — see ILPN_CONSUMED_STATUS's comment). Filtering by
+# ContainerId alone returns the LPN's complete event history,
+# unfiltered by item/transaction/date — see
+# task_service.select_terminal_ilpn_activity() for the confirmed
+# selection logic (group duplicate rows, then pick the terminal
+# movement) used to turn this into "what item, how much, and where did
+# it end up."
+ILPN_ACTIVITY_HISTORY_URL = f"{HOST}/dmui-search/api/dmui-search/entity/search"
+ILPN_ACTIVITY_HISTORY_VIEW_NAME = "dmui_activitytracking"
+ILPN_ACTIVITY_HISTORY_COMPONENT_NAME = "com-manh-cp-dmui-search"
+
 # CONFIRMED-by-user-capture (mawm_modify_ilpn_query_and_adjustment.md,
 # 2026-08-08) — Modify iLPN: correct an LPN's actual on-hand quantity
 # directly (not via a task move), used ahead of a putaway completion
@@ -626,6 +641,50 @@ def search_ilpn_current_location(
         )
     data = _response_data_list(response.json())
     return data[0] if data else None
+
+
+def search_ilpn_activity_history(container_id: str, token: str, org: str, location: str = None) -> List[dict]:
+    """CONFIRMED-by-user-capture — every Activity Tracking record for
+    one LPN, filtered only by ContainerId (no item/transaction/date
+    filter, per the source document — deliberately returns the
+    complete history so the caller can apply its own selection logic,
+    see task_service.select_terminal_ilpn_activity()). A different
+    shape from every other search in this app: `Filters`/`ViewName`
+    instead of `Query`/`Template`, and the real rows live under
+    `data.Results`, not the usual `data` list directly — DMUI Search is
+    a different MAWM component (search/reporting over Elasticsearch-
+    backed activity data) from dcinventory/task/inventory-management.
+    `TimeZone` is hardcoded to America/New_York, matching the source
+    document's own capture — unconfirmed whether/how this affects the
+    result content versus just display formatting, but it isn't a
+    filter dimension so it's assumed inert.
+    """
+    token = normalize_token(token)
+    response = _post(
+        ILPN_ACTIVITY_HISTORY_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={
+            "ViewName": ILPN_ACTIVITY_HISTORY_VIEW_NAME,
+            "Filters": [
+                {
+                    "ViewName": ILPN_ACTIVITY_HISTORY_VIEW_NAME,
+                    "AttributeId": "ContainerId",
+                    "FilterValues": [container_id],
+                }
+            ],
+            "SortIndicator": "chevron-up",
+            "TimeZone": "America/New_York",
+            "ComponentName": ILPN_ACTIVITY_HISTORY_COMPONENT_NAME,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"ilpn activity history search failed: {response.status_code} {response.text[:500]}"
+        )
+    body = response.json()
+    data = body.get("data") if isinstance(body, dict) else None
+    results = (data or {}).get("Results") if isinstance(data, dict) else None
+    return results if isinstance(results, list) else []
 
 
 def search_ilpn_statuses(
