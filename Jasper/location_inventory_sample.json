@@ -1,0 +1,62 @@
+{
+  "Locations": [
+    {
+      "LocationId": "A1AC0123",
+      "DisplayLocation": "A1AC0123",
+      "LocationBarcode": "A1AC0123",
+      "Items": [
+        {
+          "ItemId": "6000108",
+          "ItemDescription": "Dockside Oxford Shirt",
+          "OnHandQty": 240,
+          "OnHandDisplay": "240 Units"
+        }
+      ]
+    },
+    {
+      "LocationId": "A1AC0924",
+      "DisplayLocation": "A1AC0924",
+      "LocationBarcode": "A1AC0924",
+      "Items": [
+        {
+          "ItemId": "5000001",
+          "ItemDescription": "10 Pack SD Rice",
+          "OnHandQty": 1737,
+          "OnHandDisplay": "1737 Units"
+        },
+        {
+          "ItemId": "5000002",
+          "ItemDescription": "10 Pack SD Wheat",
+          "OnHandQty": 750,
+          "OnHandDisplay": "750"
+        }
+      ]
+    },
+    {
+      "LocationId": "A1AC1201",
+      "DisplayLocation": "A1AC1201",
+      "LocationBarcode": "A1AC1201",
+      "Items": [
+        {
+          "ItemId": "4000087",
+          "ItemDescription": "Colorblock Windbreaker",
+          "OnHandQty": 39,
+          "OnHandDisplay": "39 Units"
+        }
+      ]
+    },
+    {
+      "LocationId": "A2AC1201",
+      "DisplayLocation": "A2AC1201",
+      "LocationBarcode": "A2AC1201",
+      "Items": [
+        {
+          "ItemId": "4000087",
+          "ItemDescription": "Colorblock Windbreaker",
+          "OnHandQty": 20,
+          "OnHandDisplay": "20 Units"
+        }
+      ]
+    }
+  ]
+}

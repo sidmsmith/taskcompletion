@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WMS DEPLOYMENT COPY - do not sync this file's JsonDataSource cast from location_inventory_report.jrxml.
+     The WMS runs a pre-7.0 JasperReports engine (net.sf.jasperreports.engine.data.JsonDataSource),
+     while Jaspersoft Studio here bundles 7.0.6 (net.sf.jasperreports.json.data.JsonDataSource) -
+     these two files must intentionally differ on that one line. -->
+<jasperReport xmlns="http://jasperreports.sourceforge.net/jasperreports"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xmlns:jr="http://jasperreports.sourceforge.net/jasperreports/components"
+              xsi:schemaLocation="http://jasperreports.sourceforge.net/jasperreports http://jasperreports.sourceforge.net/xsd/jasperreport.xsd
+                                  http://jasperreports.sourceforge.net/jasperreports/components http://jasperreports.sourceforge.net/xsd/components.xsd
+                                  http://jasperreports.sourceforge.net/jasperreports/components http://jasperreports.sourceforge.net/xsd/barcode4j.xsd"
+              name="location_inventory_report"
+              pageWidth="612"
+              pageHeight="792"
+              columnWidth="540"
+              leftMargin="36"
+              rightMargin="36"
+              topMargin="36"
+              bottomMargin="36">
+
+    <property name="com.jaspersoft.studio.data.defaultdataadapter" value="Location Inventory JSON"/>
+    <property name="net.sf.jasperreports.export.pdf.metadata.title" value="Location Inventory Report"/>
+
+    <style name="ReportTitle" fontName="SansSerif" fontSize="16" isBold="true" forecolor="#17365D"/>
+    <style name="LocationHeader" fontName="SansSerif" fontSize="11" isBold="true" forecolor="#FFFFFF"/>
+    <style name="ColumnHeader" fontName="SansSerif" fontSize="9" isBold="true" forecolor="#FFFFFF"/>
+    <style name="Detail" fontName="SansSerif" fontSize="9"/>
+
+    <subDataset name="ItemDataset" uuid="d7b4f02f-4b0e-45f4-9b26-0c36aa6ef8cb">
+        <field name="ItemId" class="java.lang.String"/>
+        <field name="ItemDescription" class="java.lang.String"/>
+        <field name="OnHandQty" class="java.lang.Double"/>
+        <field name="OnHandDisplay" class="java.lang.String"/>
+    </subDataset>
+
+    <parameter name="REPORT_TITLE" class="java.lang.String" isForPrompting="false">
+        <defaultValueExpression><![CDATA["Cycle Count Sheet"]]></defaultValueExpression>
+    </parameter>
+
+    <queryString language="json"><![CDATA[Locations]]></queryString>
+
+    <field name="LocationId" class="java.lang.String"/>
+    <field name="DisplayLocation" class="java.lang.String"/>
+
+    <variable name="AllLocationsCsv" class="java.lang.String" resetType="Report" calculation="Nothing">
+        <variableExpression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></variableExpression>
+        <initialValueExpression><![CDATA[""]]></initialValueExpression>
+    </variable>
+
+    <title>
+        <band height="96" splitType="Stretch">
+            <textField>
+                <reportElement x="0" y="0" width="540" height="24" uuid="a4c09dc2-55da-49bd-82b6-4e46b6bfbf0a"/>
+                <textElement textAlignment="Center" verticalAlignment="Middle">
+                    <font size="14" isBold="true"/>
+                </textElement>
+                <textFieldExpression><![CDATA[$P{REPORT_TITLE}]]></textFieldExpression>
+            </textField>
+            <staticText>
+                <reportElement x="0" y="26" width="540" height="14" forecolor="#666666" uuid="34a62df7-22e8-46cc-bd3b-8d49a1b4aa2c"/>
+                <textElement textAlignment="Center">
+                    <font fontName="SansSerif" size="6"/>
+                </textElement>
+                <text><![CDATA[Generated from the Location Inventory JSON payload]]></text>
+            </staticText>
+            <componentElement>
+                <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
+                <jr:QRCode>
+                    <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
+                </jr:QRCode>
+            </componentElement>
+        </band>
+    </title>
+
+    <detail>
+        <band height="74" splitType="Stretch">
+            <rectangle>
+                <reportElement x="0" y="0" width="540" height="25" backcolor="#17365D" mode="Opaque" uuid="d2ab49b8-640a-4b57-8da6-eae8b0a5ec1c"/>
+            </rectangle>
+            <textField>
+                <reportElement style="LocationHeader" x="10" y="3" width="520" height="19" uuid="fbd5ab0b-2c24-4e36-8775-8d87a06a0e17"/>
+                <textFieldExpression><![CDATA["Location: " + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></textFieldExpression>
+            </textField>
+
+            <componentElement>
+                <reportElement x="0" y="31" width="540" height="42" uuid="77a92fb7-a16f-4c77-8dd4-42f33f02a53e"/>
+                <jr:table>
+                    <datasetRun subDataset="ItemDataset" uuid="15db0c7b-d128-4a56-9e1a-5d6dc78603f2">
+                        <dataSourceExpression><![CDATA[
+                            ((net.sf.jasperreports.engine.data.JsonDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")
+                        ]]></dataSourceExpression>
+                    </datasetRun>
+                    <jr:column width="105" uuid="11a38b91-81dd-47f3-9195-0b3a24aa3db6">
+                        <jr:columnHeader height="20">
+                            <rectangle>
+                                <reportElement x="0" y="0" width="105" height="20" backcolor="#5B9BD5" mode="Opaque" uuid="a1b2c3d4-1234-4a5b-8c6d-7e8f9a0b1c2d"/>
+                                <graphicElement>
+                                    <pen lineWidth="0.0"/>
+                                </graphicElement>
+                            </rectangle>
+                            <staticText>
+                                <reportElement style="ColumnHeader" x="6" y="0" width="99" height="20" uuid="2cf1c55f-8907-4594-b27e-4a14cb1a4ac3"/>
+                                <textElement verticalAlignment="Middle"/>
+                                <text><![CDATA[Item]]></text>
+                            </staticText>
+                        </jr:columnHeader>
+                        <jr:detailCell height="22">
+                            <textField isStretchWithOverflow="true">
+                                <reportElement style="Detail" x="6" y="0" width="99" height="22" uuid="3df78b44-4133-4468-bfbd-84cd9a5a8a2f"/>
+                                <textElement verticalAlignment="Middle"/>
+                                <textFieldExpression><![CDATA[$F{ItemId}]]></textFieldExpression>
+                            </textField>
+                        </jr:detailCell>
+                    </jr:column>
+                    <jr:column width="295" uuid="78834a8c-3405-4fb7-b3de-881e9ff8f6ac">
+                        <jr:columnHeader height="20">
+                            <staticText>
+                                <reportElement style="ColumnHeader" x="0" y="0" width="295" height="20" backcolor="#5B9BD5" mode="Opaque" uuid="1b1c4e7f-cc0d-473e-853b-078295ff324e"/>
+                                <textElement verticalAlignment="Middle"/>
+                                <text><![CDATA[Description]]></text>
+                            </staticText>
+                        </jr:columnHeader>
+                        <jr:detailCell height="22">
+                            <textField isStretchWithOverflow="true">
+                                <reportElement style="Detail" x="0" y="0" width="295" height="22" uuid="6dcbe52b-8f07-48cd-8e91-bd1f865426db"/>
+                                <textElement verticalAlignment="Middle"/>
+                                <textFieldExpression><![CDATA[$F{ItemDescription}]]></textFieldExpression>
+                            </textField>
+                        </jr:detailCell>
+                    </jr:column>
+                    <jr:column width="140" uuid="45e2830a-2b6f-43de-8df4-6fe5e1099f8e">
+                        <jr:columnHeader height="20">
+                            <rectangle>
+                                <reportElement x="0" y="0" width="140" height="20" backcolor="#5B9BD5" mode="Opaque" uuid="e9f0a1b2-5678-4c3d-9e2f-1a2b3c4d5e6f"/>
+                                <graphicElement>
+                                    <pen lineWidth="0.0"/>
+                                </graphicElement>
+                            </rectangle>
+                            <staticText>
+                                <reportElement style="ColumnHeader" x="0" y="0" width="134" height="20" uuid="7f5ce0e4-7fd0-4fc6-893f-e57c3ec72d39"/>
+                                <textElement textAlignment="Left" verticalAlignment="Middle"/>
+                                <text><![CDATA[On Hand]]></text>
+                            </staticText>
+                        </jr:columnHeader>
+                        <jr:detailCell height="22">
+                            <staticText>
+                                <reportElement style="Detail" x="0" y="0" width="95" height="22" uuid="c4d5e6f7-2345-4b1c-9d8e-3f4a5b6c7d8e"/>
+                                <textElement textAlignment="Left" verticalAlignment="Middle"/>
+                                <text><![CDATA[________________________________]]></text>
+                            </staticText>
+                            <textField>
+                                <reportElement x="95" y="0" width="39" height="22" forecolor="#999999" uuid="6799cb23-59f6-44c0-b2a3-6be6e94ed7d2"/>
+                                <textElement textAlignment="Left" verticalAlignment="Middle">
+                                    <font fontName="SansSerif" size="5"/>
+                                </textElement>
+                                <textFieldExpression><![CDATA[$F{OnHandQty} == null ? "" : "(" + new java.text.DecimalFormat("#,##0").format($F{OnHandQty}) + ")"]]></textFieldExpression>
+                            </textField>
+                        </jr:detailCell>
+                    </jr:column>
+                </jr:table>
+            </componentElement>
+        </band>
+    </detail>
+
+    <pageFooter>
+        <band height="18">
+            <textField>
+                <reportElement x="0" y="0" width="270" height="15" forecolor="#666666" uuid="be1f0f54-40b4-4b78-9f4f-5c62f4151a33"/>
+                <textElement>
+                    <font fontName="SansSerif" size="8"/>
+                </textElement>
+                <textFieldExpression><![CDATA["Page " + $V{PAGE_NUMBER}]]></textFieldExpression>
+            </textField>
+            <textField pattern="yyyy-MM-dd HH:mm">
+                <reportElement x="270" y="0" width="270" height="15" forecolor="#666666" uuid="81b0bf64-8ae1-44d8-92f3-cbcce85f5e80"/>
+                <textElement textAlignment="Right">
+                    <font fontName="SansSerif" size="8"/>
+                </textElement>
+                <textFieldExpression><![CDATA[new java.util.Date()]]></textFieldExpression>
+            </textField>
+        </band>
+    </pageFooter>
+
+    <summary>
+        <band height="160"/>
+    </summary>
+</jasperReport>

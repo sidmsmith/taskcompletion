@@ -1,0 +1,107 @@
+<!-- Created with Jaspersoft Studio version 7.0.6.final using JasperReports Library version 7.0.6-5d2a603fdc6b3db8f842a83383e594f41891534d  -->
+<jasperReport name="location_inventory_report" language="java" pageWidth="612" pageHeight="792" columnWidth="540" leftMargin="36" rightMargin="36" topMargin="36" bottomMargin="36" uuid="a2e5c735-0f03-4c5f-9db2-ef6643a9e85b">
+	<property name="com.jaspersoft.studio.data.defaultdataadapter" value="Location Inventory JSON"/>
+	<property name="net.sf.jasperreports.export.pdf.metadata.title" value="Location Inventory Report"/>
+	<style name="ReportTitle" forecolor="#17365D" fontName="SansSerif" fontSize="16.0" bold="true"/>
+	<style name="LocationHeader" forecolor="#FFFFFF" fontName="SansSerif" fontSize="11.0" bold="true"/>
+	<style name="ColumnHeader" forecolor="#FFFFFF" fontName="SansSerif" fontSize="9.0" bold="true"/>
+	<style name="Detail" fontName="SansSerif" fontSize="9.0"/>
+	<dataset name="ItemDataset" uuid="d7b4f02f-4b0e-45f4-9b26-0c36aa6ef8cb">
+		<field name="ItemId" class="java.lang.String"/>
+		<field name="ItemDescription" class="java.lang.String"/>
+		<field name="OnHandQty" class="java.lang.Double"/>
+		<field name="OnHandDisplay" class="java.lang.String"/>
+	</dataset>
+	<parameter name="REPORT_TITLE" forPrompting="false" class="java.lang.String">
+		<defaultValueExpression><![CDATA["Cycle Count Sheet"]]></defaultValueExpression>
+	</parameter>
+	<query language="json"><![CDATA[Locations]]></query>
+	<field name="LocationId" class="java.lang.String"/>
+	<field name="DisplayLocation" class="java.lang.String"/>
+	<variable name="AllLocationsCsv" class="java.lang.String">
+		<expression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></expression>
+		<initialValueExpression><![CDATA[""]]></initialValueExpression>
+	</variable>
+	<title height="96" splitType="Stretch">
+		<element kind="textField" uuid="a4c09dc2-55da-49bd-82b6-4e46b6bfbf0a" x="0" y="0" width="540" height="24" fontSize="14.0" bold="true" hTextAlign="Center" vTextAlign="Middle">
+			<expression><![CDATA[$P{REPORT_TITLE}]]></expression>
+		</element>
+		<element kind="staticText" uuid="34a62df7-22e8-46cc-bd3b-8d49a1b4aa2c" x="0" y="26" width="540" height="14" forecolor="#666666" fontName="SansSerif" fontSize="6.0" hTextAlign="Center">
+			<text><![CDATA[Generated from the Location Inventory JSON payload]]></text>
+		</element>
+		<element kind="component" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63" x="446" y="0" width="94" height="94">
+			<component kind="barcode4j:QRCode">
+				<codeExpression><![CDATA[$V{AllLocationsCsv}]]></codeExpression>
+			</component>
+		</element>
+	</title>
+	<detail>
+		<band height="74" splitType="Stretch">
+			<element kind="rectangle" uuid="d2ab49b8-640a-4b57-8da6-eae8b0a5ec1c" mode="Opaque" x="0" y="0" width="540" height="25" backcolor="#17365D"/>
+			<element kind="textField" uuid="fbd5ab0b-2c24-4e36-8775-8d87a06a0e17" x="10" y="3" width="520" height="19" style="LocationHeader">
+				<expression><![CDATA["Location: " + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></expression>
+			</element>
+			<element kind="component" uuid="77a92fb7-a16f-4c77-8dd4-42f33f02a53e" x="0" y="31" width="540" height="42">
+				<component kind="table">
+					<datasetRun uuid="15db0c7b-d128-4a56-9e1a-5d6dc78603f2" subDataset="ItemDataset">
+						<dataSourceExpression><![CDATA[((net.sf.jasperreports.json.data.JsonDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")]]></dataSourceExpression>
+					</datasetRun>
+					<column kind="single" uuid="11a38b91-81dd-47f3-9195-0b3a24aa3db6" width="105">
+						<columnHeader height="20">
+							<element kind="rectangle" uuid="a1b2c3d4-1234-4a5b-8c6d-7e8f9a0b1c2d" mode="Opaque" x="0" y="0" width="105" height="20" backcolor="#5B9BD5">
+								<pen lineWidth="0.0"/>
+							</element>
+							<element kind="staticText" uuid="2cf1c55f-8907-4594-b27e-4a14cb1a4ac3" x="6" y="0" width="99" height="20" vTextAlign="Middle" style="ColumnHeader">
+								<text><![CDATA[Item]]></text>
+							</element>
+						</columnHeader>
+						<detailCell height="22">
+							<element kind="textField" uuid="3df78b44-4133-4468-bfbd-84cd9a5a8a2f" x="6" y="0" width="99" height="22" textAdjust="StretchHeight" vTextAlign="Middle" style="Detail">
+								<expression><![CDATA[$F{ItemId}]]></expression>
+							</element>
+						</detailCell>
+					</column>
+					<column kind="single" uuid="78834a8c-3405-4fb7-b3de-881e9ff8f6ac" width="295">
+						<columnHeader height="20">
+							<element kind="staticText" uuid="1b1c4e7f-cc0d-473e-853b-078295ff324e" mode="Opaque" x="0" y="0" width="295" height="20" backcolor="#5B9BD5" vTextAlign="Middle" style="ColumnHeader">
+								<text><![CDATA[Description]]></text>
+							</element>
+						</columnHeader>
+						<detailCell height="22">
+							<element kind="textField" uuid="6dcbe52b-8f07-48cd-8e91-bd1f865426db" x="0" y="0" width="295" height="22" textAdjust="StretchHeight" vTextAlign="Middle" style="Detail">
+								<expression><![CDATA[$F{ItemDescription}]]></expression>
+							</element>
+						</detailCell>
+					</column>
+					<column kind="single" uuid="45e2830a-2b6f-43de-8df4-6fe5e1099f8e" width="140">
+						<columnHeader height="20">
+							<element kind="rectangle" uuid="e9f0a1b2-5678-4c3d-9e2f-1a2b3c4d5e6f" mode="Opaque" x="0" y="0" width="140" height="20" backcolor="#5B9BD5">
+								<pen lineWidth="0.0"/>
+							</element>
+							<element kind="staticText" uuid="7f5ce0e4-7fd0-4fc6-893f-e57c3ec72d39" x="0" y="0" width="134" height="20" hTextAlign="Left" vTextAlign="Middle" style="ColumnHeader">
+								<text><![CDATA[On Hand]]></text>
+							</element>
+						</columnHeader>
+						<detailCell height="22">
+							<element kind="staticText" uuid="c4d5e6f7-2345-4b1c-9d8e-3f4a5b6c7d8e" x="0" y="0" width="95" height="22" hTextAlign="Left" vTextAlign="Middle" style="Detail">
+								<text><![CDATA[________________________________]]></text>
+							</element>
+							<element kind="textField" uuid="6799cb23-59f6-44c0-b2a3-6be6e94ed7d2" x="95" y="0" width="39" height="22" forecolor="#999999" fontName="SansSerif" fontSize="5.0" hTextAlign="Left" vTextAlign="Middle">
+								<expression><![CDATA[$F{OnHandQty} == null ? "" : "(" + new java.text.DecimalFormat("#,##0").format($F{OnHandQty}) + ")"]]></expression>
+							</element>
+						</detailCell>
+					</column>
+				</component>
+			</element>
+		</band>
+	</detail>
+	<pageFooter height="18">
+		<element kind="textField" uuid="be1f0f54-40b4-4b78-9f4f-5c62f4151a33" x="0" y="0" width="270" height="15" forecolor="#666666" fontName="SansSerif" fontSize="8.0">
+			<expression><![CDATA["Page " + $V{PAGE_NUMBER}]]></expression>
+		</element>
+		<element kind="textField" uuid="81b0bf64-8ae1-44d8-92f3-cbcce85f5e80" x="270" y="0" width="270" height="15" forecolor="#666666" fontName="SansSerif" fontSize="8.0" pattern="yyyy-MM-dd HH:mm" hTextAlign="Right">
+			<expression><![CDATA[new java.util.Date()]]></expression>
+		</element>
+	</pageFooter>
+	<summary height="160"/>
+</jasperReport>
