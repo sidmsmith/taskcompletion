@@ -1473,7 +1473,7 @@ real UI end to end:
   Count Initiated) — status will keep updating.") rather than a bare
   "Complete failed."
 
-## Tasked (non-ad-hoc) Cycle Count — investigation started (2026-08-09, tenth session)
+## Tasked (non-ad-hoc) Cycle Count — task closure confirmed (2026-08-09, tenth session)
 
 Ad hoc counting confirmed solid, so investigation moved to real WM-
 scheduled Cycle Count tasks (`TransactionTypeId ='Cycle Count'` in
@@ -1521,18 +1521,156 @@ resolved correctly: `inventoryCountResult.Status: "Booked"`, real
 on-hand confirmed unchanged at 150, `locationCountInfo.CycleCountPending`
 cleared to `false`.
 
-**But the task itself never closed.** `CCNTINM000023` stayed at
-`Status: "7000"` (In Progress), its `TaskDetail.Status` stayed `"1000"`
-(Created), and `CompletedQuantity`/`Quantity` never got populated with
-the real counted values — confirmed genuinely stuck, not async lag
-(polled every 3s for 15s straight, zero change). **This is the real
-open gap**: the ad hoc `initiateCount`→...→`endCount` chain only
+**But the task itself never closed via `/count/end`.** `CCNTINM000023`
+stayed at `Status: "7000"` (In Progress), its `TaskDetail.Status`
+stayed `"1000"` (Created), and `CompletedQuantity`/`Quantity` never
+got populated with the real counted values — confirmed genuinely
+stuck, not async lag (polled every 3s for 15s straight, zero change).
+This meant the ad hoc `initiateCount`→...→`endCount` chain only
 handles the inventory-count side (booking the count into inventory);
-it does not close out the Task Management record. Some separate,
-currently-unknown call is needed — parallel to how Putaway needed its
-own task-completion mechanism beyond just moving inventory, and
-matching this codebase's own still-unconfirmed `complete_task()`
-(flagged elsewhere as never having been probed live). No captured
-reference exists yet for what that call looks like for Cycle Count
-tasks specifically — the user is investigating further before this
-continues.
+it does not close out the Task Management record — parallel to how
+Putaway needed its own task-completion mechanism beyond just moving
+inventory.
+
+**Resolved (2026-08-09): `/count/endCount/trigger` closes the task.**
+The user fed the above findings into Glean, which proposed replacing
+the final `/count/end` call with:
+
+```
+POST {host}/inventory-management/api/inventory-management/count/endCount/trigger
+```
+
+```json
+{
+  "LocationId": "C1CS0111",
+  "CountRunId": "CNT000800",
+  "TaskId": "CCNTINM000023",
+  "CountSequence": 1,
+  "CountMode": "USER_DIRECTED",
+  "LpnTracking": false,
+  "NumberOfLPNs": 0,
+  "TransactionId": "Cycle Count Active-API",
+  "CriteriaId": "Cycle Count Active-API Mode",
+  "CountCriteriaId": "Cycle Count Active-API Mode",
+  "TaskIntegrationDTO": {
+    "TransactionId": "Cycle Count Active-API",
+    "TransactionTypeId": "Cycle Count",
+    "LaborActivityId": "Cycle Count",
+    "LocationId": "C1CS0111",
+    "TaskId": "CCNTINM000023"
+  }
+}
+```
+
+Tested live against `CCNTINM000023`/`CNT000800`, which had already
+been fully booked earlier via the old `/count/end` call (count side
+was done; only the task was stuck) — called this new endpoint
+directly against that existing run instead of starting a fresh count,
+since it's a different endpoint, not a replay of the same call.
+Response was `200 {"success": true, "data": "OK"}`. **Independently
+re-queried task search 6× over 18s afterward** (never trust the
+response alone): `Task.Status` had genuinely changed `7000` → `8000`
+("Completed" per our own `TASK_STATUS_LABELS`), stable across every
+poll, with `ActualEndTime` now populated — not async lag, a real
+change.
+
+**Important nuance found in `TaskDetail`**: the task actually carries
+**two** `TaskDetail` rows, not one. The original row (`Sequence: 1`,
+created when WM first scheduled the task, `ItemId: null`) stayed at
+`CompletedQuantity: 0.0` / `Quantity: 0.0` even after closure — it's a
+placeholder that never gets touched by the count flow. A **second**
+row (`Sequence: 2`, `CreatedTimestamp` matching `initiateCount`'s
+timestamp, `ItemId: "123459"`) is the one that actually carries the
+real values: `Quantity: 150.0`, `CompletedQuantity: 150.0` — an exact
+match, `Status: "8000"`. So checking only the first `TaskDetail` array
+element (the natural first instinct) gives a false negative; the
+count-relevant row must be identified by `ItemId` being non-null (or
+by matching `CreatedTimestamp` to the count run), not by array
+position.
+
+Also reconfirmed via the other read-only endpoints, all consistent:
+`locationCountInfo.CycleCountPending: false`,
+`inventoryCountRun.Status: 80` (Booked), `inventoryCountResult.Status:
+"Booked"` with `OriginalQuantity`/`CountQuantity` both `150`,
+`VarianceQuantity: 0`.
+
+**Not yet tested**: a fresh end-to-end run using the trigger call from
+the start (this test reused an already-booked run, calling the new
+endpoint solely to check task closure). Also not yet tested: whether
+`/count/endCount/trigger` is safe to use universally (i.e. also for ad
+hoc counts, which currently use the already-working `/count/end`) —
+no reason yet to touch the working ad hoc path.
+
+**Wired into the backend (2026-08-09), not yet reachable from the
+UI.** Since the user doesn't have an open real WM-scheduled Cycle
+Count task to test against yet (still working on creating one),
+wiring was done conservatively rather than switching the proven ad
+hoc path over to unconfirmed behavior:
+
+- `mawm_client.trigger_end_count(location_id, count_run_id, task_id,
+  token, org, location=None)` — new function, the confirmed
+  `/count/endCount/trigger` call.
+- `task_service.complete_cycle_count_line()` and
+  `complete_cycle_count_location()` both gained an `is_tasked: bool =
+  False` parameter. At the final step, `is_tasked=True` calls
+  `trigger_end_count()` instead of `end_count()`; everything else in
+  the chain (initiate/validate/accept/persist, atomicity, polling) is
+  completely unchanged either way. Default `False` means every
+  existing ad hoc caller behaves exactly as before — **confirmed via
+  live regression test** after this change: exact-match count at
+  `A1AC0123` (item `6000108`, 240 = 240) still books correctly
+  (`Count Initiated` → `Booked` after the normal short async delay via
+  `check_cycle_count_status()` polling).
+- `/api/complete_cycle_count_line` and
+  `/api/complete_cycle_count_location` both accept an optional
+  `isTasked`/`is_tasked` boolean in the POST body (default `false`,
+  forwarded straight through) so the wired-up path can be exercised
+  directly once real task data exists, without needing the UI.
+
+**No UI wiring done** — there is still no way to reach `is_tasked=True`
+from the actual app UI. Two separate gaps remain, both still open:
+1. The search box doesn't route a real Cycle Count `TaskId` (like
+   `CCNTINM000023`) to the cycle-count UI at all yet — it would fall
+   into the generic Putaway-style task path instead.
+2. Even if it did, nothing in the UI/frontend sets `is_tasked: true`
+   when calling the two completion endpoints.
+Both need real task data in hand to build against sensibly (matching
+how the rest of ad hoc cycle count was only built after live-testing
+each piece), so they're intentionally left until then.
+
+**Test plan for once a real open Cycle Count task exists** (either a
+fresh `CCNTINM...`-style task or whatever the user manages to create):
+1. Read-only first — confirm the task is real and open:
+   `task/api/task/task/search` with `Query: "TaskId ='<id>'"`, check
+   `Status` (expect something pre-`8000`, e.g. `3000` Ready For
+   Assignment or `7000` In Progress) and note `BeginLocationId`/
+   `SourceLocationId` for the location.
+2. Call `/api/complete_cycle_count_line` (single item) or
+   `/api/complete_cycle_count_location` (whole location, all items)
+   directly — `curl`/Python script, not through the UI yet — with
+   `isTasked: true`, the real `locationId`, and a **matching quantity**
+   for a happy-path/no-variance test first (established pattern: test
+   happy path before exceptions).
+3. Independently re-verify, same rigor as every other test this
+   session — don't trust the response `success` alone:
+   - `task/api/task/task/search` again: `Task.Status` should move to
+     `8000`. **Check every `TaskDetail` row, not just the first** — the
+     real one is identified by having a non-null `ItemId` (or a
+     `CreatedTimestamp` matching when `initiateCount` ran), and its
+     `CompletedQuantity` should equal `Quantity` (the counted amount).
+   - `inventoryCountResult/search` for the `CountRunId` — `Status`
+     should reach `Booked` (poll via `check_cycle_count_status`/
+     `check_cycle_count_location_status` if not immediate, same as ad
+     hoc).
+   - `locationCountInfo/search` — `CycleCountPending` should clear to
+     `false`.
+4. Once a happy-path single-item task confirms clean, test a
+   multi-item location under a real task the same way ad hoc was
+   proven: no-variance first, then within-tolerance, then
+   out-of-tolerance — checking each time whether task closure behaves
+   the same as the count-booking side (e.g. does an out-of-tolerance
+   Pending Booking run leave the task open too, or does
+   `trigger_end_count()` still close it even though the count itself
+   didn't book?  — genuinely unknown, worth checking explicitly).
+5. Only after single-item and multi-item tasked completion are both
+   confirmed should the UI/search-routing gaps above get built.

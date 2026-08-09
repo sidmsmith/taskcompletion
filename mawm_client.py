@@ -268,6 +268,7 @@ CYCLE_COUNT_VALIDATE_ITEM_URL = f"{HOST}/inventory-management/api/inventory-mana
 CYCLE_COUNT_ACCEPT_QUANTITY_URL = f"{HOST}/inventory-management/api/inventory-management/count/acceptQuantity"
 CYCLE_COUNT_PERSIST_URL = f"{HOST}/inventory-management/api/inventory-management/count/quantity/persistCountDetails"
 CYCLE_COUNT_END_URL = f"{HOST}/inventory-management/api/inventory-management/count/end"
+CYCLE_COUNT_TRIGGER_END_URL = f"{HOST}/inventory-management/api/inventory-management/count/endCount/trigger"
 CYCLE_COUNT_CRITERIA_ID = "Cycle Count Active-API Mode"
 CYCLE_COUNT_TRANSACTION_ID = "Cycle Count Active-API"
 CYCLE_COUNT_TRANSACTION_TYPE_ID = "Cycle Count"
@@ -1011,6 +1012,57 @@ def end_count(location_id: str, count_run_id: str, token: str, org: str, locatio
         json=payload,
     )
     return _parse_cycle_count_response(response, "endCount")
+
+
+def trigger_end_count(
+    location_id: str, count_run_id: str, task_id: str, token: str, org: str, location: str = None
+) -> dict:
+    """CONFIRMED live 2026-08-09 against a real WM-scheduled Cycle Count
+    task (`CCNTINM000023`) — a task-aware replacement for end_count().
+    `end_count()` books the inventory count but never closes the
+    underlying Task Management record (confirmed stuck at
+    `Status: "7000"` for 15s+ of polling); this endpoint does both.
+    Verified via independent re-query afterward (never trust the 200
+    response alone): `Task.Status` changed `7000` -> `8000` ("Completed"),
+    stable across 18s of polling, with the item-carrying `TaskDetail`
+    row's `CompletedQuantity` equal to `Quantity`. Note the task has TWO
+    `TaskDetail` rows — a placeholder one (no ItemId) that never gets
+    populated, and the real one (matches the count's ItemId) that does;
+    don't check TaskDetail[0] alone.
+
+    Only tested so far by calling this directly against an
+    already-booked run (to isolate task-closure behavior) — not yet
+    tested as the actual step-5 replacement in a fresh chain, and not
+    yet tested against an ad hoc (system-pool) TaskId. Safe to assume
+    task_id is always available here since every caller already
+    extracts it from initiateCount's response.
+    """
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountRunId": count_run_id,
+        "TaskId": task_id,
+        "CountSequence": 1,
+        "CountMode": "USER_DIRECTED",
+        "LpnTracking": False,
+        "NumberOfLPNs": 0,
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "CriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "CountCriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "TaskIntegrationDTO": {
+            "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+            "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LaborActivityId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LocationId": location_id,
+            "TaskId": task_id,
+        },
+    }
+    response = _post(
+        CYCLE_COUNT_TRIGGER_END_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "triggerEndCount")
 
 
 def search_location_count_info(location_id: str, token: str, org: str, location: str = None) -> Optional[dict]:

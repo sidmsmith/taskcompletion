@@ -36,7 +36,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.12.1"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -236,9 +236,10 @@ def complete_cycle_count_line_route():
     location_id = (data.get("locationId") or data.get("location_id") or "").strip()
     item_id = (data.get("itemId") or data.get("item_id") or "").strip()
     quantity = data.get("quantity")
+    is_tasked = bool(data.get("isTasked") or data.get("is_tasked") or False)
     try:
         result = complete_cycle_count_line(
-            token, org, location_id, item_id, quantity, location=location
+            token, org, location_id, item_id, quantity, location=location, is_tasked=is_tasked
         )
         forward_usage_event(
             {
@@ -288,9 +289,10 @@ def complete_cycle_count_location_route():
     location_id = (data.get("locationId") or data.get("location_id") or "").strip()
     # [{"itemId", "quantity"}, ...] -- every item at the location, 0 valid.
     item_adjustments = data.get("itemAdjustments") or data.get("item_adjustments") or []
+    is_tasked = bool(data.get("isTasked") or data.get("is_tasked") or False)
     try:
         result = complete_cycle_count_location(
-            token, org, location_id, item_adjustments, location=location
+            token, org, location_id, item_adjustments, location=location, is_tasked=is_tasked
         )
         forward_usage_event(
             {

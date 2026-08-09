@@ -92,6 +92,7 @@ from mawm_client import (
     search_task_id_for_container,
     search_task_transactions,
     task_status_description,
+    trigger_end_count,
     validate_item_and_get_item_details,
     validate_storage_location,
     workflow_execute,
@@ -1945,7 +1946,8 @@ def _cycle_count_result_response(
 
 
 def complete_cycle_count_line(
-    token: str, org: str, location_id: str, item_id: str, quantity, location: str = None
+    token: str, org: str, location_id: str, item_id: str, quantity, location: str = None,
+    is_tasked: bool = False,
 ) -> Dict[str, Any]:
     """Runs the full six-call ad hoc Cycle Count chain for one
     location/item pair (ported from the sibling cyclecount app — see
@@ -1995,6 +1997,18 @@ def complete_cycle_count_line(
     so a multi-item accordion may need to serialize its per-item
     completions rather than fire them concurrently; not yet addressed
     here since it needs a real multi-item location to verify against.
+
+    `is_tasked` (2026-08-09, default False — every existing ad hoc
+    caller is unaffected): when True, the final step calls
+    trigger_end_count() instead of end_count(). Confirmed live that
+    trigger_end_count() closes the real WM Task Management record
+    (Status 7000 -> 8000) that end_count() leaves stuck — see
+    mawm_client.trigger_end_count()'s docstring and CLAUDE.md's "Tasked
+    (non-ad-hoc) Cycle Count" section. Not yet exercised through this
+    exact call path end-to-end (that test called trigger_end_count()
+    directly against an already-booked run, not from inside this
+    chain) — needs a real open WM-scheduled Cycle Count task to verify;
+    until then this flag has no live caller.
     """
     location_id = (location_id or "").strip().upper()
     item_id = (item_id or "").strip()
@@ -2041,7 +2055,10 @@ def complete_cycle_count_line(
         return {"success": False, "error": f"persistCountDetails failed: {exc}"}
 
     try:
-        end_count(location_id, count_run_id, token, org, location=dest)
+        if is_tasked:
+            trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
+        else:
+            end_count(location_id, count_run_id, token, org, location=dest)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"endCount failed: {exc}"}
 
@@ -2095,7 +2112,8 @@ def check_cycle_count_status(
 
 
 def complete_cycle_count_location(
-    token: str, org: str, location_id: str, item_adjustments: List[dict], location: str = None
+    token: str, org: str, location_id: str, item_adjustments: List[dict], location: str = None,
+    is_tasked: bool = False,
 ) -> Dict[str, Any]:
     """Atomic multi-item counterpart to complete_cycle_count_line() — for
     a location with more than one distinct item, **every item must be
@@ -2128,6 +2146,11 @@ def complete_cycle_count_location(
     _cycle_count_result_response()) under `results`, plus an overall
     `success` (only True when every item's own `success` is True) and
     the location lock state before/after.
+
+    `is_tasked` — see complete_cycle_count_line()'s docstring; same
+    trigger_end_count() vs end_count() branch at the final step,
+    same "no live caller yet, needs a real open Cycle Count task"
+    caveat.
     """
     location_id = (location_id or "").strip().upper()
     if not location_id:
@@ -2190,7 +2213,10 @@ def complete_cycle_count_location(
             }
 
     try:
-        end_count(location_id, count_run_id, token, org, location=dest)
+        if is_tasked:
+            trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
+        else:
+            end_count(location_id, count_run_id, token, org, location=dest)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"endCount failed: {exc}", "countRunId": count_run_id}
 
