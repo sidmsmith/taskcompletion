@@ -954,3 +954,184 @@ domain `task_status`) drives a vasexecution-style soft-chip badge
 `public/index.html`). Current rule, per explicit instruction: Completed
 and Canceled render red, everything else green — a placeholder, not a
 final design; revisit if the status set needs more granularity later.
+
+## Ad hoc Cycle Count (2026-08-08, ninth session)
+
+First feature outside Putaway. Ported from the sibling `cyclecount` app
+(`C:\Users\ssmith\Personal\Development\work\cyclecount`, v1.3.1) —
+same host/auth, a different MAWM component
+(`inventory-management`/`dcinventory`, not `putaway`/`task`).
+
+**Search-box integration**: the existing "Task Id or iLPN" box now also
+accepts one or more Storage locations (same `;`/`,`/whitespace
+delimiter as the existing multi-search). `public/app.js`'s
+`classifySearchInput()` checks each token against the already-preloaded
+`state.storageLocations` set (see `preloadStorageLocations()`) — all
+tokens recognized as locations → `cycle_count` mode; all
+unrecognized → `task` mode; a mix of both → **Load Task is disabled**
+with an explanatory hint (per explicit instruction: mixing is not
+allowed, not auto-resolved by guessing intent). `state.searchMode`
+drives this at type-time; `state.lastSearchMode` remembers which mode
+the *last successful load* used, so `reloadCurrentSearch()` calls the
+right endpoint.
+
+**Separate results table** (`#cycleCountLinesTable`/`#cycleCountLinesBody`,
+per explicit instruction over conditional columns on the putaway table
+— confirmed live in the browser): columns are Line/Location/Item
+(editable text input)/Description/Qty/Result. The Qty box starts
+genuinely blank (not pre-filled with current on-hand) and is **forced**
+— `isCycleCountQtyValid()` checks the raw string is non-empty before
+`Number()`, so an untouched blank box doesn't silently pass as "0" the
+way `Number("") === 0` would otherwise allow; `0` typed explicitly is
+valid. A location with more than one genuinely distinct item (after
+`resolve_cycle_count_location()`'s ItemId-dedup, see below) renders as
+the same MIXED accordion pattern already used for multi-item no-task
+containers — confirmed live for the single-item case; the accordion
+path for a real multi-item location is unconfirmed (no live example
+found yet).
+
+**Backend**: `task_service.resolve_cycle_count_search_multi()`
+(parallel to `resolve_search_multi()`) → `resolve_cycle_count_location()`
+per location, using `search_location_inventory()` (already existing,
+same `dcinventory` endpoint the old app's `getInventory` called
+directly) for item-from-location lookup.
+
+**Critical fix, confirmed live 2026-08-08**: `resolve_cycle_count_location()`
+**deduplicates by ItemId** — a location can carry more than one raw
+inventory *record* for the same item (`C1CS0110` came back as 4 rows
+all for item `50002236`; same duplicate-record pattern already
+documented for `adjust_location_quantities()`). Without this, the
+first cut of this feature rendered 4 identical duplicate lines with
+colliding keys. One line per distinct ItemId, not one line per row.
+
+### The six-call completion chain, and why the first cut of it was wrong
+
+`task_service.complete_cycle_count_line()` runs `initiateCount` →
+`validateItemAndGetItemDetails` → `acceptQuantity` →
+`persistCountDetails` → `endCount` (`mawm_client.py`'s Cycle Count
+section has each call's payload shape, ported from the old app).
+
+**The first implementation auto-overrode a quantity-mismatch WARNING
+from `acceptQuantity` and reported success** — this looked plausible
+(HTTP 200/201 the whole way through) but was **directly contradicted
+by live testing**: counting `A1AC0114` at 5 when the real on-hand was
+50 reported "Completed" while on-hand silently stayed 50. Same result
+at two more locations, including one that never had any inventory at
+all (`A1AC0117`, counted for the first time — stayed empty). The
+reference `cyclecount` app has the identical payload shape and almost
+certainly shares this exact gap; it apparently was never caught because
+its own success reporting never independently re-verifies the write —
+exactly the trap this whole project's live-verification-over-trusting-
+`success:true` methodology exists to catch.
+
+**Explained by the user, then confirmed live against a real 3-location
+sample file** (`C:\Users\ssmith\OneDrive - Manhattan
+Associates\Desktop\cyc.txt`: `A1AC0123`→240, `A1AC1201`→39,
+`A2AC1201`→10) and a document the user captured
+(`mawm_cycle_count_location_investigation.md`) — this isn't a bug in
+the six-call chain at all. None of those six calls' own HTTP status or
+messages reveal whether a count actually gets applied; MAWM books (or
+doesn't) **asynchronously**, and the real outcome is only observable
+via three separate read-only endpoints, none previously known to any
+app in this workspace:
+
+- `search_location_count_info()` → `POST dcinventory/api/dcinventory/locationCountInfo/search`
+  — the location-level lock flag, `CycleCountPending` (`true` while a
+  count is unresolved, `false` once resolved — "resolved" isn't the
+  same as "succeeded").
+- `search_inventory_count_runs()` → `POST inventory-management/api/inventory-management/inventoryCountRun/search`
+  — every count run ever attempted for a location; each row nests its
+  own `ContainerCount[]`/`InventoryCount[]` detail (the same data
+  `inventoryCountResult` below returns flat).
+- `search_inventory_count_results()` → `POST inventory-management/api/inventory-management/inventoryCountResult/search`
+  — the flat, item-level detail for one `CountRunId`:
+  `OriginalQuantity`/`CountQuantity`/`VarianceQuantity`/`Status` (a
+  human label, not just a code)/`BookingFailureReason`. This is what
+  `complete_cycle_count_line()` polls.
+
+Tested with and without a `Template` on all three — identical full row
+either way; the document's templated field list is the complete set.
+
+**CONFIRMED live, three real outcomes** (the sample file's three
+locations, then reproduced again through the corrected production code
+path on fresh, never-before-touched locations):
+
+1. **Perfect match** (`A1AC0123`: counted 240 = on-hand 240;
+   `A1AC0122`: counted 996 = on-hand 996) — every call clean 2xx, no
+   warning anywhere, books synchronously. `inventoryCountResult.Status:
+   "Booked"`, `StatusKey: "80"`.
+2. **Within tolerance** (`A1AC1201`: counted 39 vs on-hand 41, -2
+   variance) — `acceptQuantity` returns HTTP 400 with `INM::227`
+   ("Quantity mismatch") as a `WARNING` only (no `ERROR`). The count
+   still books, but **asynchronously** — an immediate re-query after
+   `endCount` returns can still show the pre-count value;
+   `complete_cycle_count_line()` polls `inventoryCountResult` up to 5
+   times, 0.6s apart, same posture as Modify iLPN's `endIlpn`
+   elsewhere in this app.
+3. **Out of tolerance** (`A2AC1201`: counted 10 vs on-hand 20, -10
+   variance; `A1AC0127`: counted 890 vs on-hand 898, -8 variance) —
+   `acceptQuantity` returns the same `INM::227` WARNING **plus**
+   `INM::411` ("Recount required") as an `ERROR`. `persistCountDetails`/
+   `endCount` still both report clean success, but the count run parks
+   at `Status: "Pending Booking"` (`StatusKey: "35"`) indefinitely — not
+   an async delay, confirmed by re-checking after a 6-second wait and
+   again minutes later. `locationCountInfo.CycleCountPending` flips
+   `true` and stays there — the location is genuinely locked pending a
+   real human/supervisor booking decision outside this app's reach.
+
+Exact tolerance thresholds are MAWM-side configuration, not something
+this app determines or should try to reverse-engineer — the -8/898
+(~0.9%) case went out-of-tolerance while the -2/41 (~4.9%) case stayed
+within it, so it is **not** a simple percentage cutoff.
+
+`complete_cycle_count_line()` now runs the full six-call chain to
+completion regardless of what any individual step reports (a WARNING
+or ERROR message at validate/accept is not, by itself, treated as
+failure — confirmed live that both still let the chain proceed all the
+way to `endCount` returning 200), then polls for the real outcome.
+`success` is only `True` when the poll finds `Status == "Booked"`;
+`"Pending Booking"` and any other non-Booked status come back as
+`success: False` with the real status, variance, and
+`bookingFailureReason` attached — distinct from an actual chain
+exception (network failure, unparseable response), which still stops
+the chain early and returns a plain error.
+
+The **frontend** (`cycleCountResultText()`/`cycleCountResultKind()`
+in `app.js`) shows three distinct Result-cell states matching this:
+green "Booked: X → Y" (done, inputs disabled), muted/italic "Pending
+supervisor booking… Location locked — not yet applied" (left editable,
+not marked done — a corrected recount is plausible), red for a genuine
+failure. This is backend/data-model work, not the final UI — the user
+is still deciding how to surface this more richly (columns for
+previous/current qty, a location-lock indicator, and — since there's
+no reference to `InventoryCount`/`InventoryCountDetail` records
+anywhere else in this workspace — possibly a dedicated view onto the
+count run/result records themselves). `locationLockedBefore`/
+`locationLockedAfter` are already returned by
+`complete_cycle_count_line()` for exactly that future use.
+
+**Open, unexplained, and deliberately not chased further**:
+`A1AC0124` (an item location with 24+ pre-existing `inventoryCountRun`
+rows already on it — clearly reused/heavily-seeded demo data, not a
+fresh location) produced a count run stuck at `Status: "Count
+Initiated"` (`StatusKey: "20"`, a status not seen anywhere else) with
+a GUID-shaped `TaskId` instead of the `CCNTINM0005xx`-style TaskId
+every other test produced, and never progressed even after several
+minutes. Also seen once: `StatusKey: "95"` on some of that location's
+historical runs, meaning unknown. Given the heavy pre-existing count
+history specific to that one location, this reads as a location-
+specific artifact of the demo data rather than a general behavior —
+not reproduced on any genuinely fresh location — but flagged here
+rather than silently ignored.
+
+**Not yet tested**: a real multi-item location (the accordion path) —
+`complete_cycle_count_line()`'s docstring flags that running two counts
+against the *same* location within seconds of each other can produce a
+genuine `"Booking Failed"` concurrency conflict (`"Cycle count already
+in progress for different inventory read"` — confirmed live, though as
+a side effect of rapid-fire test automation, not normal single-visit
+usage), so a multi-item accordion completing several items at the same
+location may need to serialize its per-item completions rather than
+fire them concurrently. Also not yet built: the tasked (non-ad-hoc)
+Cycle Count flow — explicitly deferred by the user until ad hoc counts
+are solid.

@@ -16,12 +16,14 @@ if str(ROOT) not in sys.path:
 from mawm_client import TASK_TYPES, get_manhattan_token, normalize_token, validate_org  # noqa: E402
 from task_service import (  # noqa: E402
     complete_container_putaway,
+    complete_cycle_count_line,
     complete_line,
     complete_putaway_line,
     preload_adjustment_reason_codes,
     preload_putaway_locations,
     preload_putaway_reason_codes,
     preload_task_transactions,
+    resolve_cycle_count_search_multi,
     resolve_search_multi,
     validate_putaway_location,
 )
@@ -31,7 +33,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.10.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -187,6 +189,69 @@ def load_task_route():
                 "error": str(e),
             }
         )
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/search_cycle_count", methods=["POST"])
+def search_cycle_count_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    # One or more Storage locations, same ";"/","/whitespace delimiter
+    # convention as the Task Id/iLPN box — see
+    # resolve_cycle_count_search_multi()'s docstring.
+    search_value = (data.get("locations") or data.get("locationIds") or "").strip()
+    try:
+        result = resolve_cycle_count_search_multi(token, org, search_value, location=location)
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "search_cycle_count_completed"
+                if result.get("success")
+                else "search_cycle_count_failed",
+                "org": org,
+                "searchValue": search_value,
+                "groupCount": len(result.get("groups") or []),
+            }
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[SEARCH_CYCLE_COUNT] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/complete_cycle_count_line", methods=["POST"])
+def complete_cycle_count_line_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    location_id = (data.get("locationId") or data.get("location_id") or "").strip()
+    item_id = (data.get("itemId") or data.get("item_id") or "").strip()
+    quantity = data.get("quantity")
+    try:
+        result = complete_cycle_count_line(
+            token, org, location_id, item_id, quantity, location=location
+        )
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "complete_cycle_count_line_completed"
+                if result.get("success")
+                else "complete_cycle_count_line_failed",
+                "org": org,
+                "locationId": location_id,
+                "itemId": item_id,
+            }
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[COMPLETE_CYCLE_COUNT_LINE] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

@@ -54,6 +54,8 @@ from typing import Any, Dict, List, Optional
 
 from mawm_client import (
     ADJUSTMENT_REASON_CODES,
+    CYCLE_COUNT_QUANTITY_MISMATCH_TEXT,
+    CYCLE_COUNT_TRANSACTION_ID,
     DEFAULT_ADJUSTMENT_REASON_CODE,
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
     ILPN_CONSUMED_STATUS,
@@ -61,28 +63,35 @@ from mawm_client import (
     PUTAWAY_WORKFLOW_SCRIPT_NAME,
     TASK_TYPE_LABELS,
     USER_DIRECTED_TRANSACTION_ID,
+    accept_quantity,
     adjust_ilpn_inventory,
     adjust_location_inventory,
     apply_warning_overrides,
     commit_putaway_move,
     complete_task,
+    end_count,
     extract_message,
     extract_warning,
     fetch_putaway_move,
     ilpn_status_description,
+    initiate_count,
+    persist_count_details,
     refresh_ilpn_read_timestamp,
     resolve_location,
     search_all_storage_locations,
     search_container_inventory,
     search_ilpn_current_location,
     search_ilpn_statuses,
+    search_inventory_count_results,
     search_items,
+    search_location_count_info,
     search_location_inventory,
     search_putaway_reason_codes,
     search_task,
     search_task_id_for_container,
     search_task_transactions,
     task_status_description,
+    validate_item_and_get_item_details,
     validate_storage_location,
     workflow_execute,
     workflow_init,
@@ -1561,3 +1570,355 @@ def validate_putaway_location(
         "locationId": str(row.get("LocationId") or ""),
         "displayLocation": str(row.get("DisplayLocation") or row.get("LocationId") or ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Ad hoc Cycle Count (2026-08-08, ninth session) — ported from the sibling
+# `cyclecount` app's own six-call chain (see mawm_client.py's Cycle Count
+# section for per-call docstrings and the exact source it was ported
+# from). Mirrors resolve_search()/resolve_search_multi()'s architecture:
+# one group per Storage location, one line per item found there (more
+# than one item -> the frontend renders the same "MIXED" accordion
+# pattern already built for multi-item no-task containers, per explicit
+# instruction). Quantity always starts blank/None regardless of current
+# on-hand -- the count must be entered fresh, per explicit instruction.
+# ---------------------------------------------------------------------------
+
+
+def _extract_count_run_id(body: dict) -> str:
+    """initiateCount's CountRunId lands in one of several response
+    shapes across MAWM orgs -- the old cyclecount app defensively
+    checks all of them; ported verbatim rather than guessing which one
+    this org actually uses.
+    """
+    if not isinstance(body, dict):
+        return ""
+    for key in ("CountRunId", "countRunId"):
+        val = body.get(key)
+        if val:
+            return str(val)
+    for container_key in ("data", "Data"):
+        inner = body.get(container_key)
+        if isinstance(inner, dict):
+            for key in ("CountRunId", "countRunId"):
+                val = inner.get(key)
+                if val:
+                    return str(val)
+    return ""
+
+
+def _extract_count_task_id(body: dict) -> str:
+    """Same defensive multi-shape extraction as _extract_count_run_id(), for TaskId."""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("TaskId", "taskId"):
+        val = body.get(key)
+        if val:
+            return str(val)
+    for container_key in ("data", "Data"):
+        inner = body.get(container_key)
+        if isinstance(inner, dict):
+            for key in ("TaskId", "taskId"):
+                val = inner.get(key)
+                if val:
+                    return str(val)
+    return ""
+
+
+def resolve_cycle_count_location(
+    token: str, org: str, location_id: str, location: str = None
+) -> Dict[str, Any]:
+    """Builds one cycle-count group for a single Storage location — the
+    ad hoc counterpart to resolve_search()'s task/no_task branches.
+    Item-from-location lookup reuses search_location_inventory() (the
+    same dcinventory endpoint the old cyclecount app calls directly, so
+    no new client function was needed for it).
+
+    **Deduplicates by ItemId** — confirmed live, 2026-08-08: a location
+    can carry more than one raw inventory *record* for the very same
+    item (the same duplicate-record pattern already documented for
+    adjust_location_quantities() — distinguishing attributes like batch/
+    lot, not a genuinely different item). `C1CS0110` came back as 4 rows
+    all for item `50002236`. One line per distinct ItemId, not one line
+    per raw row — a physical cycle count is "how much of this item is
+    here," not "how many system records exist for it." The MIXED-style
+    accordion (multiple lines under one location) is reserved for
+    genuinely different items at the same location, per explicit
+    instruction.
+    """
+    location_id = (location_id or "").strip().upper()
+    if not location_id:
+        return {"success": False, "error": "Location required"}
+
+    dest = resolve_location(org, location)
+    raw_rows = search_location_inventory(location_id, token, org, location=dest)
+    seen_item_ids = set()
+    rows: List[dict] = []
+    for row in raw_rows:
+        item_id = str(row.get("ItemId") or "")
+        if item_id and item_id not in seen_item_ids:
+            seen_item_ids.add(item_id)
+            rows.append(row)
+    item_ids = [str(r.get("ItemId") or "") for r in rows if r.get("ItemId")]
+    items = search_items(item_ids, token, org, location=dest) if item_ids else {}
+
+    lines: List[Dict[str, Any]] = []
+    if not rows:
+        lines.append(
+            {
+                "lineNumber": 1,
+                "taskDetailId": f"cyclecount:{location_id}:",
+                "locationId": location_id,
+                "itemId": "",
+                "description": "",
+                "quantity": None,
+            }
+        )
+    else:
+        for idx, row in enumerate(rows, start=1):
+            item_id = str(row.get("ItemId") or "")
+            item = items.get(item_id) or {}
+            lines.append(
+                {
+                    "lineNumber": idx,
+                    "taskDetailId": f"cyclecount:{location_id}:{item_id}",
+                    "locationId": location_id,
+                    "itemId": item_id,
+                    "description": str(item.get("Description") or ""),
+                    "quantity": None,
+                }
+            )
+
+    return {
+        "success": True,
+        "mode": "cycle_count",
+        "locationId": location_id,
+        "facility": dest,
+        "taskType": "CYCLE_COUNT",
+        "taskTypeLabel": "Cycle Count",
+        "taskStatus": "",
+        "taskStatusLabel": "Not Started",
+        "taskTransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "lineCount": len(lines),
+        "lines": lines,
+    }
+
+
+_CYCLE_COUNT_SPLIT_RE = _MULTI_SEARCH_SPLIT_RE
+
+
+def resolve_cycle_count_search_multi(
+    token: str, org: str, raw_locations: str, location: str = None
+) -> Dict[str, Any]:
+    """Multi-location counterpart to resolve_search_multi() — same
+    delimiter convention (";", ",", whitespace), one group per location,
+    denormalized the same way onto each line so the frontend can treat
+    the combined line list as flat.
+    """
+    tokens: List[str] = []
+    seen = set()
+    for raw_token in _CYCLE_COUNT_SPLIT_RE.split(raw_locations or ""):
+        token_value = raw_token.strip().upper()
+        if token_value and token_value not in seen:
+            seen.add(token_value)
+            tokens.append(token_value)
+
+    if not tokens:
+        return {"success": False, "error": "Storage location required"}
+
+    dest = resolve_location(org, location)
+    groups: List[Dict[str, Any]] = []
+    not_found: List[str] = []
+    for token_value in tokens:
+        result = resolve_cycle_count_location(token, org, token_value, location=dest)
+        if not result.get("success"):
+            not_found.append(token_value)
+            continue
+        group_key = f"cycle_count:{result['locationId']}"
+        for line in result.get("lines") or []:
+            line["groupKey"] = group_key
+            line["groupMode"] = "cycle_count"
+            line["groupLocationId"] = result["locationId"]
+            line["groupTaskStatus"] = result.get("taskStatus", "")
+            line["groupTaskStatusLabel"] = result.get("taskStatusLabel", "")
+        result["groupKey"] = group_key
+        groups.append(result)
+
+    if not groups:
+        return {
+            "success": False,
+            "error": f"No valid Storage location found for: {', '.join(not_found)}",
+        }
+
+    line_count = sum(len(g.get("lines") or []) for g in groups)
+    return {
+        "success": True,
+        "facility": dest,
+        "groups": groups,
+        "lineCount": line_count,
+        "notFound": not_found,
+    }
+
+
+def complete_cycle_count_line(
+    token: str, org: str, location_id: str, item_id: str, quantity, location: str = None
+) -> Dict[str, Any]:
+    """Runs the full six-call ad hoc Cycle Count chain for one
+    location/item pair (ported from the sibling cyclecount app — see
+    mawm_client.py's Cycle Count section for the per-call docstrings):
+    initiateCount -> validateItemAndGetItemDetails -> acceptQuantity ->
+    persistCountDetails -> endCount.
+
+    **Revised 2026-08-08 after live investigation** (see
+    mawm_cycle_count_location_investigation.md, user-captured) — none of
+    these six calls' own HTTP status/messages reveal whether the count
+    actually got applied. MAWM runs three real outcomes, invisible until
+    polled afterward:
+      - Perfect match: books synchronously, no warning anywhere.
+      - Within tolerance: acceptQuantity returns a WARNING (INM::227
+        "Quantity mismatch") but the count still books — ASYNCHRONOUSLY,
+        confirmed live to take a moment (the same posture as Modify
+        iLPN's endIlpn elsewhere in this app).
+      - Out of tolerance: acceptQuantity returns that same WARNING plus
+        an ERROR (INM::411 "Recount required"); persistCountDetails/
+        endCount still both report success, but the count run parks in
+        "Pending Booking" forever — a real human/supervisor decision
+        outside this app, not something that resolves on its own.
+    So this now runs the chain to completion regardless of what any
+    individual step reports (a WARNING or ERROR message at validate/
+    accept is not, by itself, treated as failure — confirmed live that
+    both still let the chain proceed), then polls
+    search_inventory_count_results() for the real, authoritative
+    outcome. Only a call that genuinely raises (network failure,
+    unparseable non-2xx body) stops the chain early.
+
+    Returns the full count-result row's fields (previousQty/countedQty/
+    varianceQty/status/bookingFailureReason) so the caller has real data
+    to show, not just success/failure — `success` is only True when the
+    poll finds `Status == "Booked"`; "Pending Booking" (out of
+    tolerance, awaiting supervisor booking) and "Booking Failed"/
+    "Booking Rejected" all come back as `success: False` with the real
+    status and reason attached, distinct from an actual chain error.
+
+    Each line runs its own independent chain (its own initiateCount/
+    endCount) — including each item within a multi-item location's
+    accordion. **Not yet confirmed live** whether MAWM tolerates
+    re-initiating a count against the same location back to back for a
+    second/third item — confirmed live this session that running two
+    counts against the *same* location within seconds of each other can
+    produce a genuine "Booking Failed" concurrency conflict
+    ("Cycle count already in progress for different inventory read"),
+    so a multi-item accordion may need to serialize its per-item
+    completions rather than fire them concurrently; not yet addressed
+    here since it needs a real multi-item location to verify against.
+    """
+    location_id = (location_id or "").strip().upper()
+    item_id = (item_id or "").strip()
+    if not location_id or not item_id:
+        return {"success": False, "error": "Location and Item are required"}
+    if quantity is None:
+        return {"success": False, "error": "Quantity is required"}
+
+    dest = resolve_location(org, location)
+
+    try:
+        info_before = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info_before = None
+    locked_before = bool(info_before and info_before.get("CycleCountPending"))
+
+    try:
+        initiate = initiate_count(location_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"initiateCount failed: {exc}"}
+    if not (200 <= int(initiate.get("_httpStatus") or 0) < 300):
+        return {"success": False, "error": extract_message(initiate) or "initiateCount failed"}
+    count_run_id = _extract_count_run_id(initiate)
+    task_id = _extract_count_task_id(initiate)
+    if not count_run_id or not task_id:
+        return {
+            "success": False,
+            "error": "initiateCount did not return a CountRunId/TaskId",
+        }
+
+    try:
+        validate_item_and_get_item_details(location_id, count_run_id, item_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"validateItemAndGetItemDetails failed: {exc}"}
+
+    try:
+        accept_quantity(location_id, count_run_id, task_id, item_id, quantity, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"acceptQuantity failed: {exc}"}
+
+    try:
+        persist_count_details(location_id, count_run_id, task_id, item_id, quantity, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"persistCountDetails failed: {exc}"}
+
+    try:
+        end_count(location_id, count_run_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"endCount failed: {exc}"}
+
+    # Booking is asynchronous for anything other than a perfect match —
+    # poll a few times with a brief wait rather than trusting the chain
+    # alone (confirmed live: an immediate re-query can still show the
+    # pre-count value even for a count that books moments later).
+    result_row = None
+    for _ in range(5):
+        time.sleep(0.6)
+        try:
+            rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+        except Exception:  # noqa: BLE001
+            rows = []
+        row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
+        result_row = row
+        if row and str(row.get("Status") or "") != "Pending Booking":
+            break
+
+    try:
+        info_after = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info_after = None
+    locked_after = bool(info_after and info_after.get("CycleCountPending"))
+
+    if result_row is None:
+        return {
+            "success": False,
+            "error": "Could not retrieve the count result after completion",
+            "locationId": location_id,
+            "itemId": item_id,
+            "countRunId": count_run_id,
+            "locationLockedBefore": locked_before,
+            "locationLockedAfter": locked_after,
+        }
+
+    status_label = str(result_row.get("Status") or "")
+    booked = status_label == "Booked"
+    response = {
+        "success": booked,
+        "locationId": location_id,
+        "itemId": item_id,
+        "countRunId": count_run_id,
+        "status": status_label,
+        "statusKey": str(result_row.get("StatusKey") or ""),
+        "previousQty": result_row.get("OriginalQuantity"),
+        "countedQty": result_row.get("CountQuantity"),
+        "varianceQty": result_row.get("VarianceQuantity"),
+        "bookingFailureReason": result_row.get("BookingFailureReason"),
+        "locationLockedBefore": locked_before,
+        "locationLockedAfter": locked_after,
+    }
+    if not booked:
+        if status_label == "Pending Booking":
+            response["error"] = (
+                "Out of tolerance — pending supervisor booking. "
+                "Location is locked; inventory not yet updated."
+            )
+        else:
+            response["error"] = (
+                result_row.get("BookingFailureReason")
+                or f"Count not booked (status: {status_label or 'unknown'})"
+            )
+    return response

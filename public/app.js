@@ -12,9 +12,20 @@
     // needs to cross-reference back into `groups` for a given row.
     groups: [],
     lastSearchValue: "", // raw search box text, re-used to refresh after a completion
+    lastSearchMode: "task", // which endpoint/table the last successful load used — see reloadCurrentSearch()
     selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
     adjustmentReasonCodes: null, // [{key,value}] once preloaded, see preloadAdjustmentReasonCodes()
+    // "task" (Task Id/iLPN search, the existing #linesTable) or
+    // "cycle_count" (Storage location search, the separate
+    // #cycleCountLinesTable — per explicit instruction, ad hoc Cycle
+    // Count gets its own table rather than conditional columns on the
+    // putaway one, since the two have almost nothing in common: no LPN,
+    // no To Location, no planned/completed distinction, and Item is
+    // editable here when it isn't anywhere else). Set by
+    // classifySearchInput() before a search even runs, so the Load
+    // button can already gate on it.
+    searchMode: "task",
   };
 
   function allLines() {
@@ -93,6 +104,8 @@
     taskMeta: document.getElementById("taskMeta"),
     linesTable: document.getElementById("linesTable"),
     linesBody: document.getElementById("linesBody"),
+    cycleCountLinesTable: document.getElementById("cycleCountLinesTable"),
+    cycleCountLinesBody: document.getElementById("cycleCountLinesBody"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
     actionStatus: document.getElementById("actionStatus"),
@@ -178,13 +191,52 @@
     return escapeHtml(s);
   }
 
+  const SEARCH_INPUT_SPLIT_RE = /[;,\s]+/;
+
+  /**
+   * Classifies the search box's raw text as "task" (Task Id/iLPN
+   * tokens), "cycle_count" (all tokens are recognized Storage
+   * locations), "empty", or "mixed" — mixing a location with a Task Id/
+   * iLPN in the same search is disallowed outright (2026-08-08, per
+   * explicit instruction: "the prompt should not allow both lpns, and
+   * locations. if both are entered, then the load button should be
+   * disabled") rather than guessing which one the user meant.
+   *
+   * Relies on state.storageLocations (see preloadStorageLocations()) to
+   * recognize a location token; before that preload resolves, every
+   * token is treated as "task" (same fallback posture
+   * validateLocation() already uses elsewhere) since there's nothing
+   * yet to check a location against.
+   */
+  function classifySearchInput(value) {
+    const tokens = String(value || "")
+      .split(SEARCH_INPUT_SPLIT_RE)
+      .map((t) => t.trim().toUpperCase())
+      .filter(Boolean);
+    if (!tokens.length) return "empty";
+    if (!state.storageLocations) return "task";
+    const isLocation = (t) => state.storageLocations.has(t);
+    const hasLocation = tokens.some(isLocation);
+    const hasOther = tokens.some((t) => !isLocation(t));
+    if (hasLocation && hasOther) return "mixed";
+    return hasLocation ? "cycle_count" : "task";
+  }
+
   function updateLoadButton() {
     const value = el.taskIdInput.value.trim();
-    el.loadTaskBtn.disabled = !value;
+    const kind = classifySearchInput(value);
+    state.searchMode = kind === "cycle_count" ? "cycle_count" : "task";
+    el.loadTaskBtn.disabled = kind === "empty" || kind === "mixed";
     if (!state.token) {
       el.matchHint.textContent = "Authenticate to begin.";
-    } else if (!value) {
-      el.matchHint.textContent = "Scan or type a Task Id or iLPN — separate multiple with ; , or a space.";
+    } else if (kind === "empty") {
+      el.matchHint.textContent =
+        "Scan or type a Task Id, iLPN, or Storage Location — separate multiple with ; , or a space.";
+    } else if (kind === "mixed") {
+      el.matchHint.textContent =
+        "Enter either Task Ids/iLPNs or Storage Locations, not both — Load Task is disabled until this is one or the other.";
+    } else if (kind === "cycle_count") {
+      el.matchHint.textContent = "Press Enter or click Load Task to start an ad hoc Cycle Count.";
     } else {
       el.matchHint.textContent = "Press Enter or click Load Task.";
     }
@@ -436,6 +488,8 @@
 
   function renderGroups() {
     state.selectedTaskDetailId = null;
+    el.cycleCountLinesTable.style.display = "none";
+    el.linesTable.style.display = "";
     renderTaskMeta();
     const multiGroup = state.groups.length > 1;
     el.linesTable.classList.toggle("multi-group", multiGroup);
@@ -812,6 +866,335 @@
     updateLineActionButtons();
   }
 
+  // ---------------------------------------------------------------------
+  // Ad hoc Cycle Count (2026-08-08, ninth session) — its own table
+  // (#cycleCountLinesTable, per explicit instruction) and its own
+  // parallel set of render/select/validate/complete functions rather
+  // than branching the putaway ones above, since almost nothing about a
+  // cycle count line resembles a putaway line: no location override, no
+  // reason code, no remaining-quantity concept, and no confirm-warning
+  // modal (a quantity-mismatch warning is auto-overridden server-side —
+  // see task_service.complete_cycle_count_line()). Reuses
+  // state.groups/allLines()/state.selectedTaskDetailId/
+  // getLineByTaskDetailId() as-is — a taskDetailId is unique regardless
+  // of mode, and the two modes are never loaded at the same time (see
+  // classifySearchInput()).
+  // ---------------------------------------------------------------------
+
+  function cycleCountLineRowHtml(line, isSubRow) {
+    const rowClass = isSubRow ? "mixed-item-row" : "cc-line-row line-row";
+    const extraAttrs = isSubRow
+      ? ` data-mixed-parent="${escapeAttr(line.groupKey)}" style="display:none"`
+      : "";
+    return `
+        <tr class="${rowClass}" data-task-detail-id="${escapeAttr(line.taskDetailId)}"${extraAttrs}>
+          <td>${isSubRow ? "" : escapeHtml(line.lineNumber)}</td>
+          <td>${isSubRow ? "" : escapeHtml(line.locationId)}</td>
+          <td>
+            <input
+              type="text"
+              class="form-control cc-item-input"
+              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              value="${escapeAttr(line.itemId)}"
+              autocomplete="off"
+            />
+          </td>
+          <td>${escapeHtml(line.description)}</td>
+          <td class="col-qty-wide">
+            <input
+              type="number"
+              class="form-control cc-qty-input invalid"
+              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              value=""
+              step="any"
+            />
+          </td>
+          <td class="col-reason cc-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
+        </tr>`;
+  }
+
+  /**
+   * A location with more than one genuinely distinct item (see
+   * task_service.resolve_cycle_count_location()'s ItemId-dedup
+   * docstring — this is only reachable for real different items, never
+   * duplicate records for the same one) renders as the same MIXED
+   * accordion pattern already used for multi-item no-task containers,
+   * per explicit instruction. Unlike that case, the summary row here
+   * has no completable entity of its own (there's no single aggregate
+   * to count across different items) — only the expanded sub-rows are
+   * ever selectable/completable.
+   */
+  function cycleCountGroupRowsHtml(group) {
+    const lines = group.lines || [];
+    if (lines.length <= 1) {
+      return lines.map((line) => cycleCountLineRowHtml(line, false)).join("");
+    }
+    const groupKey = group.groupKey;
+    const summaryRow = `
+        <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}">
+          <td>${escapeHtml(lines[0].lineNumber)}</td>
+          <td>${escapeHtml(group.locationId)}</td>
+          <td colspan="4">
+            <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(groupKey)}">
+              <i class="fas fa-caret-right"></i> MIXED (${lines.length} items)
+            </button>
+          </td>
+        </tr>`;
+    const itemRows = lines.map((line) => cycleCountLineRowHtml(line, true)).join("");
+    return summaryRow + itemRows;
+  }
+
+  function renderCycleCountTaskMeta() {
+    const groups = state.groups;
+    if (groups.length === 1) {
+      el.taskMeta.innerHTML = `<span><strong>Location</strong> ${escapeHtml(groups[0].locationId)}</span>`;
+    } else {
+      el.taskMeta.innerHTML = `<span><strong>${groups.length} locations loaded</strong></span>`;
+    }
+    el.transactionIdValue.textContent = "Cycle Count Active-API";
+  }
+
+  function renderCycleCountGroups() {
+    state.selectedTaskDetailId = null;
+    el.linesTable.style.display = "none";
+    el.cycleCountLinesTable.style.display = "";
+    renderCycleCountTaskMeta();
+    el.cycleCountLinesBody.innerHTML = state.groups.map((g) => cycleCountGroupRowsHtml(g)).join("");
+    updateCycleCountLineActionButtons();
+  }
+
+  function getCycleCountQtyInput(taskDetailId) {
+    return el.cycleCountLinesBody.querySelector(
+      '.cc-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+  }
+
+  function getCycleCountItemInput(taskDetailId) {
+    return el.cycleCountLinesBody.querySelector(
+      '.cc-item-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+  }
+
+  /**
+   * Qty must be an explicitly entered number — including 0 — not just
+   * "non-blank" (2026-08-08, per explicit instruction: "the qty should
+   * be empty and be forced to enter a number, even if 0"). A blank
+   * input's `.value` is the empty string, which Number() coerces to 0,
+   * so the raw string is checked first — otherwise an untouched box
+   * would silently pass as a real "0" entry.
+   */
+  function isCycleCountQtyValid(taskDetailId) {
+    const input = getCycleCountQtyInput(taskDetailId);
+    if (!input) return false;
+    const raw = input.value.trim();
+    if (raw === "") return false;
+    return Number.isFinite(Number(raw));
+  }
+
+  function isCycleCountItemValid(taskDetailId) {
+    const input = getCycleCountItemInput(taskDetailId);
+    return !!input && !!input.value.trim();
+  }
+
+  function validateCycleCountQty(input) {
+    const raw = input.value.trim();
+    const valid = raw !== "" && Number.isFinite(Number(raw));
+    input.classList.toggle("invalid", !valid);
+    updateCycleCountLineActionButtons();
+  }
+
+  function isCycleCountLineDone(line) {
+    const resultCell = el.cycleCountLinesBody.querySelector(
+      '.cc-result[data-task-detail-id="' + CSS.escape(String(line.taskDetailId)) + '"]'
+    );
+    return !!resultCell && resultCell.dataset.done === "true";
+  }
+
+  function allOutstandingCycleCountLines() {
+    return allLines().filter((l) => !isCycleCountLineDone(l));
+  }
+
+  function allOutstandingCycleCountLinesValid() {
+    const outstanding = allOutstandingCycleCountLines();
+    if (!outstanding.length) return true; // let the click through to show "nothing to do"
+    return outstanding.every(
+      (l) => isCycleCountItemValid(l.taskDetailId) && isCycleCountQtyValid(l.taskDetailId)
+    );
+  }
+
+  function getSelectedCycleCountLine() {
+    if (state.selectedTaskDetailId === null) return null;
+    return getLineByTaskDetailId(state.selectedTaskDetailId);
+  }
+
+  function updateCycleCountLineActionButtons() {
+    const selectedLine = getSelectedCycleCountLine();
+    const hasSelection = !!selectedLine;
+    const selectedValid =
+      hasSelection &&
+      !isCycleCountLineDone(selectedLine) &&
+      isCycleCountItemValid(selectedLine.taskDetailId) &&
+      isCycleCountQtyValid(selectedLine.taskDetailId);
+    el.fullLineBtn.disabled = !hasSelection || !selectedValid;
+    el.allLinesBtn.disabled = !allOutstandingCycleCountLinesValid();
+  }
+
+  function selectCycleCountLine(taskDetailId) {
+    state.selectedTaskDetailId = taskDetailId;
+    el.cycleCountLinesBody.querySelectorAll("tr.cc-line-row, tr.mixed-item-row").forEach((row) => {
+      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
+    });
+    updateCycleCountLineActionButtons();
+  }
+
+  function setCycleCountResultCell(taskDetailId, message, kind, done) {
+    const cell = el.cycleCountLinesBody.querySelector(
+      '.cc-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (!cell) return;
+    cell.textContent = message;
+    cell.className = "col-reason cc-result" + (kind ? " " + kind : "");
+    cell.dataset.done = done ? "true" : "false";
+    if (done) {
+      const qtyInput = getCycleCountQtyInput(taskDetailId);
+      const itemInput = getCycleCountItemInput(taskDetailId);
+      if (qtyInput) qtyInput.disabled = true;
+      if (itemInput) itemInput.disabled = true;
+    }
+  }
+
+  async function completeCycleCountLineAction(line) {
+    const itemInput = getCycleCountItemInput(line.taskDetailId);
+    const qtyInput = getCycleCountQtyInput(line.taskDetailId);
+    const itemId = itemInput ? itemInput.value.trim() : line.itemId;
+    const quantity = qtyInput ? Number(qtyInput.value) : null;
+    return api("complete_cycle_count_line", {
+      org: state.org,
+      token: state.token,
+      location: state.facility,
+      locationId: line.locationId,
+      itemId,
+      quantity,
+    });
+  }
+
+  /**
+   * The real outcome (2026-08-08, revised after live investigation —
+   * see task_service.complete_cycle_count_line()'s docstring) is one of
+   * three cases, not just success/failure: booked (applied), pending
+   * supervisor booking (out of tolerance — the location is locked, not
+   * an error exactly, but not applied either), or a genuine failure. A
+   * "Pending Booking" result leaves the row retryable (not marked
+   * done) since it's plausible the count itself should be re-entered,
+   * not just resubmitted as-is.
+   */
+  function cycleCountResultText(result) {
+    if (result.status === "Pending Booking") {
+      return (
+        "Pending supervisor booking (out of tolerance): was " + result.previousQty +
+        ", counted " + result.countedQty + " (variance " + result.varianceQty +
+        "). Location locked — not yet applied."
+      );
+    }
+    if (result.success) {
+      const varied = Number(result.varianceQty) ? " (variance " + result.varianceQty + ")" : "";
+      return "Booked: " + result.previousQty + " → " + result.countedQty + varied;
+    }
+    return result.bookingFailureReason || result.error || "Failed";
+  }
+
+  function cycleCountResultKind(result) {
+    if (result.success) return "success";
+    if (result.status === "Pending Booking") return "pending";
+    return "error";
+  }
+
+  async function completeCycleCountLine() {
+    const line = getSelectedCycleCountLine();
+    if (!line) return;
+    if (isCycleCountLineDone(line)) return;
+    setBusy(true, "Completing line " + line.lineNumber + "…");
+    try {
+      const result = await completeCycleCountLineAction(line);
+      const kind = cycleCountResultKind(result);
+      setCycleCountResultCell(line.taskDetailId, cycleCountResultText(result), kind, result.success);
+      if (!result.success) {
+        setActionStatus(result.error || "Complete failed", kind === "pending" ? "" : "error");
+        return;
+      }
+      setActionStatus("Completed line " + line.lineNumber + ".", "success");
+      updateCycleCountLineActionButtons();
+    } catch (e) {
+      setCycleCountResultCell(line.taskDetailId, e.message || String(e), "error", false);
+      setActionStatus(e.message || String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  let allCycleCountLinesPending = [];
+
+  function openAllCycleCountLinesModal() {
+    allCycleCountLinesPending = allOutstandingCycleCountLines();
+    if (!allCycleCountLinesPending.length) {
+      setActionStatus("No outstanding lines to complete.", "");
+      return;
+    }
+    if (!allOutstandingCycleCountLinesValid()) {
+      setActionStatus("Enter an Item and Qty for every line before completing all.", "error");
+      return;
+    }
+    const multiGroup = state.groups.length > 1;
+    el.allLinesList.innerHTML = allCycleCountLinesPending
+      .map((l) => {
+        const groupPrefix = multiGroup ? "Location " + l.locationId + " — " : "";
+        const itemInput = getCycleCountItemInput(l.taskDetailId);
+        const qtyInput = getCycleCountQtyInput(l.taskDetailId);
+        const itemId = itemInput ? itemInput.value.trim() : l.itemId;
+        const qty = qtyInput ? qtyInput.value : "";
+        return (
+          "<li>" + escapeHtml(groupPrefix) + "Line " + escapeHtml(l.lineNumber) + " — " +
+          escapeHtml(itemId) + ": " + escapeHtml(qty) + "</li>"
+        );
+      })
+      .join("");
+    allLinesModal.show();
+  }
+
+  async function confirmAllCycleCountLines() {
+    allLinesModal.hide();
+    const total = allCycleCountLinesPending.length;
+    let succeeded = 0;
+    const failures = [];
+    for (let i = 0; i < total; i++) {
+      const line = allCycleCountLinesPending[i];
+      setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
+      try {
+        const result = await completeCycleCountLineAction(line);
+        const kind = cycleCountResultKind(result);
+        setCycleCountResultCell(line.taskDetailId, cycleCountResultText(result), kind, result.success);
+        if (result.success) {
+          succeeded++;
+        } else {
+          failures.push("Line " + line.lineNumber + ": " + (result.error || "failed"));
+        }
+      } catch (e) {
+        failures.push("Line " + line.lineNumber + ": " + (e.message || String(e)));
+        setCycleCountResultCell(line.taskDetailId, e.message || String(e), "error", false);
+      }
+    }
+    setBusy(false);
+    updateCycleCountLineActionButtons();
+    if (!failures.length) {
+      setActionStatus("Completed " + fmtCount(succeeded, "line") + ".", "success");
+    } else {
+      setActionStatus(
+        "Completed " + succeeded + " of " + total + " lines. Issues: " + failures.join("; "),
+        "error"
+      );
+    }
+  }
+
   function showResults() {
     el.filtersScreen.classList.remove("active");
     el.resultsScreen.classList.add("active");
@@ -845,7 +1228,32 @@
     }
     state.groups = data.groups || [];
     state.lastSearchValue = searchValue;
+    state.lastSearchMode = "task";
     renderGroups();
+    let statusText = fmtCount(allLines().length, "line");
+    if (data.notFound && data.notFound.length) {
+      statusText += " — not found: " + data.notFound.join(", ");
+    }
+    el.resultsStatus.textContent = statusText;
+    return true;
+  }
+
+  /** Cycle-count counterpart to fetchAndRenderTask() — same shape, different endpoint/table. */
+  async function fetchAndRenderCycleCount(searchValue) {
+    const data = await api("search_cycle_count", {
+      org: state.org,
+      token: state.token,
+      location: state.facility,
+      locations: searchValue,
+    });
+    if (!data.success) {
+      setStatus(data.error || "Load failed", "error");
+      return false;
+    }
+    state.groups = data.groups || [];
+    state.lastSearchValue = searchValue;
+    state.lastSearchMode = "cycle_count";
+    renderCycleCountGroups();
     let statusText = fmtCount(allLines().length, "line");
     if (data.notFound && data.notFound.length) {
       statusText += " — not found: " + data.notFound.join(", ");
@@ -865,7 +1273,10 @@
     // reloadCurrentSearch()).
     setActionStatus("");
     try {
-      const ok = await fetchAndRenderTask(searchValue);
+      const ok =
+        state.searchMode === "cycle_count"
+          ? await fetchAndRenderCycleCount(searchValue)
+          : await fetchAndRenderTask(searchValue);
       if (ok) showResults();
     } catch (e) {
       setStatus(e.message || String(e), "error");
@@ -887,7 +1298,11 @@
   /** Re-runs the same raw search text to refresh everything currently loaded. */
   async function reloadCurrentSearch() {
     if (!state.lastSearchValue) return;
-    await fetchAndRenderTask(state.lastSearchValue);
+    if (state.lastSearchMode === "cycle_count") {
+      await fetchAndRenderCycleCount(state.lastSearchValue);
+    } else {
+      await fetchAndRenderTask(state.lastSearchValue);
+    }
   }
 
   function getSelectedLine() {
@@ -1308,9 +1723,48 @@
   const reasonCodeModalEl = document.getElementById("reasonCodeModal");
   const reasonCodeModal = window.bootstrap ? new window.bootstrap.Modal(reasonCodeModalEl) : null;
 
-  el.fullLineBtn.addEventListener("click", completeLine);
-  el.allLinesBtn.addEventListener("click", openAllLinesModal);
-  el.allLinesConfirmBtn.addEventListener("click", confirmAllLines);
+  el.fullLineBtn.addEventListener("click", () => {
+    if (state.lastSearchMode === "cycle_count") completeCycleCountLine();
+    else completeLine();
+  });
+  el.allLinesBtn.addEventListener("click", () => {
+    if (state.lastSearchMode === "cycle_count") openAllCycleCountLinesModal();
+    else openAllLinesModal();
+  });
+  el.allLinesConfirmBtn.addEventListener("click", () => {
+    if (state.lastSearchMode === "cycle_count") confirmAllCycleCountLines();
+    else confirmAllLines();
+  });
+
+  el.cycleCountLinesBody.addEventListener("click", (e) => {
+    const toggle = e.target.closest(".mixed-toggle");
+    if (toggle) {
+      const target = toggle.dataset.mixedTarget;
+      const expanded = toggle.classList.toggle("expanded");
+      const icon = toggle.querySelector("i");
+      if (icon) icon.className = expanded ? "fas fa-caret-down" : "fas fa-caret-right";
+      el.cycleCountLinesBody
+        .querySelectorAll('.mixed-item-row[data-mixed-parent="' + CSS.escape(target) + '"]')
+        .forEach((row) => {
+          row.style.display = expanded ? "" : "none";
+        });
+      return;
+    }
+    const row = e.target.closest("tr.cc-line-row, tr.mixed-item-row");
+    if (!row) return;
+    selectCycleCountLine(row.dataset.taskDetailId);
+  });
+  el.cycleCountLinesBody.addEventListener("input", (e) => {
+    const qtyInput = e.target.closest(".cc-qty-input");
+    if (qtyInput) {
+      validateCycleCountQty(qtyInput);
+      return;
+    }
+    const itemInput = e.target.closest(".cc-item-input");
+    if (itemInput) {
+      updateCycleCountLineActionButtons();
+    }
+  });
 
   if (window.InspectionThemes) {
     // Theme=N hides the picker; Theme=<key> (case-insensitive) pre-selects a theme.

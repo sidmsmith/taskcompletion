@@ -233,6 +233,62 @@ ILPN_CONSUMED_STATUS = "9000"
 ADJUST_LOCATION_INVENTORY_URL = f"{HOST}/dcinventory/api/dcinventory/inventory/adjustInventory"
 LOCATION_ADJUSTMENT_STALE_RECORD_CODE = "DCI::313"
 
+# Cycle Count (ad hoc, "USER_DIRECTED" mode) — ported from the sibling
+# `cyclecount` app (C:\Users\ssmith\Personal\Development\work\
+# cyclecount, v1.3.1), which live-tests this exact six-call chain
+# against SS-DEMO via its own file-upload workflow. Same host/auth as
+# everything else in this app, so no new credentials — just a
+# different MAWM component (`inventory-management`, not `putaway`/
+# `task`). Per-location sequence: initiateCount() -> (item-from-
+# location lookup, reuses search_location_inventory() rather than
+# duplicating the old app's own dcinventory query) ->
+# validate_item_and_get_item_details() -> accept_quantity() ->
+# persist_count_details() -> end_count(). accept_quantity() is the one
+# call that can come back with a `messages.Message[]` WARNING (a
+# quantity-mismatch is auto-overridden, per explicit instruction
+# matching the old app's own silent-continue behavior) rather than a
+# hard failure.
+CYCLE_COUNT_INITIATE_URL = f"{HOST}/inventory-management/api/inventory-management/count/initiateCount"
+CYCLE_COUNT_VALIDATE_ITEM_URL = f"{HOST}/inventory-management/api/inventory-management/count/validateItemAndGetItemDetails"
+CYCLE_COUNT_ACCEPT_QUANTITY_URL = f"{HOST}/inventory-management/api/inventory-management/count/acceptQuantity"
+CYCLE_COUNT_PERSIST_URL = f"{HOST}/inventory-management/api/inventory-management/count/quantity/persistCountDetails"
+CYCLE_COUNT_END_URL = f"{HOST}/inventory-management/api/inventory-management/count/end"
+CYCLE_COUNT_CRITERIA_ID = "Cycle Count Active-API Mode"
+CYCLE_COUNT_TRANSACTION_ID = "Cycle Count Active-API"
+CYCLE_COUNT_TRANSACTION_TYPE_ID = "Cycle Count"
+CYCLE_COUNT_QUANTITY_MISMATCH_TEXT = "quantity mismatch"
+
+# CONFIRMED-by-user-capture (mawm_cycle_count_location_investigation.md,
+# 2026-08-08, ninth session) — the booking outcome of a submitted count
+# is NOT knowable from acceptQuantity/persistCountDetails/endCount's own
+# responses; MAWM books it (or fails to) asynchronously afterward. These
+# three read-only endpoints are how to observe the real outcome:
+# locationCountInfo (the location-level "is a count pending" lock flag),
+# inventoryCountRun (one row per count attempt for a location, Status/
+# TaskId/BookedDateTime), inventoryCountResult (the flat item-level
+# detail for one run: OriginalQuantity/CountQuantity/VarianceQuantity/
+# Status/BookingFailureReason). See task_service.complete_cycle_count_line()
+# for how these get polled after persist/end to determine the real
+# result instead of trusting the chain's own HTTP statuses.
+LOCATION_COUNT_INFO_SEARCH_URL = f"{HOST}/dcinventory/api/dcinventory/locationCountInfo/search"
+INVENTORY_COUNT_RUN_SEARCH_URL = f"{HOST}/inventory-management/api/inventory-management/inventoryCountRun/search"
+INVENTORY_COUNT_RESULT_SEARCH_URL = f"{HOST}/inventory-management/api/inventory-management/inventoryCountResult/search"
+
+# Tier 1 (CONFIRMED live, mawm_cycle_count_location_investigation.md +
+# live capture this session) — inventoryCountRun.Status / .StatusKey.
+# 35/70/75/80 confirmed by the user's captured document; 65 ("Booking
+# Failed") confirmed live this session (a real concurrency conflict:
+# "Cycle count already in progress for different inventory read", from
+# running two count attempts against the same location within seconds
+# of each other — not expected in normal single-count-per-visit usage).
+INVENTORY_COUNT_RUN_STATUS_LABELS = {
+    "35": "Pending Booking",
+    "65": "Booking Failed",
+    "70": "Booking Rejected",
+    "75": "Booking Accepted",
+    "80": "Booked",
+}
+
 # CONFIRMED live against SS-DEMO — the document's own
 # `/api/putaway/config/services/reasonCodes/list` guess (hedged there as
 # "typically GET", no method captured) 404'd; the real endpoint is the
@@ -361,6 +417,17 @@ def build_task_headers(
         "selectedOrganization": org,
         "selectedLocation": loc,
     }
+
+
+def build_cycle_count_headers(token: str, org: str, location: str = None) -> dict:
+    """Cycle Count endpoints additionally require an explicit `FacilityId`
+    header (confirmed live in the sibling `cyclecount` app) — every
+    other header matches build_task_headers() exactly, so this just
+    layers that one extra header on top instead of duplicating the rest.
+    """
+    headers = build_task_headers(token, org, location=location)
+    headers["FacilityId"] = headers["selectedLocation"]
+    return headers
 
 
 def get_manhattan_token(org: str) -> Optional[str]:
@@ -706,6 +773,264 @@ def adjust_location_inventory(inventory_lines: List[dict], token: str, org: str,
         )
     body["_httpStatus"] = response.status_code
     return body
+
+
+def _parse_cycle_count_response(response: requests.Response, label: str) -> dict:
+    """Shared response handling for all six Cycle Count calls below.
+    Mirrors the old cyclecount app's Flask layer: always try to parse
+    JSON regardless of status code (accept_quantity() in particular can
+    come back 400 with a genuine `messages.Message[]` warning body, not
+    an actual failure), only raising when the body is truly unparseable
+    AND the status was non-2xx. Callers inspect `_httpStatus` themselves
+    to decide success — a 2xx status here doesn't guarantee MAWM-level
+    success any more than it does elsewhere in this app.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"{label} failed: {response.status_code} {response.text[:500]}"
+            )
+        body = {"raw": response.text[:500]} if response.text else {}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    body["_httpStatus"] = response.status_code
+    return body
+
+
+def initiate_count(location_id: str, token: str, org: str, location: str = None) -> dict:
+    """Ported from cyclecount/api/index.py's initiate_count() — step 1
+    of the chain. Response carries `CountRunId`/`TaskId` (exact casing/
+    nesting unconfirmed in this app until live-tested; the old app
+    defensively checks several shapes — see
+    task_service.complete_cycle_count_line() for that extraction).
+    """
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountMode": "USER_DIRECTED",
+        "CountSequence": 1,
+        "LpnTracking": False,
+        "CountCriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "TaskIntegrationDTO": {
+            "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+            "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LaborActivityId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+        },
+    }
+    response = _post(
+        CYCLE_COUNT_INITIATE_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "initiateCount")
+
+
+def validate_item_and_get_item_details(
+    location_id: str, count_run_id: str, item_id: str, token: str, org: str, location: str = None
+) -> dict:
+    """Ported from cyclecount/api/index.py's validate_item_and_get_item_details() — step 3."""
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountRunId": count_run_id,
+        "LpnTracking": False,
+        "ContainerId": None,
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "CriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "ItemAttributeDTO": {"Item": item_id},
+        "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+    }
+    response = _post(
+        CYCLE_COUNT_VALIDATE_ITEM_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "validateItemAndGetItemDetails")
+
+
+def accept_quantity(
+    location_id: str,
+    count_run_id: str,
+    task_id: str,
+    item_id: str,
+    quantity,
+    token: str,
+    org: str,
+    location: str = None,
+) -> dict:
+    """Ported from cyclecount/api/index.py's accept_quantity() — step 4,
+    the one call that can legitimately come back non-2xx with a real
+    `messages.Message[]` warning (quantity mismatch) rather than a hard
+    failure; see task_service.complete_cycle_count_line() for how that's
+    distinguished from an actual error.
+    """
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountRunId": count_run_id,
+        "ContainerType": None,
+        "ContainerId": None,
+        "Quantity": quantity,
+        "BlindIlpn": False,
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "TaskId": task_id,
+        "CriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "ItemAttributeDTO": {"Item": item_id, "CompareAttributes": False},
+        "TaskIntegrationDTO": {
+            "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+            "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LaborActivityId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+        },
+    }
+    response = _post(
+        CYCLE_COUNT_ACCEPT_QUANTITY_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "acceptQuantity")
+
+
+def persist_count_details(
+    location_id: str,
+    count_run_id: str,
+    task_id: str,
+    item_id: str,
+    quantity,
+    token: str,
+    org: str,
+    location: str = None,
+) -> dict:
+    """Ported from cyclecount/api/index.py's persist_count_details() — step 5."""
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountRunId": count_run_id,
+        "Quantity": quantity,
+        "TaskId": task_id,
+        "ContainerId": None,
+        "ContainerType": "LOCATION",
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "BlindIlpn": False,
+        "CriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "ItemAttributeDTO": {"Item": item_id, "CompareAttributes": False},
+        "TaskIntegrationDTO": {
+            "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+            "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LaborActivityId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+        },
+    }
+    response = _post(
+        CYCLE_COUNT_PERSIST_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "persistCountDetails")
+
+
+def end_count(location_id: str, count_run_id: str, token: str, org: str, location: str = None) -> dict:
+    """Ported from cyclecount/api/index.py's end_count() — step 6, closes the count run."""
+    token = normalize_token(token)
+    payload = {
+        "LocationId": location_id,
+        "CountRunId": count_run_id,
+        "CountSequence": 1,
+        "LpnTracking": False,
+        "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+        "CriteriaId": CYCLE_COUNT_CRITERIA_ID,
+        "TaskIntegrationDTO": {
+            "TransactionId": CYCLE_COUNT_TRANSACTION_ID,
+            "TransactionTypeId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+            "LaborActivityId": CYCLE_COUNT_TRANSACTION_TYPE_ID,
+        },
+    }
+    response = _post(
+        CYCLE_COUNT_END_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json=payload,
+    )
+    return _parse_cycle_count_response(response, "endCount")
+
+
+def search_location_count_info(location_id: str, token: str, org: str, location: str = None) -> Optional[dict]:
+    """CONFIRMED-by-user-capture — the location-level cycle-count lock
+    flag (`CycleCountPending`). Confirmed live: `true` while a count is
+    unresolved (including a genuinely out-of-tolerance, never-resolving
+    Pending Booking run), `false` once resolved (booked, rejected, or
+    failed all clear it — being "resolved" isn't the same as "the count
+    succeeded"). No Template needed — tested with and without one live
+    and got the identical full row either way.
+    """
+    token = normalize_token(token)
+    quoted = location_id.replace("'", "''")
+    response = _post(
+        LOCATION_COUNT_INFO_SEARCH_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json={"Query": f"LocationId = '{quoted}'", "Size": 20},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"locationCountInfo search failed: {response.status_code} {response.text[:500]}"
+        )
+    rows = _response_data_list(response.json())
+    return rows[0] if rows else None
+
+
+def search_inventory_count_runs(location_id: str, token: str, org: str, location: str = None) -> List[dict]:
+    """CONFIRMED-by-user-capture — every count run ever attempted for a
+    location (not scoped to one CountRunId), newest and oldest mixed
+    together; the caller picks the relevant one (see
+    task_service.complete_cycle_count_line(), which already knows its
+    own CountRunId from initiateCount and doesn't need to guess). Each
+    row nests its own `ContainerCount[]`/`InventoryCount[]` detail, but
+    search_inventory_count_results() below is the flatter, easier-to-use
+    equivalent for that — this is mainly useful for the run's own
+    Status/TaskId/BookedDateTime.
+    """
+    token = normalize_token(token)
+    quoted = location_id.replace("'", "''")
+    response = _post(
+        INVENTORY_COUNT_RUN_SEARCH_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json={"Query": f"LocationId = '{quoted}'", "Size": 100},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"inventoryCountRun search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
+
+def search_inventory_count_results(
+    count_run_id: str, location_id: str, token: str, org: str, location: str = None
+) -> List[dict]:
+    """CONFIRMED-by-user-capture — the flat, item-level detail for one
+    specific count run: OriginalQuantity/CountQuantity/VarianceQuantity/
+    Status ("Pending Booking"/"Booked"/etc, a human label already, not
+    just a status key)/BookingFailureReason. This is the single source
+    of truth task_service.complete_cycle_count_line() polls after
+    persist/end to determine what actually happened, since none of the
+    six completion calls' own responses reveal the real (asynchronous)
+    booking outcome.
+    """
+    token = normalize_token(token)
+    quoted_run = count_run_id.replace("'", "''")
+    quoted_loc = location_id.replace("'", "''")
+    response = _post(
+        INVENTORY_COUNT_RESULT_SEARCH_URL,
+        headers=build_cycle_count_headers(token, org, location=location),
+        json={
+            "Query": f"CountRunId = '{quoted_run}' AND LocationId = '{quoted_loc}'",
+            "Size": 999,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"inventoryCountResult search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
 
 
 def refresh_ilpn_read_timestamp(container_id: str, token: str, org: str, location: str = None) -> None:
