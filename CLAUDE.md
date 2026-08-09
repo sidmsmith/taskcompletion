@@ -1349,5 +1349,41 @@ selected group — both resolved to `"Booked"` (`"1739 → 1739"`/
 (qty/item inputs disabled), and real MAWM data independently confirmed
 unchanged on-hand (1739/750) with the location unlocked afterward.
 
+**Within-tolerance multi-item test, same session, per explicit
+instruction** ("test one line difference within tolerance… before out
+of tolerance") — one item off by 1 on its larger on-hand quantity
+(`5000001`: 1739 → counted 1738, then a follow-up UI test 1738 →
+counted 1737), the other exact (`5000002`: 750 → 750). Confirmed live
+via both a direct `complete_cycle_count_location()` call and, in a
+follow-up pass, the real UI end to end:
+
+- Immediately after submission both items show
+  `"Count Initiated"`/`"In Booking"` (a **third** new intermediate
+  status not seen before — the observed progression across all
+  multi-item tests so far is `Count Initiated` → `In Booking` →
+  `Count Complete` (multi-item only, once every item is persisted) →
+  `Booked`; not all stages necessarily show for every case, e.g. a
+  perfect match can skip straight to `Booked`).
+- The mismatched item's `acceptQuantity` step returns the usual
+  `INM::227` "Quantity mismatch" WARNING; polling confirmed both items
+  resolve to `"Booked"` together, same as the no-variance case.
+- Real on-hand correctly updated for the mismatched item only
+  (1739→1738, then 1738→1737 in the follow-up test) — the exact-match
+  item stayed untouched (750) both times, confirmed via direct
+  `search_location_inventory()` re-query after each test, not just
+  trusted from the API response.
+- The UI test specifically confirmed the polling path: the row showed
+  `"In Booking"` with the not-yet-applied counted qty struck through
+  immediately after clicking Complete Line, then flipped to green
+  `"Booked: 1738 → 1737 (variance -1)"` a few seconds later via
+  `pollCycleCountGroupStatus()`'s background poll, with the
+  action-status banner updating to "Location A1AC0924 booked." —
+  matching the single-item polling behavior confirmed earlier in this
+  session, now proven for the multi-item atomic path too.
+
+**Still not tested**: an actual out-of-tolerance variance on a
+multi-item location (deliberately deferred, per explicit instruction,
+until the within-tolerance path was confirmed solid first).
+
 Also not yet built: the tasked (non-ad-hoc) Cycle Count flow —
 explicitly deferred by the user until ad hoc counts are solid.

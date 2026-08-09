@@ -1312,6 +1312,24 @@
     return "error";
   }
 
+  /**
+   * A group-level response's top-level `error` only exists for an
+   * early hard failure (e.g. initiateCount itself failed) — when it's
+   * the per-item results that aren't booked yet (the common case right
+   * after submission, before polling catches up), there's no top-level
+   * error to fall back to (2026-08-08, found live: the action-status
+   * banner showed a bare "Complete failed" for a perfectly healthy
+   * in-flight multi-item count). Summarizes each item's own status
+   * instead so the banner reflects reality while the poll runs.
+   */
+  function cycleCountGroupResponseSummary(response) {
+    if (response.error) return response.error;
+    const results = response.results || [];
+    if (!results.length) return "Complete failed";
+    const statuses = results.map((r) => r.status || (r.success ? "Booked" : "Unknown")).join(", ");
+    return "Still processing (" + statuses + ") — status will keep updating.";
+  }
+
   async function completeCycleCountLine() {
     const group = getSelectedCycleCountGroup();
     if (!group) return;
@@ -1321,7 +1339,7 @@
       const response = await completeCycleCountGroupAction(group);
       applyCycleCountLocationResultToGroup(group, response);
       if (!response.success) {
-        setActionStatus(response.error || "Complete failed", "error");
+        setActionStatus(cycleCountGroupResponseSummary(response), "");
         pollCycleCountGroupStatus(group, response); // fire-and-forget
         return;
       }
@@ -1382,7 +1400,7 @@
         if (response.success) {
           succeeded++;
         } else {
-          failures.push(cycleCountFailureLabel(group, response.error || "failed"));
+          failures.push(cycleCountFailureLabel(group, cycleCountGroupResponseSummary(response)));
           pollCycleCountGroupStatus(group, response); // fire-and-forget, doesn't block the rest of the loop
         }
       } catch (e) {
