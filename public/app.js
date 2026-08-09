@@ -881,6 +881,30 @@
   // classifySearchInput()).
   // ---------------------------------------------------------------------
 
+  /**
+   * Matches the two-arrow "cycle count pending" icon shown in the real
+   * WM UI next to a locked location (2026-08-08, per explicit
+   * instruction, screenshot provided) — no exact source asset was
+   * found on disk, so this uses Font Awesome's closest equivalent
+   * (already loaded in this app) rather than inventing/guessing at a
+   * custom icon. Always rendered (not conditionally), display toggled
+   * via setCycleCountLockIcon() so a later poll/completion result can
+   * show or hide it live without re-rendering the row — "before or
+   * after count," per explicit instruction: the initial search already
+   * carries the location's current lock state (see
+   * task_service.resolve_cycle_count_location()), so this can be
+   * showing before any count is even started.
+   */
+  function cycleCountLockIconHtml(taskDetailId, locked) {
+    return (
+      ' <i class="fas fa-arrows-rotate cc-lock-icon" data-task-detail-id="' +
+      escapeAttr(taskDetailId) +
+      '" title="Cycle count pending — location locked" style="display:' +
+      (locked ? "inline-block" : "none") +
+      '"></i>'
+    );
+  }
+
   function cycleCountLineRowHtml(line, isSubRow) {
     const rowClass = isSubRow ? "mixed-item-row" : "cc-line-row line-row";
     const extraAttrs = isSubRow
@@ -889,7 +913,7 @@
     return `
         <tr class="${rowClass}" data-task-detail-id="${escapeAttr(line.taskDetailId)}"${extraAttrs}>
           <td>${isSubRow ? "" : escapeHtml(line.lineNumber)}</td>
-          <td>${isSubRow ? "" : escapeHtml(line.locationId)}</td>
+          <td>${isSubRow ? "" : escapeHtml(line.locationId) + cycleCountLockIconHtml(line.taskDetailId, line.locationLocked)}</td>
           <td>
             <input
               type="text"
@@ -935,7 +959,7 @@
     const summaryRow = `
         <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}">
           <td>${escapeHtml(lines[0].lineNumber)}</td>
-          <td>${escapeHtml(group.locationId)}</td>
+          <td>${escapeHtml(group.locationId) + cycleCountLockIconHtml(groupKey, group.locationLocked)}</td>
           <td colspan="6">
             <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(groupKey)}">
               <i class="fas fa-caret-right"></i> MIXED (${lines.length} items)
@@ -1049,12 +1073,19 @@
     updateCycleCountLineActionButtons();
   }
 
+  /**
+   * `message` may contain HTML (the strikethrough on a not-yet-applied
+   * counted qty — see cycleCountResultText()), so this uses innerHTML,
+   * not textContent — cycleCountResultText() is responsible for
+   * escaping any free-text portion (MAWM's own error/failure-reason
+   * strings) before it gets here.
+   */
   function setCycleCountResultCell(taskDetailId, message, kind, done) {
     const cell = el.cycleCountLinesBody.querySelector(
       '.cc-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
     );
     if (!cell) return;
-    cell.textContent = message;
+    cell.innerHTML = message;
     cell.className = "col-reason cc-result" + (kind ? " " + kind : "");
     cell.dataset.done = done ? "true" : "false";
     if (done) {
@@ -1065,12 +1096,36 @@
     }
   }
 
+  function setCycleCountLockIcon(taskDetailId, locked) {
+    const icon = el.cycleCountLinesBody.querySelector(
+      '.cc-lock-icon[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (icon) icon.style.display = locked ? "inline-block" : "none";
+  }
+
+  /**
+   * "10 ($50)" — the dollar variance in smaller grey text to the right
+   * of the quantity variance (2026-08-08, per explicit instruction),
+   * rounded to whole dollars, accounting-style parens for negative (no
+   * explicit minus sign inside — matches the requested example
+   * literally) rather than a plain "-$50".
+   */
+  function formatVarianceValueHtml(varianceValue) {
+    if (varianceValue == null) return "";
+    const rounded = Math.round(Math.abs(Number(varianceValue)));
+    const text = Number(varianceValue) < 0 ? "($" + rounded + ")" : "$" + rounded;
+    return ' <span class="cc-variance-value">' + text + "</span>";
+  }
+
   /**
    * Fills in the Previous Qty / Variance columns alongside the Status
    * cell (2026-08-08, per explicit instruction — "show the previous/
    * counted qty and the variances from the count details so the user
-   * can see the full result"), from either completeCycleCountLine()'s
-   * or check_cycle_count_status()'s identically-shaped result.
+   * can see the full result") and the location lock icon, from either
+   * completeCycleCountLine()'s or check_cycle_count_status()'s
+   * identically-shaped result. The two endpoints name the lock flag
+   * differently (`locationLocked` for a live status check vs.
+   * `locationLockedAfter` for a fresh completion) — normalized here.
    */
   function applyCycleCountResultToRow(taskDetailId, result) {
     const prevCell = el.cycleCountLinesBody.querySelector(
@@ -1080,7 +1135,13 @@
       '.cc-variance[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
     );
     if (prevCell) prevCell.textContent = result.previousQty != null ? result.previousQty : "";
-    if (varCell) varCell.textContent = result.varianceQty != null ? result.varianceQty : "";
+    if (varCell) {
+      varCell.innerHTML =
+        (result.varianceQty != null ? escapeHtml(result.varianceQty) : "") +
+        formatVarianceValueHtml(result.varianceValue);
+    }
+    const locked = result.locationLocked !== undefined ? result.locationLocked : result.locationLockedAfter;
+    if (locked !== undefined) setCycleCountLockIcon(taskDetailId, locked);
     setCycleCountResultCell(taskDetailId, cycleCountResultText(result), cycleCountResultKind(result), result.success);
   }
 
@@ -1166,20 +1227,33 @@
    * "Pending Booking" result leaves the row retryable (not marked
    * done) since it's plausible the count itself should be re-entered,
    * not just resubmitted as-is.
+   *
+   * **Cleaned up 2026-08-08, per explicit instruction** — was a long
+   * prose sentence ("Pending supervisor booking (out of tolerance):
+   * was 20, counted 10 (variance -10). Location locked — not yet
+   * applied."); now a terse "Pending Booking 20 → ~~10~~ (variance
+   * -10)" with the not-yet-applied counted qty struck through (per
+   * explicit instruction — arrow kept from the Booked case for visual
+   * consistency, strikethrough on the counted side signals "attempted,
+   * not applied" without the previous, still-current value getting
+   * struck). Returns HTML (see setCycleCountResultCell()'s innerHTML
+   * usage) — free-text portions (MAWM's own error/failure-reason
+   * strings) are escaped, but the numeric qty/variance fields aren't
+   * (they're never user-typed free text, always straight from the
+   * count-result API response).
    */
   function cycleCountResultText(result) {
     if (result.status === "Pending Booking") {
       return (
-        "Pending supervisor booking (out of tolerance): was " + result.previousQty +
-        ", counted " + result.countedQty + " (variance " + result.varianceQty +
-        "). Location locked — not yet applied."
+        "Pending Booking " + result.previousQty + " → <s>" + result.countedQty + "</s> (variance " +
+        result.varianceQty + ")"
       );
     }
     if (result.success) {
       const varied = Number(result.varianceQty) ? " (variance " + result.varianceQty + ")" : "";
       return "Booked: " + result.previousQty + " → " + result.countedQty + varied;
     }
-    return result.bookingFailureReason || result.error || "Failed";
+    return escapeHtml(result.bookingFailureReason || result.error || "Failed");
   }
 
   function cycleCountResultKind(result) {

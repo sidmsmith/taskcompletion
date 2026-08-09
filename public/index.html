@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Task Check In v0.10.2</title>
+  <title>Task Check In v0.10.3</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet" />
   <style>
@@ -373,7 +373,23 @@
     tr.mixed-item-row.selected td { background: rgba(13, 110, 253, 0.12); }
     .cc-result.success { color: var(--success); }
     .cc-result.error { color: var(--red-text); }
-    .cc-result.pending { color: var(--text-muted); font-style: italic; }
+    /* Red, not muted grey (2026-08-08, per explicit instruction) — an
+       out-of-tolerance count needing supervisor attention reads as
+       urgent, not a routine "still working on it" state. */
+    .cc-result.pending { color: var(--red-text); }
+    .cc-variance-value {
+      color: var(--text-muted);
+      font-size: 0.8em;
+      margin-left: 0.3em;
+    }
+    /* Matches the two-arrow "cycle count pending" icon shown in the
+       real WM UI next to a locked location (2026-08-08, per explicit
+       instruction) — see cycleCountLockIconHtml() in app.js. */
+    .cc-lock-icon {
+      color: var(--red-text);
+      margin-left: 0.4rem;
+      font-size: 0.85rem;
+    }
   </style>
 </head>
 <body>

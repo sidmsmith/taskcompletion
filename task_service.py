@@ -1651,6 +1651,12 @@ def resolve_cycle_count_location(
         return {"success": False, "error": "Location required"}
 
     dest = resolve_location(org, location)
+    try:
+        info = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info = None
+    locked = bool(info and info.get("CycleCountPending"))
+
     raw_rows = search_location_inventory(location_id, token, org, location=dest)
     seen_item_ids = set()
     rows: List[dict] = []
@@ -1672,6 +1678,7 @@ def resolve_cycle_count_location(
                 "itemId": "",
                 "description": "",
                 "quantity": None,
+                "locationLocked": locked,
             }
         )
     else:
@@ -1686,6 +1693,7 @@ def resolve_cycle_count_location(
                     "itemId": item_id,
                     "description": str(item.get("Description") or ""),
                     "quantity": None,
+                    "locationLocked": locked,
                 }
             )
 
@@ -1701,6 +1709,7 @@ def resolve_cycle_count_location(
         "taskTransactionId": CYCLE_COUNT_TRANSACTION_ID,
         "lineCount": len(lines),
         "lines": lines,
+        "locationLocked": locked,
     }
 
 
@@ -1792,6 +1801,7 @@ def _cycle_count_result_response(
         "previousQty": result_row.get("OriginalQuantity"),
         "countedQty": result_row.get("CountQuantity"),
         "varianceQty": result_row.get("VarianceQuantity"),
+        "varianceValue": result_row.get("VarianceValue"),
         "bookingFailureReason": result_row.get("BookingFailureReason"),
     }
     if not booked:

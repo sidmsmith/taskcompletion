@@ -1170,6 +1170,50 @@ lines"), which is misleading given booking is asynchronous and a line
 counted as an "issue" the instant the loop finishes may still book
 moments later via the background poll.
 
+**WM-matching lock icon + terser Pending Booking display (2026-08-08,
+same session, per explicit instruction with a reference screenshot of
+the real WM UI)**:
+
+- **Location lock icon**: `resolve_cycle_count_location()` now also
+  calls `search_location_count_info()` up front and returns
+  `locationLocked` on both the group and every line (denormalized the
+  same way as `groupLocationId` etc), so the frontend knows a
+  location's `CycleCountPending` state **before any count is even
+  started** — confirmed live: searching two already-locked locations
+  (`A1AC0140`/`A2AC1201`, still pending from earlier same-session
+  testing) showed the icon immediately on load, with no completion
+  action taken yet. No source asset for the real WM icon (two circular
+  arrows) was found anywhere on disk despite a real search — `app.js`'s
+  `cycleCountLockIconHtml()` uses Font Awesome's `fa-arrows-rotate`
+  (already loaded in this app) as the closest equivalent rather than
+  guessing at/fabricating a custom icon. Always rendered in the row's
+  HTML but display-toggled (`setCycleCountLockIcon()`) so a later
+  completion/poll result can show or hide it live without re-rendering
+  the row — "before or after count," per explicit instruction.
+- **Terser, red Pending Booking message**: was a full sentence
+  ("Pending supervisor booking (out of tolerance): was 20, counted 10
+  (variance -10). Location locked — not yet applied.") in muted grey;
+  now "Pending Booking 20 → ~~10~~ (variance -10)" in red — the counted
+  qty (not the still-current previous qty) struck through, since that's
+  the value that didn't actually take effect. `setCycleCountResultCell()`
+  switched from `textContent` to `innerHTML` to support the `<s>` tag;
+  `cycleCountResultText()` still escapes any free-text MAWM
+  error/failure-reason string before it reaches that innerHTML, since
+  the numeric qty/variance fields are always trusted API values but
+  error text technically isn't.
+- **Variance dollar value**: `_cycle_count_result_response()` now also
+  returns `varianceValue` (MAWM's `VarianceValue` field, confirmed in
+  the user-captured investigation doc). Shown in the Variance column as
+  smaller grey text to the right of the quantity variance — "10 ($50)"
+  per explicit instruction — rounded to whole dollars,
+  accounting-style parens for negative (no explicit minus sign inside,
+  matching the requested example literally) via
+  `formatVarianceValueHtml()`.
+- All three confirmed together live: `A1AC0142` (baseline 574, counted
+  200) rendered the red lock icon next to the location, "Pending
+  Booking 574 → ~~200~~ (variance -374)" in red, and "-374 ($1870)" in
+  the Variance column.
+
 **Open, unexplained, and deliberately not chased further**:
 `A1AC0124` (an item location with 24+ pre-existing `inventoryCountRun`
 rows already on it — clearly reused/heavily-seeded demo data, not a
