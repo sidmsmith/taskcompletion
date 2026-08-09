@@ -1381,9 +1381,37 @@ follow-up pass, the real UI end to end:
   matching the single-item polling behavior confirmed earlier in this
   session, now proven for the multi-item atomic path too.
 
-**Still not tested**: an actual out-of-tolerance variance on a
-multi-item location (deliberately deferred, per explicit instruction,
-until the within-tolerance path was confirmed solid first).
+**Out-of-tolerance multi-item test — a genuinely important finding**
+(same session, tested right after within-tolerance per explicit
+instruction): `5000001` counted way off (1737 → 800, variance -937),
+`5000002` counted exactly right (750 → 750, variance 0). Confirmed
+live via both a direct `complete_cycle_count_location()` call and the
+real UI end to end:
+
+- **Both items** ended up at `Status: "Pending Booking"` — including
+  `5000002`, the exact match with zero variance. One item's tolerance
+  failure blocks the **entire location's** count from booking, not
+  just the offending item — this is evaluated at the location/count-
+  run level, not purely per item.
+- Real on-hand confirmed **unchanged for both items** (`5000001`
+  stayed 1737, `5000002` stayed 750) — the correctly-counted item's
+  correction does not get applied just because it happened to be
+  right; it's held hostage by its sibling until a supervisor resolves
+  the whole location.
+- UI correctly reflected this: both rows showed red `"Pending Booking"`
+  with the counted qty struck through (`"1737 → ~~800~~"` and
+  `"750 → ~~750~~"`), the lock icon displayed, and — importantly —
+  **neither row was marked done**; both stayed editable/retryable
+  (inputs not disabled), unlike the "Booked" case which locks them.
+  This is the right behavior (a supervisor might reject the whole
+  count, at which point the operator would need to recount and
+  resubmit), but it's worth knowing: a single bad count on one SKU in
+  a multi-item location holds up every other SKU there too, with no
+  partial credit for the ones that were actually right.
+- The action-status banner correctly showed the improved summary from
+  the same-session fix above ("Still processing (Count Initiated,
+  Count Initiated) — status will keep updating.") rather than a bare
+  "Complete failed."
 
 Also not yet built: the tasked (non-ad-hoc) Cycle Count flow —
 explicitly deferred by the user until ad hoc counts are solid.
