@@ -69,7 +69,6 @@ from mawm_client import (
     apply_warning_overrides,
     commit_putaway_move,
     complete_task,
-    end_count,
     extract_message,
     extract_warning,
     fetch_putaway_move,
@@ -501,11 +500,14 @@ def _resolve_cycle_count_task(
     confirmed this session that a Cycle Count task's own `TaskDetail`
     carries no item until counted (WM creates the task for the whole
     location), so this reuses resolve_cycle_count_location() exactly
-    like ad hoc does, tagging the result with the real `taskId` so the
-    frontend sends `isTasked: true` on completion (trigger_end_count()
-    instead of end_count() — see mawm_client.trigger_end_count()'s
-    docstring; task closure requires it, count booking works either
-    way).
+    like ad hoc does, tagging the result with the real `taskId` purely
+    for the frontend's own header display/routing (search-time `mode`
+    detection, showing the real Task Id/status) — the completion
+    functions themselves (complete_cycle_count_line()/
+    complete_cycle_count_location()) always call trigger_end_count()
+    regardless of how the location/task was found, so this `taskId`
+    tag no longer changes completion behavior, only what the search
+    result looks like.
     """
     classification = _classify_cycle_count_task(raw_task)
     if classification == "unsupported":
@@ -2091,7 +2093,6 @@ def _cycle_count_result_response(
 
 def complete_cycle_count_line(
     token: str, org: str, location_id: str, item_id: str, quantity, location: str = None,
-    is_tasked: bool = False,
 ) -> Dict[str, Any]:
     """Runs the full six-call ad hoc Cycle Count chain for one
     location/item pair (ported from the sibling cyclecount app — see
@@ -2142,17 +2143,27 @@ def complete_cycle_count_line(
     completions rather than fire them concurrently; not yet addressed
     here since it needs a real multi-item location to verify against.
 
-    `is_tasked` (2026-08-09, default False — every existing ad hoc
-    caller is unaffected): when True, the final step calls
-    trigger_end_count() instead of end_count(). Confirmed live that
-    trigger_end_count() closes the real WM Task Management record
-    (Status 7000 -> 8000) that end_count() leaves stuck — see
-    mawm_client.trigger_end_count()'s docstring and CLAUDE.md's "Tasked
-    (non-ad-hoc) Cycle Count" section. Not yet exercised through this
-    exact call path end-to-end (that test called trigger_end_count()
-    directly against an already-booked run, not from inside this
-    chain) — needs a real open WM-scheduled Cycle Count task to verify;
-    until then this flag has no live caller.
+    **Always calls trigger_end_count(), never end_count()** (2026-08-09,
+    revised — previously conditional on an `is_tasked` flag the
+    frontend had to set correctly, which depended on the user having
+    searched by the right TaskId; found live that searching by
+    location instead left a real WM task stuck "In Progress" forever,
+    since the ad hoc path used to call end_count() unconditionally).
+    Confirmed live via direct reproduction that trigger_end_count() is
+    safe to call unconditionally: (a) against a location with a real
+    pre-existing task — initiateCount() auto-attaches to that task's
+    real TaskId with zero extra signal (no INM::207 or any other
+    warning surfaces via these API calls — that message is apparently
+    mobile-device-UI-specific), and trigger_end_count() closes it
+    correctly; (b) against a genuinely task-less, never-counted
+    location — trigger_end_count() still returns `200 success: true`
+    and books the count normally, no task-related side effects. Since
+    `task_id` here is always whatever initiateCount() itself returned
+    (a real pre-existing task's id if the location has one, otherwise
+    a value with no corresponding searchable Task record — confirmed
+    live, `search_task()` finds nothing for a pure ad hoc count's
+    TaskId), there's no need to detect or distinguish the two cases —
+    trigger_end_count() handles both correctly on its own.
     """
     location_id = (location_id or "").strip().upper()
     item_id = (item_id or "").strip()
@@ -2199,10 +2210,7 @@ def complete_cycle_count_line(
         return {"success": False, "error": f"persistCountDetails failed: {exc}"}
 
     try:
-        if is_tasked:
-            trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
-        else:
-            end_count(location_id, count_run_id, token, org, location=dest)
+        trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"endCount failed: {exc}"}
 
@@ -2224,8 +2232,10 @@ def complete_cycle_count_line(
 
 def _attach_polled_task_status(response: dict, task_id: str, token: str, org: str, dest: str) -> None:
     """Refreshes `taskStatus`/`taskStatusLabel` on a poll response
-    in-place, for a tasked (`is_tasked=True`) group only (2026-08-09,
-    fixing a real gap the user found live: the header's Task Status
+    in-place, only when the frontend knows a real `task_id` (i.e. the
+    group was reached by searching a real TaskId directly — see
+    _resolve_cycle_count_task()) (2026-08-09, fixing a real gap the
+    user found live: the header's Task Status
     stayed frozen at its search-time value forever, even after the
     task actually closed — because task closure is independent of
     count booking (see CLAUDE.md's "task status alone is never proof"
@@ -2282,7 +2292,6 @@ def check_cycle_count_status(
 
 def complete_cycle_count_location(
     token: str, org: str, location_id: str, item_adjustments: List[dict], location: str = None,
-    is_tasked: bool = False,
 ) -> Dict[str, Any]:
     """Atomic multi-item counterpart to complete_cycle_count_line() — for
     a location with more than one distinct item, **every item must be
@@ -2316,10 +2325,10 @@ def complete_cycle_count_location(
     `success` (only True when every item's own `success` is True) and
     the location lock state before/after.
 
-    `is_tasked` — see complete_cycle_count_line()'s docstring; same
-    trigger_end_count() vs end_count() branch at the final step,
-    same "no live caller yet, needs a real open Cycle Count task"
-    caveat.
+    **Always calls trigger_end_count(), never end_count()** — see
+    complete_cycle_count_line()'s docstring for why (confirmed live
+    both against a real pre-existing task and a genuinely task-less
+    location; no detection needed, safe either way).
     """
     location_id = (location_id or "").strip().upper()
     if not location_id:
@@ -2382,10 +2391,7 @@ def complete_cycle_count_location(
             }
 
     try:
-        if is_tasked:
-            trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
-        else:
-            end_count(location_id, count_run_id, token, org, location=dest)
+        trigger_end_count(location_id, count_run_id, task_id, token, org, location=dest)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"endCount failed: {exc}", "countRunId": count_run_id}
 

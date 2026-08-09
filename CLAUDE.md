@@ -2129,3 +2129,108 @@ turns up). Confirmed live: counting `A1AC0123` (on-hand `240`) at `50`
 under a fresh task showed the new banner text immediately, with the
 row itself still correctly showing `Pending Booking` / `240 → 50` /
 `-190 ($950)`.
+
+## Ad hoc completion now always closes the real task too — is_tasked retired (2026-08-09, tenth session)
+
+**The user found this live**: scanned a location by mistake instead of
+the real Cycle Count TaskId (the ad hoc path, `is_tasked` defaulting
+to `False`) — the count itself booked fine, but the real WM task
+stayed stuck "In Progress" forever, since ad hoc still called
+`end_count()`, not `trigger_end_count()`. They then completed the
+*same* location on the real mobile RF device, which showed `"Cycle
+count already exists for the location (INM::207)"`, and — after
+confirming — correctly booked the count **and** closed the task. The
+ask: figure out what `INM::207` tells us and use it to close the task
+regardless of how the count was reached.
+
+**Investigated live before writing any code** (per explicit
+instruction to summarize first):
+
+- Called our own ad hoc `initiateCount()` (exactly what the location-
+  search path already does) against a location with a real
+  pre-existing task. **No `INM::207` or any warning came back in the
+  API response at all** — `messages.Message: []`. That warning is
+  apparently mobile-device-UI-specific, not visible through any of the
+  endpoints this app already calls. But the response's own `TaskId`
+  **was** the real pre-existing task's id — MAWM's own dedup, with no
+  extra signal needed, confirming (yet again, first found with
+  `CCNTINM000023` much earlier this session) that ad hoc `initiateCount()`
+  auto-attaches to a real task whenever one exists for the location.
+- Tested whether `trigger_end_count()` — until now only called when
+  `is_tasked=True` — is actually safe to call **unconditionally**:
+  - Against that same real-task location: closed the task correctly
+    (`Status: 8000`).
+  - Against a genuinely task-less, never-counted location
+    (`A1AC0405`, confirmed zero prior `inventoryCountRun` rows):
+    `trigger_end_count()` still returned `200 success: true` and
+    booked the count normally — no task-related error, no side
+    effect. (Also confirmed *why* this is safe: `search_task()` finds
+    **nothing** for a pure ad hoc count's synthesized `TaskId` — it's
+    not a real, searchable Task record at all, so there's nothing for
+    `trigger_end_count()` to break.)
+  - Also found, incidentally: the task's own `TransactionId` gets
+    overwritten to this app's `CYCLE_COUNT_TRANSACTION_ID` at the very
+    first call, `initiateCount()` itself — not later at persist/trigger
+    time as previously assumed.
+
+**This resolved the open "is trigger_end_count safe universally?"
+question from earlier this session, and made the fix simpler than
+detecting `INM::207` at all**: since `complete_cycle_count_line()`/
+`complete_cycle_count_location()` already extract `task_id` from
+`initiateCount()`'s own response regardless of caller intent, and
+`trigger_end_count()` is confirmed safe either way, both functions now
+**always** call `trigger_end_count()` — the `end_count()`/`is_tasked`
+branch is gone entirely. This retired `is_tasked` at the completion-call
+level end to end: removed from both `task_service.py` functions'
+signatures, both `/api/complete_cycle_count_line` /
+`/api/complete_cycle_count_location` routes, and the frontend's
+`completeCycleCountGroupAction()` payload. `end_count()` itself is now
+unused (removed from `task_service.py`'s imports) — `mawm_client.end_count()`
+is left in place since it's still a real, working, confirmed API
+wrapper, just no longer called from this app.
+
+**What did *not* change**: the search-time lockdown/classification
+(`_classify_cycle_count_task()`, the `"actionable"`/`"view_only"`/
+`"unsupported"` split) — that's a separate concern about what's safe
+to search by TaskId *directly*, unrelated to what an ad hoc/location
+search's own `initiateCount()` auto-attaches to internally.
+
+**Confirmed live, three ways**:
+1. Regression: multi-item ad hoc completion (`A1AC0924`, both items
+   exact match) still books correctly with the new unconditional
+   `trigger_end_count()` — no regression from removing `end_count()`.
+2. **The actual reported bug, reproduced and fixed**: created a fresh
+   real task (`CCNTINM000567`, `A1AC1201`), completed it via
+   `complete_cycle_count_line()` **by location**, exactly like the
+   user's mistaken search — count booked (`Booked`, real on-hand
+   updated) **and** the task closed (`Status: 8000`), both without any
+   `is_tasked`/TaskId involvement at all.
+3. Same thing through the actual browser UI: searched `A1AC0312` by
+   **location** (header showed the plain ad hoc "Location A1AC0312",
+   confirming the ad hoc path was genuinely taken, not the tasked
+   one), entered an out-of-tolerance quantity, completed — banner
+   correctly progressed from "Still processing (Count Initiated)" to
+   the new "Out of tolerance — pending supervisor booking. Won't
+   resolve on its own." message (confirming the polling-banner fix
+   above works together with this one), and independently confirmed
+   the real task (`CCNTINM000573`) still closed to `Status: 8000`
+   despite the count itself landing in `Pending Booking` — the same
+   "task closes regardless of whether the count actually books"
+   behavior documented earlier, now reachable from the ad hoc path
+   too.
+
+**Verification methodology note**: while investigating, found that a
+real task reused across multiple count attempts on the same location
+can accumulate **more than one** item-carrying `TaskDetail` row (not
+just one placeholder + one real, as documented earlier) — e.g.
+`CCNTINM000567` ended up with three rows total, two carrying the same
+`ItemId` from different count attempts. The correct one to check is
+whichever has the latest `CreatedTimestamp`, not just "the first row
+with a non-null `ItemId`." This only affects manual live-verification
+scripts (grepping `TaskDetail` by hand) — nothing in the app itself
+reads `TaskDetail` this way.
+
+**Not retroactively fixed**: any task already left stuck "In Progress"
+from before this fix (like the one the user manually closed via
+mobile) needs the same manual resolution as before — this only
+prevents it from happening again going forward.

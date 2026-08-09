@@ -1291,6 +1291,15 @@
         updateCycleCountLineActionButtons();
         return;
       }
+      // Real bug found live, 2026-08-09: the banner used to only ever
+      // update on this success branch, so it stayed frozen at whatever
+      // the very first response said (e.g. "Still processing (Count
+      // Initiated)...") even once the real status moved on — including
+      // to a genuinely stuck Pending Booking, which the row itself
+      // correctly showed via applyCycleCountLocationResultToGroup()
+      // above but the banner never reflected. Refresh it every tick so
+      // it tracks whatever's actually true right now.
+      setActionStatus(cycleCountGroupResponseSummary(response), "");
     }
   }
 
@@ -1310,18 +1319,15 @@
         quantity: qtyInput ? Number(qtyInput.value) : null,
       };
     });
+    // No isTasked flag anymore (2026-08-09) — the backend always calls
+    // trigger_end_count() regardless of how the location/task was
+    // found, so this app no longer needs to tell it which case it is.
     return api("complete_cycle_count_location", {
       org: state.org,
       token: state.token,
       location: state.facility,
       locationId: group.locationId,
       itemAdjustments,
-      // trigger_end_count() vs end_count() at the final step — see
-      // task_service.complete_cycle_count_location()'s docstring. Only
-      // true for a real WM-scheduled task (group.isTasked, set by
-      // resolve_search()'s mode:"cycle_count" branch); ad hoc groups
-      // never carry it, so this is false/undefined for them, unchanged.
-      isTasked: !!group.isTasked,
     });
   }
 
