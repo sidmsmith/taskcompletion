@@ -84,6 +84,7 @@ from mawm_client import (
     search_ilpn_current_location,
     search_ilpn_statuses,
     search_inventory_count_results,
+    search_inventory_count_runs,
     search_items,
     search_location_count_info,
     search_location_inventory,
@@ -417,21 +418,78 @@ def _build_task_response(raw_task: dict, task_id: str, token: str, org: str, des
     }
 
 
-def _cycle_count_task_signature_ok(raw_task: dict) -> bool:
-    """Locks the search box's tasked Cycle Count routing down to the one
-    task-creation flavor confirmed live this session (see CLAUDE.md's
-    "Tasked (non-ad-hoc) Cycle Count" section) —
-    `cycleCountTask/create`'s `TransactionId: "Cycle Count"` +
-    `AssignedTaskPoolId: "SystemTaskPool"`. Per explicit instruction:
-    the demo org has stale/unverified tasks from other flavors (e.g.
-    the earlier `"Recount"`/`"Task Interleaving"` task, and genuine ad
-    hoc byproduct tasks with the same `SystemTaskPool` but a different
-    `TransactionId`), so anything not matching this exact signature is
-    refused here rather than guessed at.
+_CYCLE_COUNT_TASK_COMPLETED_STATUS = "8000"
+
+
+def _classify_cycle_count_task(raw_task: dict) -> str:
+    """Locks the search box's tasked Cycle Count routing down to
+    `AssignedTaskPoolId: "SystemTaskPool"` (the one confirmed-safe
+    task-creation flavor, see CLAUDE.md's "Tasked (non-ad-hoc) Cycle
+    Count" section) — the demo org has stale/unverified tasks from
+    other flavors (e.g. the earlier `"Recount"`/`"Task Interleaving"`
+    task), so anything else is refused rather than guessed at. Returns
+    one of:
+
+    - `"actionable"` — still open (`TransactionId: "Cycle Count"`, its
+      original creation-time value), can run the normal count chain.
+    - `"view_only"` — `Status: "8000"` (Completed). **Found live
+      2026-08-09**: `TransactionId` is not stable — it gets overwritten
+      to this app's own `CYCLE_COUNT_TRANSACTION_ID` once *this app*
+      processes the task via `trigger_end_count()`, so re-searching an
+      already-completed task used to hit the "unsupported
+      configuration" refusal below, which was confusing (the task
+      genuinely was supported — it just finished). Status alone is the
+      robust signal for "nothing left to do here" regardless of what
+      changed `TransactionId`, so any completed SystemTaskPool task is
+      view-only, not just ones this app itself closed.
+    - `"unsupported"` — anything else (wrong pool, or an open task
+      whose `TransactionId` isn't the expected creation-time value).
     """
-    transaction_id = str(_first(raw_task, "TransactionId") or "").strip()
     task_pool = str(_first(raw_task, "AssignedTaskPoolId") or "").strip()
-    return transaction_id == "Cycle Count" and task_pool == "SystemTaskPool"
+    if task_pool != "SystemTaskPool":
+        return "unsupported"
+    status = str(_first(raw_task, "Status") or "").strip()
+    if status == _CYCLE_COUNT_TASK_COMPLETED_STATUS:
+        return "view_only"
+    transaction_id = str(_first(raw_task, "TransactionId") or "").strip()
+    if transaction_id == "Cycle Count":
+        return "actionable"
+    return "unsupported"
+
+
+def _cycle_count_task_history_result(location_id: str, task_id: str, token: str, org: str, dest: str) -> Dict[str, dict]:
+    """Looks up the historical count run/result tied to a specific
+    completed Cycle Count task, for view-only display — `{itemId:
+    _cycle_count_result_response()-shaped dict}`. A location can carry
+    more than one count run over time (repeat counts, see CLAUDE.md's
+    "screenflow gotcha" section), so this filters to the run(s) whose
+    own `TaskId` matches, not just "the latest run for the location."
+    Returns `{}` (not raises) on any lookup failure — the caller falls
+    back to a plain "Completed" placeholder per line either way, since
+    view-only status must hold regardless of whether history is found.
+    """
+    try:
+        runs = search_inventory_count_runs(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        return {}
+    matching = [r for r in runs if str(r.get("TaskId") or "") == task_id]
+    if not matching:
+        return {}
+    # Most recently updated, if somehow more than one run shares a TaskId.
+    matching.sort(key=lambda r: str(r.get("UpdatedTimestamp") or ""), reverse=True)
+    count_run_id = str(matching[0].get("CountRunId") or "")
+    if not count_run_id:
+        return {}
+    try:
+        rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        return {}
+    out: Dict[str, dict] = {}
+    for row in rows:
+        item_id = str(row.get("ItemId") or "")
+        if item_id:
+            out[item_id] = _cycle_count_result_response(row, location_id, item_id, count_run_id)
+    return out
 
 
 def _resolve_cycle_count_task(
@@ -449,7 +507,8 @@ def _resolve_cycle_count_task(
     docstring; task closure requires it, count booking works either
     way).
     """
-    if not _cycle_count_task_signature_ok(raw_task):
+    classification = _classify_cycle_count_task(raw_task)
+    if classification == "unsupported":
         transaction_id = str(_first(raw_task, "TransactionId") or "")
         task_pool = str(_first(raw_task, "AssignedTaskPoolId") or "")
         return {
@@ -468,13 +527,24 @@ def _resolve_cycle_count_task(
     if not result.get("success"):
         return result
 
+    is_view_only = classification == "view_only"
     result["taskId"] = task_id
     result["isTasked"] = True
+    result["isReadOnly"] = is_view_only
     result["taskStatus"] = str(_first(raw_task, "Status") or "")
     result["taskStatusLabel"] = task_status_description(_first(raw_task, "Status"))
+    if is_view_only:
+        history = _cycle_count_task_history_result(location_id, task_id, token, org, dest)
     for line in result.get("lines") or []:
         line["taskId"] = task_id
         line["isTasked"] = True
+        if is_view_only:
+            item_result = history.get(line["itemId"]) if history else None
+            if item_result is None:
+                item_result = {"success": True, "status": "Completed"}
+            line["result"] = item_result
+            if item_result.get("countedQty") is not None:
+                line["quantity"] = item_result["countedQty"]
     return result
 
 
@@ -2152,8 +2222,32 @@ def complete_cycle_count_line(
     return response
 
 
+def _attach_polled_task_status(response: dict, task_id: str, token: str, org: str, dest: str) -> None:
+    """Refreshes `taskStatus`/`taskStatusLabel` on a poll response
+    in-place, for a tasked (`is_tasked=True`) group only (2026-08-09,
+    fixing a real gap the user found live: the header's Task Status
+    stayed frozen at its search-time value forever, even after the
+    task actually closed — because task closure is independent of
+    count booking (see CLAUDE.md's "task status alone is never proof"
+    caveat) and can happen mid-poll, but nothing was re-querying
+    task/api/task/task/search to pick that up. `task_id` is falsy for
+    ad hoc groups, which just skip this — one extra search_task() call
+    per poll tick only for real tasks.
+    """
+    if not task_id:
+        return
+    try:
+        raw_task = search_task(task_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        return
+    if raw_task:
+        response["taskStatus"] = str(_first(raw_task, "Status") or "")
+        response["taskStatusLabel"] = task_status_description(_first(raw_task, "Status"))
+
+
 def check_cycle_count_status(
-    token: str, org: str, location_id: str, item_id: str, count_run_id: str, location: str = None
+    token: str, org: str, location_id: str, item_id: str, count_run_id: str, location: str = None,
+    task_id: str = None,
 ) -> Dict[str, Any]:
     """Lightweight poll target for the frontend (2026-08-08) — re-checks
     search_inventory_count_results() for one already-started count run,
@@ -2176,6 +2270,7 @@ def check_cycle_count_status(
         return {"success": False, "error": f"inventoryCountResult search failed: {exc}"}
     result_row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
     response = _cycle_count_result_response(result_row, location_id, item_id, count_run_id)
+    _attach_polled_task_status(response, task_id, token, org, dest)
 
     try:
         info = search_location_count_info(location_id, token, org, location=dest)
@@ -2319,7 +2414,8 @@ def complete_cycle_count_location(
 
 
 def check_cycle_count_location_status(
-    token: str, org: str, location_id: str, item_ids: List[str], count_run_id: str, location: str = None
+    token: str, org: str, location_id: str, item_ids: List[str], count_run_id: str, location: str = None,
+    task_id: str = None,
 ) -> Dict[str, Any]:
     """Multi-item counterpart to check_cycle_count_status() — the
     lightweight poll target complete_cycle_count_location()'s caller
@@ -2346,10 +2442,12 @@ def check_cycle_count_location_status(
         info = search_location_count_info(location_id, token, org, location=dest)
     except Exception:  # noqa: BLE001
         info = None
-    return {
+    response = {
         "success": all(r.get("success") for r in results),
         "locationId": location_id,
         "countRunId": count_run_id,
         "results": results,
         "locationLocked": bool(info and info.get("CycleCountPending")),
     }
+    _attach_polled_task_status(response, task_id, token, org, dest)
+    return response

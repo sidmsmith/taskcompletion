@@ -1993,3 +1993,92 @@ test, `CCNTINM000558` (`A1AC0123`, item `6000108`, on-hand `240`):
 
 Version bumped to `v0.13.0` for this change (real new user-facing
 capability, not just a doc/investigation update).
+
+## Tasked Cycle Count: live header status + view-only completed tasks (2026-08-09, tenth session)
+
+Real user testing against the v0.13.0 UI wiring above surfaced two
+issues, both fixed the same session:
+
+**Bug 1 — header Task Status never updated after completion.** The
+header (`renderCycleCountTaskMeta()`) only rendered once at search
+time, from that moment's `taskStatus`. Nothing refreshed it
+afterward, so it stayed frozen at e.g. "Ready For Assignment" forever
+even after the task actually closed — misleading, since (per the
+already-documented caveat) task closure can happen well before or
+independent of the count itself booking.
+
+Fixed: `check_cycle_count_status()`/`check_cycle_count_location_status()`
+(the poll targets `pollCycleCountGroupStatus()` already calls every
+2s) gained an optional `task_id` parameter — when present (only for a
+tasked group; ad hoc passes none and pays no extra cost), a shared new
+`_attach_polled_task_status()` helper re-queries `search_task()` and
+attaches fresh `taskStatus`/`taskStatusLabel` to the response. The
+frontend now reads that off every poll tick and calls
+`renderCycleCountTaskMeta()` again — confirmed live: header correctly
+flipped from "Ready For Assignment" to "Completed" a few seconds after
+Complete Line, in step with the count itself reaching "Booked."
+
+**Bug 2 — re-searching a completed task threw a confusing hard
+error.** Exactly the mechanism flagged as a risk when the lockdown was
+first built: `TransactionId` on a Task record isn't stable — it gets
+overwritten to this app's own `CYCLE_COUNT_TRANSACTION_ID`
+("Cycle Count Active-API") once *this app* processes the task via
+`trigger_end_count()`. So re-searching an already-completed task hit
+the original `_cycle_count_task_signature_ok()` check (which only
+recognized the original creation-time `TransactionId: "Cycle Count"`)
+and got refused with "unsupported configuration" — technically true
+but deeply misleading, since the task was genuinely supported and had
+simply finished.
+
+Fixed: replaced the boolean signature check with
+`_classify_cycle_count_task(raw_task) -> "actionable" | "view_only" |
+"unsupported"`. `AssignedTaskPoolId` must still be `"SystemTaskPool"`
+either way (the actual lockdown boundary); beyond that, `Status ==
+"8000"` (Completed) alone is treated as `"view_only"` — deliberately
+**not** conditioned on `TransactionId`, since a completed task poses
+zero risk of "processing a bad task" regardless of what changed its
+`TransactionId` (there's nothing left to process). An open task still
+requires the original `TransactionId: "Cycle Count"` to be
+`"actionable"`; anything else stays `"unsupported"` and refused as
+before.
+
+**View-only rendering — and the "show what the task did" ask, done
+via a genuinely small amount of new code.** For `"view_only"`, a new
+`_cycle_count_task_history_result()` looks up the specific
+`inventoryCountRun` whose own `TaskId` matches (a location can carry
+several runs over time — filters to the right one, not just "the
+latest for the location"), pulls its `inventoryCountResult` rows, and
+builds each item's result via the **already-existing**
+`_cycle_count_result_response()` — the exact same shape used for a
+live in-progress result. Each line gets `line.result` (falls back to
+a plain `{success: true, status: "Completed"}` if no history is found,
+so view-only always holds even without history) and
+`line.quantity = <the real counted amount>`.
+
+On the frontend, `renderCycleCountGroups()` now applies any
+`line.result` immediately after rendering by calling the **already-
+existing** `setCycleCountResultCell(..., true)` — which already had
+the side effect (built for the live-completion case, unrelated to this
+feature) of disabling the item/qty inputs and marking a line "done."
+That one existing side effect is the *entire* read-only mechanism —
+`isCycleCountGroupDone()` already keeps a done group out of both
+Complete Line and Complete All (confirmed live: Complete Line disabled
+immediately; Complete All stays clickable but correctly reports "No
+outstanding lines to complete" since `allOutstandingCycleCountGroups()`
+already filters out done groups — pre-existing behavior, not
+something new this needed). `cycleCountLineRowHtml()`'s qty input now
+seeds its `value` from `line.quantity` when present (previously always
+blank) so it displays the counted amount instead of an empty box
+before getting disabled. No new gating logic, no new CSS, no new
+"read-only" concept in the frontend at all — entirely reused machinery
+from live completion.
+
+**Confirmed live**: re-searched `CCNTINM000560` (completed moments
+earlier in the same test) — header showed `Status Completed`
+immediately, item (`4000087`) and qty (`20`) inputs both correctly
+`disabled` with the real counted values, result cell showed
+`Booked` / `20 → 20` / `0 ($0)` (the real historical outcome, not a
+placeholder), Complete Line `disabled`, Complete All left enabled but
+verified via `openAllCycleCountLinesModal()`'s existing logic that it
+would only report "No outstanding lines to complete," never attempt to
+reprocess anything.

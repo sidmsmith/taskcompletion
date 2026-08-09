@@ -939,9 +939,9 @@
           <td class="col-qty-wide">
             <input
               type="number"
-              class="form-control cc-qty-input invalid"
+              class="form-control cc-qty-input${line.quantity == null ? " invalid" : ""}"
               data-task-detail-id="${escapeAttr(line.taskDetailId)}"
-              value=""
+              value="${line.quantity == null ? "" : escapeAttr(line.quantity)}"
               step="any"
             />
           </td>
@@ -1018,6 +1018,22 @@
     el.cycleCountLinesTable.style.display = "";
     renderCycleCountTaskMeta();
     el.cycleCountLinesBody.innerHTML = state.groups.map((g) => cycleCountGroupRowsHtml(g)).join("");
+    // A view-only group (task_service._resolve_cycle_count_task()'s
+    // isReadOnly, 2026-08-09 — a Cycle Count task that's already
+    // Completed) carries its historical result on each line already,
+    // not from a live poll. Applying it here with done=true reuses
+    // setCycleCountResultCell()'s existing side effect of disabling
+    // the item/qty inputs and marking the line done — no separate
+    // read-only styling/gating needed, since isCycleCountGroupDone()
+    // already keeps a done group out of both Complete Line and
+    // Complete All.
+    (state.groups || []).forEach((g) => {
+      (g.lines || []).forEach((line) => {
+        if (line.result) {
+          setCycleCountResultCell(line.taskDetailId, cycleCountResultText(line.result), cycleCountResultKind(line.result), true);
+        }
+      });
+    });
     updateCycleCountLineActionButtons();
   }
 
@@ -1241,11 +1257,22 @@
           locationId: group.locationId,
           itemIds,
           countRunId: initialResponse.countRunId,
+          taskId: group.taskId || "",
         });
       } catch (e) {
         return; // quietly stop polling -- the rows still show the last known state
       }
       applyCycleCountLocationResultToGroup(group, response);
+      // Real finding, 2026-08-09: a tasked group's Task Status can
+      // close well before (or without ever) the count itself booking
+      // — see CLAUDE.md's "task status alone is never proof" caveat —
+      // so this needs its own live refresh here, from the same poll
+      // tick, rather than assuming it tracks count status.
+      if (response.taskStatus !== undefined) {
+        group.taskStatus = response.taskStatus;
+        group.taskStatusLabel = response.taskStatusLabel;
+        renderCycleCountTaskMeta();
+      }
       if (response.success) {
         setActionStatus("Location " + group.locationId + " booked.", "success");
         updateCycleCountLineActionButtons();

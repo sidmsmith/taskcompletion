@@ -36,7 +36,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.13.1"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -269,9 +269,10 @@ def check_cycle_count_status_route():
     location_id = (data.get("locationId") or data.get("location_id") or "").strip()
     item_id = (data.get("itemId") or data.get("item_id") or "").strip()
     count_run_id = (data.get("countRunId") or data.get("count_run_id") or "").strip()
+    task_id = (data.get("taskId") or data.get("task_id") or "").strip() or None
     try:
         result = check_cycle_count_status(
-            token, org, location_id, item_id, count_run_id, location=location
+            token, org, location_id, item_id, count_run_id, location=location, task_id=task_id
         )
         return jsonify(result)
     except Exception as e:
@@ -322,9 +323,10 @@ def check_cycle_count_location_status_route():
     location_id = (data.get("locationId") or data.get("location_id") or "").strip()
     item_ids = data.get("itemIds") or data.get("item_ids") or []
     count_run_id = (data.get("countRunId") or data.get("count_run_id") or "").strip()
+    task_id = (data.get("taskId") or data.get("task_id") or "").strip() or None
     try:
         result = check_cycle_count_location_status(
-            token, org, location_id, item_ids, count_run_id, location=location
+            token, org, location_id, item_ids, count_run_id, location=location, task_id=task_id
         )
         return jsonify(result)
     except Exception as e:
