@@ -2078,7 +2078,54 @@ earlier in the same test) — header showed `Status Completed`
 immediately, item (`4000087`) and qty (`20`) inputs both correctly
 `disabled` with the real counted values, result cell showed
 `Booked` / `20 → 20` / `0 ($0)` (the real historical outcome, not a
-placeholder), Complete Line `disabled`, Complete All left enabled but
-verified via `openAllCycleCountLinesModal()`'s existing logic that it
-would only report "No outstanding lines to complete," never attempt to
-reprocess anything.
+placeholder), Complete Line `disabled`. Complete All was initially
+left enabled at this point (functionally harmless, per
+`openAllCycleCountLinesModal()`'s own emptiness check — see the next
+section for the follow-up fix once the user flagged it looking wrong).
+
+## Two more polish fixes from real use (2026-08-09, tenth session)
+
+**Complete All stayed visually enabled on an all-done batch.**
+`allOutstandingCycleCountGroupsValid()` deliberately returns `true`
+when there's nothing outstanding ("let the click through to show
+'nothing to do'" — a real, intentional 2026-08-08 design choice, not a
+bug in itself), but `updateCycleCountLineActionButtons()` used that
+return value directly to gate the button, so a fully-completed batch
+(e.g. a re-searched already-`Completed` task, or any location that's
+already fully done) left Complete All looking clickable — confirmed
+functionally harmless (`openAllCycleCountLinesModal()`'s own
+emptiness check catches it and just shows "No outstanding lines to
+complete") but visually confusing, per the user. Fixed:
+`updateCycleCountLineActionButtons()` now separately checks
+`allOutstandingCycleCountGroups().length` before trusting
+`allOutstandingCycleCountGroupsValid()`'s own "true when empty"
+return — greys the button out whenever there's nothing outstanding,
+while `allOutstandingCycleCountGroupsValid()` itself is unchanged
+(still used, and still correct, for the "some things outstanding but
+not yet filled in" case). Confirmed live: re-searching the completed
+`CCNTINM000560` now shows both Complete Line and Complete All
+`disabled`.
+
+**"Still processing... status will keep updating" was misleading for
+Pending Booking specifically.** `cycleCountGroupResponseSummary()`
+builds the action-status banner shown right after Complete
+Line/Complete All. Across every out-of-tolerance test this session —
+single-item and multi-item, ad hoc and tasked, no exceptions — a
+`Pending Booking` result has been a **permanent** terminal state, not
+a transient one: MAWM never resolves it on its own, it just sits
+locked until a supervisor manually books or rejects it. The generic
+"status will keep updating" phrasing was actively wrong for this
+specific case. Fixed: when every item in the group's response already
+shows `Pending Booking`, the banner now reads "Out of tolerance —
+pending supervisor booking. Won't resolve on its own." instead.
+**Scope note**: only the *message* changed — `pollCycleCountGroupStatus()`
+itself still polls up to the full 60s window regardless of status,
+deliberately left alone (matching the existing docstring's own
+caution that there's "no way to tell [transient vs. stuck] apart from
+the status text alone" — confirmed strongly enough now to fix the
+message, not confirmed strongly enough to want to silently stop
+watching a row that's supposedly stuck, in case a real exception ever
+turns up). Confirmed live: counting `A1AC0123` (on-hand `240`) at `50`
+under a fresh task showed the new banner text immediately, with the
+row itself still correctly showing `Pending Booking` / `240 → 50` /
+`-190 ($950)`.

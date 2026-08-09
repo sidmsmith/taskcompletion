@@ -1106,9 +1106,21 @@
     return state.groups.filter((g) => !isCycleCountGroupDone(g));
   }
 
+  /**
+   * `true` when empty (2026-08-08) — openAllCycleCountLinesModal()
+   * already checks emptiness itself before calling this, so that case
+   * never actually reaches the check below there. Only
+   * updateCycleCountLineActionButtons() relies on the empty-input
+   * behavior, and it ANDs this with its own outstanding-count check
+   * (see below, 2026-08-09 fix) rather than trusting this return value
+   * alone — so an all-done batch (e.g. every group already completed,
+   * or a re-searched already-Completed task) correctly greys the
+   * button out instead of leaving it clickable-but-a-no-op, which the
+   * user found confusing live.
+   */
   function allOutstandingCycleCountGroupsValid() {
     const outstanding = allOutstandingCycleCountGroups();
-    if (!outstanding.length) return true; // let the click through to show "nothing to do"
+    if (!outstanding.length) return true;
     return outstanding.every((g) => isCycleCountGroupValid(g));
   }
 
@@ -1122,7 +1134,8 @@
     const hasSelection = !!selectedGroup;
     const selectedValid = hasSelection && !isCycleCountGroupDone(selectedGroup) && isCycleCountGroupValid(selectedGroup);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
-    el.allLinesBtn.disabled = !allOutstandingCycleCountGroupsValid();
+    const outstanding = allOutstandingCycleCountGroups();
+    el.allLinesBtn.disabled = !outstanding.length || !allOutstandingCycleCountGroupsValid();
   }
 
   function selectCycleCountGroup(groupKey) {
@@ -1377,6 +1390,18 @@
     if (response.error) return response.error;
     const results = response.results || [];
     if (!results.length) return "Complete failed";
+    // "Pending Booking" is confirmed live — repeatedly, across every
+    // out-of-tolerance test this session, single-item and multi-item,
+    // ad hoc and tasked — to be a permanent terminal state, not a
+    // transient one: MAWM never resolves it on its own, it just sits
+    // locked until a supervisor manually books or rejects it (see
+    // CLAUDE.md's Cycle Count sections). When every item in the group
+    // already shows it, say so plainly instead of "status will keep
+    // updating," which the user found actively misleading here
+    // (2026-08-09) — nothing further will update on its own.
+    if (results.length && results.every((r) => r.status === "Pending Booking")) {
+      return "Out of tolerance — pending supervisor booking. Won't resolve on its own.";
+    }
     const statuses = results.map((r) => r.status || (r.success ? "Booked" : "Unknown")).join(", ");
     return "Still processing (" + statuses + ") — status will keep updating.";
   }
