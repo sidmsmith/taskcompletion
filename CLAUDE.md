@@ -1700,9 +1700,8 @@ it — not just reusing an old one):
   independently of task status once tasked cycle count is wired into
   it — never treat a closed task as proof the count succeeded.
 
-Multi-item locations (more than one distinct item under one task/run)
-under a real task are still untested — everything above has been
-single-item locations only. No UI wiring exists yet either way.
+Multi-item locations under a real task are now confirmed too — see
+the section immediately below.
 
 **No UI wiring done** — there is still no way to reach `is_tasked=True`
 from the actual app UI. Two separate gaps remain, both still open:
@@ -1714,22 +1713,163 @@ from the actual app UI. Two separate gaps remain, both still open:
 Both need more confirmed backend behavior first (see below), so
 they're intentionally left until then.
 
+## Multi-item location under a real task — confirmed, plus a genuine screenflow gotcha (2026-08-09, tenth session)
+
+**Test location**: `A1AC0924` (same one ad hoc proved atomicity on —
+item `5000001` "10 Pack SD Rice", item `5000002` "10 Pack SD Wheat").
+Each test created a fresh real task via `cycleCountTask/create`,
+waited ~6s, and independently confirmed via `task/api/task/task/search`
+that a new open task actually existed before counting against it.
+
+**Happy path — fully confirmed, clean.** `CCNTINM000552`, both items
+counted at exact on-hand (`5000001`: 1739, `5000002`: 750) via
+`complete_cycle_count_location(..., is_tasked=True)`. Both items
+reached `inventoryCountResult.Status: "Booked"` within 3s; `Task.Status`
+closed to `8000`; **both** items got their own real `TaskDetail` row
+(not just one) with `CompletedQuantity == Quantity` matching each
+item's own counted value (`1739.0`/`750.0`). Confirms the
+per-item-row-created-during-the-count pattern (documented above for
+single-item) generalizes correctly to multiple items under one task.
+
+**Out of tolerance — fully confirmed, matches ad hoc exactly.**
+`CCNTINM000553`, `5000001` counted `1000` (way off from 1739),
+`5000002` counted `750` (exact). Confirmed live: **both** items ended
+up `"Pending Booking"` — including `5000002`, which matched exactly —
+exactly like ad hoc's own "one item off holds the whole location"
+finding. `inventoryCountRun.Status: 35`, never booked, real on-hand
+unchanged for both items (1739/750), location stayed locked. **The
+task still closed to `Status: 8000` anyway**, same as the single-item
+out-of-tolerance case — this generalizes too: task closure is
+independent of count booking regardless of item count.
+
+**Within tolerance — confirmed the *intended ad hoc atomicity behavior
+holds*, but ran into a genuine screenflow gotcha along the way that's
+worth documenting rather than fixing.** Tried to test `5000001` off by
+15 (0.9%, expected within tolerance) with `5000002` exact, expecting a
+clean parallel to ad hoc's within-tolerance case. Created a third task,
+`CCNTINM000554`, and confirmed it existed before testing — but because
+`A1AC0924` was **still locked from the unresolved out-of-tolerance run
+above** (`CNT000807` never got booked or otherwise resolved — nothing
+ever clears a genuinely out-of-tolerance `Pending Booking` run except a
+supervisor), `initiateCount` did not start an independent fresh count
+for the new task. Instead:
+
+- `CountRunId` stayed `CNT000807` — the *same* stuck run from the
+  out-of-tolerance test — while `TaskId` came back as a **brand new**
+  ID (`CCNTINM000554`, then — confirmed by calling `initiateCount`
+  again standalone afterward purely to inspect this — `CCNTINM000555`
+  the very next call). **Every `initiateCount` call against a location
+  stuck in unresolved Pending Booking appears to mint a fresh TaskId
+  every time**, while reusing the same underlying stuck `CountRunId`.
+- Completing the chain with the new "within tolerance" quantities
+  (`persistCountDetails`) overwrote `CNT000807`'s stored counted
+  values with the new attempt's numbers — `inventoryCountResult`
+  now shows `1724`/`-15 variance` for `5000001`, not the original
+  `1000`/`-739` — but **the run's own status stayed `"Pending
+  Booking"`** (it didn't re-evaluate to "within tolerance" and book,
+  it just kept the same terminal status with newer numbers sitting
+  under it).
+- **`trigger_end_count()` still closed the new task (`CCNTINM000554`)
+  to `Status: 8000` anyway**, with its own `TaskDetail` showing the
+  new attempt's values (`1724.0`/`750.0`) as if genuinely completed.
+  Meanwhile `CCNTINM000553` (the *original* out-of-tolerance task)
+  independently still shows `Status: 8000` too, but with **its own**
+  `TaskDetail` frozen at **its** attempt's values (`1000.0`/`750.0`) —
+  two different "Completed" tasks now exist for the same location,
+  each showing different, both-stale counted quantities, neither of
+  which matches the real underlying count state.
+- `CCNTINM000555` (created purely by the standalone inspection
+  `initiateCount` call, nothing else run against it) never appeared in
+  `task/api/task/task/search` even after a further 5s wait — left
+  alone, not investigated further or completed, per explicit
+  instruction not to chase or fix screenflow oddities reactively.
+
+**Net assessment, stated plainly**: this is not a bug introduced by
+this app's wiring — `is_tasked=True` did exactly what it's supposed to
+at each individual call. It's a real characteristic of how MAWM's
+`cycleCountTask/create` + `initiateCount` behave when repeatedly
+invoked against a location that's already stuck in unresolved Pending
+Booking: each attempt spins up a new, independently-"completable" Task
+Management record layered on top of the same broken underlying count,
+and `trigger_end_count()` will happily mark each one "Completed" even
+though none of them reflects whether the actual inventory was ever
+corrected. **A supervisor (or this app, once built) relying on Task
+Management status to know "is this location's count resolved" would be
+badly misled** by a stuck location — multiple "Completed" tasks would
+exist while the real count sits permanently unresolved. This sharpens
+the caveat already recorded above (task status isn't proof a count
+booked) into something with a concrete, reproducible multi-task
+trail attached. Genuinely testing a *clean* multi-item within-tolerance
+scenario needs either a location that hasn't already been driven into
+Pending Booking, or the existing stuck run resolved by a supervisor
+first — neither attempted here, per instruction not to react
+reflexively.
+
+**Follow-up (2026-08-09, same session)**: the user rejected the
+Pending Booking runs in the real WM UI (a supervisor-level action, not
+something this app exposes), confirmed live by `CycleCountPending`
+clearing to `false` and `inventoryCountRun.Status` moving to `70`
+("Booking Rejected"). Created a fourth task, `CCNTINM000556`, on the
+now-clean location and re-ran the same attempt (`5000001` at `1724`,
+15 off from 1739; `5000002` exact). This time `initiateCount` correctly
+returned a **genuinely fresh** `CountRunId` (`CNT000808`) — confirming
+the earlier TaskId-churn/stale-run behavior really was specific to an
+already-stuck location, not a general bug. But **the fresh run also
+went straight to `Pending Booking` and stayed there for 24s of
+polling**, real inventory untouched. So the -15/1739 (0.86%) variance
+that was assumed "within tolerance" (by analogy with `A1AC1201`'s
+-1/40 = 2.5% and an older ad hoc test's -8/898 = 0.9%, both of which
+did book) turned out to exceed **this item's** actual tolerance
+threshold — tolerance is evidently configured per item/location, not
+a single global percentage, so past passing examples don't reliably
+predict a new item's threshold. The atomic hold (`5000002`, exact
+match, held too) and task-closes-anyway (`Task.Status: 8000` despite
+the run staying `Pending Booking`) behaviors both reconfirmed cleanly
+on this fresh run — so the *mechanism* is solidly proven twice now;
+only the specific "land inside this item's tolerance band" outcome is
+still unachieved. Location `A1AC0924` is now stuck again
+(`CNT000808`, `Pending Booking`) pending the same manual
+rejection/booking decision.
+
+**Within tolerance, finally clean (2026-08-09, same session)**: the
+user rejected `CNT000808` too (same manual WM UI action — confirmed
+live, `CycleCountPending` back to `false`), then asked to retry with
+just 1 unit off, "to ensure that it works as expected." Created a
+fifth task, `CCNTINM000557`, confirmed open, and counted `5000001` at
+`1738` (-1/1739, 0.06%) with `5000002` exact. **Fully clean this
+time**: `complete_cycle_count_location()`'s immediate response showed
+`"Count Complete"` (`StatusKey: 30`) for both items — the same
+previously-documented ad hoc multi-item intermediate status, not
+`Pending Booking` — and within ~3s both items reached
+`inventoryCountResult.Status: "Booked"`, `varianceQty: -1`/`0`.
+Independently confirmed: real on-hand for `5000001` actually moved to
+`1738` (5000002 stayed `750`), `inventoryCountRun.Status: 80`
+(Booked) with `BookedDateTime` populated, `Task.Status: 8000`, and
+**both** `TaskDetail` rows correctly show `CompletedQuantity ==
+Quantity` matching each item's own counted value. Location unlocked
+afterward. This closes out the last open piece — **all three
+tolerance outcomes (happy path, within-tolerance, out-of-tolerance)
+are now confirmed at both the single-item and multi-item level**,
+matching ad hoc's own behavior exactly in every case except the one
+documented caveat: task closure is independent of count booking, so
+task status alone is never proof a count was actually applied.
+
 **Remaining test plan**, same rigor as every test above (never trust
 response `success` alone — always independently re-query):
-1. Multi-item location under a real task — no-variance first, then
-   within-tolerance, then out-of-tolerance, mirroring how ad hoc was
-   proven, using `/api/complete_cycle_count_location` with
-   `isTasked: true` and every item's real quantity. (All three
-   tolerance outcomes are now confirmed at the *single-item* level —
-   this is specifically about whether the atomic multi-item behavior
-   ad hoc already relies on, e.g. one item's tolerance failure holding
-   back the whole location, carries over unchanged under a real task.)
-2. A task created via a real WM scheduling flow (not
+1. A task created via a real WM scheduling flow (not
    `cycleCountTask/create`) with a different `TransactionId`/
    `AssignedTaskPoolId` than both flavors tested so far, if one
    becomes available, to widen confidence beyond these two known
    shapes.
-3. Only after multi-item tasked completion is confirmed should the
-   UI/search-routing gaps above get built — single-item tasked
-   completion (happy path, within-tolerance, out-of-tolerance) is now
-   fully confirmed.
+2. Decide deliberately (not reactively) whether/how this app should
+   guard against the stuck-location multi-task-trail scenario above
+   before any UI wiring happens — e.g. surfacing existing
+   `Pending Booking` state up front and blocking a fresh tasked count
+   attempt against an already-locked location, rather than letting it
+   silently mint another eventually-"Completed" task. Not yet decided
+   or built — flagged for explicit discussion first.
+3. All core tasked-cycle-count completion behavior (single-item and
+   multi-item, all three tolerance outcomes) is now fully confirmed.
+   UI/search-routing work is the remaining piece — worth deciding on
+   the stuck-location guard above first, since the UI is where a real
+   user would actually run into it.
