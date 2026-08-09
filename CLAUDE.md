@@ -1594,18 +1594,10 @@ Also reconfirmed via the other read-only endpoints, all consistent:
 "Booked"` with `OriginalQuantity`/`CountQuantity` both `150`,
 `VarianceQuantity: 0`.
 
-**Not yet tested**: a fresh end-to-end run using the trigger call from
-the start (this test reused an already-booked run, calling the new
-endpoint solely to check task closure). Also not yet tested: whether
-`/count/endCount/trigger` is safe to use universally (i.e. also for ad
-hoc counts, which currently use the already-working `/count/end`) —
-no reason yet to touch the working ad hoc path.
-
-**Wired into the backend (2026-08-09), not yet reachable from the
-UI.** Since the user doesn't have an open real WM-scheduled Cycle
-Count task to test against yet (still working on creating one),
-wiring was done conservatively rather than switching the proven ad
-hoc path over to unconfirmed behavior:
+**Wired into the backend (2026-08-09).** Since the user didn't have an
+open real WM-scheduled Cycle Count task to test against yet at the
+time, wiring was done conservatively rather than switching the proven
+ad hoc path over to unconfirmed behavior:
 
 - `mawm_client.trigger_end_count(location_id, count_run_id, task_id,
   token, org, location=None)` — new function, the confirmed
@@ -1627,50 +1619,117 @@ hoc path over to unconfirmed behavior:
   forwarded straight through) so the wired-up path can be exercised
   directly once real task data exists, without needing the UI.
 
+**Confirmed end-to-end, fresh, real tasks (2026-08-09).** The user
+found a genuine task-creation call —
+`POST /inventory-management/api/inventory-management/count/cycleCountTask/create`,
+body a bare array of location IDs (e.g. `["A1AC1201"]`) — that creates
+a real WM Cycle Count task for a location after a short delay and sets
+the location's `CycleCountPending` lock, with a lot of admin
+configuration behind it the user set up outside this app. Used it to
+create two fresh tasks, `CCNTINM000548` (`A1AC0123`) and `CCNTINM000549`
+(`A1AC1201`), then ran `task_service.complete_cycle_count_line(...,
+is_tasked=True)` directly (bypassing the UI, per the plan below) for a
+single-item exact-match happy-path test on each — **both fully
+confirmed**, count and task together, first try:
+
+- `CCNTINM000548`/`A1AC0123`, item `6000108`, counted `240` (matches
+  on-hand exactly): count run `CNT000802` reached
+  `inventoryCountResult.Status: "Booked"` in ~3s;
+  `task/api/task/task/search` on `CCNTINM000548` showed `Status: 8000`
+  and the real `TaskDetail` row (`ItemId: "6000108"`)
+  `CompletedQuantity: 240.0` = `Quantity: 240.0`, stable across 18s of
+  polling. `locationCountInfo.CycleCountPending` cleared to `false`.
+- `CCNTINM000549`/`A1AC1201`, item `4000087`, counted `40` (exact
+  match): identical result shape — `Booked` in ~3s,
+  `Task.Status: 8000`, real `TaskDetail.CompletedQuantity: 40.0` =
+  `Quantity: 40.0`.
+
+**Worth noting**: these two tasks are a different flavor from
+`CCNTINM000023` tested earlier — `TransactionId: "Cycle Count"` (not
+`"Recount"`) and `AssignedTaskPoolId: "SystemTaskPool"` (not `"Task
+Interleaving"`), which is the exact same `AssignedTaskPoolId` value
+previously used as the signature of an ad hoc *byproduct* task
+(`CCNTINM0000000021`). The user flagged in advance that this
+`TransactionId` "may or may not work as expected" — it worked cleanly
+for both single-item happy-path tests, but this is a second, distinct
+task-creation path from `CCNTINM000023`'s, so it's not yet proof every
+task-creation flavor behaves identically. **Per explicit instruction,
+did not chase or "fix" anything speculative here** — both tests were
+clean, so there was nothing to react to.
+
+Both tests above are single-item, exact-match only.
+
+**Within-tolerance and out-of-tolerance also confirmed (2026-08-09),
+same session**, each via a *freshly created* task (using
+`cycleCountTask/create` per above, confirming after a few seconds'
+wait that a new open task actually appeared before counting against
+it — not just reusing an old one):
+
+- **Within tolerance**: created `CCNTINM000550` for `A1AC1201`
+  (on-hand `40`), counted `39` (off by 1). `acceptQuantity`-level
+  behavior matched ad hoc exactly — count passed through an
+  intermediate `"In Booking"` stage before reaching
+  `inventoryCountResult.Status: "Booked"` at ~9s, `varianceQty: -1`.
+  **The task closed to `Status: 8000` almost immediately (~3s) — before
+  the count itself finished booking.** Real `TaskDetail`
+  `CompletedQuantity: 39.0` = `Quantity: 39.0` (the *counted* value,
+  not the original on-hand). Task closure and count booking are
+  evidently independent/asynchronous of each other, not sequenced.
+- **Out of tolerance**: created `CCNTINM000551` for `A2AC1201`
+  (on-hand `20`), counted `10` (-50% variance). Immediately came back
+  `Status: "Pending Booking"`, exactly like ad hoc. **Confirmed stuck
+  there across 18s of polling** — `inventoryCountRun.Status: 35`,
+  `BookedDateTime: null`, `locationCountInfo.CycleCountPending`
+  stayed `true` throughout, real inventory unchanged at `20`.
+
+  **But the task still closed anyway** — `Task.Status: 8000` from the
+  very first poll (~3s), real `TaskDetail.CompletedQuantity: 10.0` =
+  `Quantity: 10.0` (the counted, *not-yet-applied* quantity), stable
+  across every subsequent poll. **This answers the open question from
+  the section above, and it's worth flagging clearly rather than
+  smoothing over**: `trigger_end_count()` closes the Task Management
+  record regardless of whether the underlying inventory count ever
+  actually books. A supervisor looking at Task Management alone would
+  see this Cycle Count task as "Completed" even though the real
+  inventory correction is still sitting unresolved, pending their own
+  manual booking decision, exactly the scenario `Pending Booking`
+  exists to gate. Task status is **not** a reliable signal for
+  "the count was actually applied" — only `inventoryCountResult.Status
+  == "Booked"` (or `locationCountInfo.CycleCountPending == false`) is.
+  This app's own UI must keep surfacing count/booking status
+  independently of task status once tasked cycle count is wired into
+  it — never treat a closed task as proof the count succeeded.
+
+Multi-item locations (more than one distinct item under one task/run)
+under a real task are still untested — everything above has been
+single-item locations only. No UI wiring exists yet either way.
+
 **No UI wiring done** — there is still no way to reach `is_tasked=True`
 from the actual app UI. Two separate gaps remain, both still open:
 1. The search box doesn't route a real Cycle Count `TaskId` (like
-   `CCNTINM000023`) to the cycle-count UI at all yet — it would fall
+   `CCNTINM000548`) to the cycle-count UI at all yet — it would fall
    into the generic Putaway-style task path instead.
 2. Even if it did, nothing in the UI/frontend sets `is_tasked: true`
    when calling the two completion endpoints.
-Both need real task data in hand to build against sensibly (matching
-how the rest of ad hoc cycle count was only built after live-testing
-each piece), so they're intentionally left until then.
+Both need more confirmed backend behavior first (see below), so
+they're intentionally left until then.
 
-**Test plan for once a real open Cycle Count task exists** (either a
-fresh `CCNTINM...`-style task or whatever the user manages to create):
-1. Read-only first — confirm the task is real and open:
-   `task/api/task/task/search` with `Query: "TaskId ='<id>'"`, check
-   `Status` (expect something pre-`8000`, e.g. `3000` Ready For
-   Assignment or `7000` In Progress) and note `BeginLocationId`/
-   `SourceLocationId` for the location.
-2. Call `/api/complete_cycle_count_line` (single item) or
-   `/api/complete_cycle_count_location` (whole location, all items)
-   directly — `curl`/Python script, not through the UI yet — with
-   `isTasked: true`, the real `locationId`, and a **matching quantity**
-   for a happy-path/no-variance test first (established pattern: test
-   happy path before exceptions).
-3. Independently re-verify, same rigor as every other test this
-   session — don't trust the response `success` alone:
-   - `task/api/task/task/search` again: `Task.Status` should move to
-     `8000`. **Check every `TaskDetail` row, not just the first** — the
-     real one is identified by having a non-null `ItemId` (or a
-     `CreatedTimestamp` matching when `initiateCount` ran), and its
-     `CompletedQuantity` should equal `Quantity` (the counted amount).
-   - `inventoryCountResult/search` for the `CountRunId` — `Status`
-     should reach `Booked` (poll via `check_cycle_count_status`/
-     `check_cycle_count_location_status` if not immediate, same as ad
-     hoc).
-   - `locationCountInfo/search` — `CycleCountPending` should clear to
-     `false`.
-4. Once a happy-path single-item task confirms clean, test a
-   multi-item location under a real task the same way ad hoc was
-   proven: no-variance first, then within-tolerance, then
-   out-of-tolerance — checking each time whether task closure behaves
-   the same as the count-booking side (e.g. does an out-of-tolerance
-   Pending Booking run leave the task open too, or does
-   `trigger_end_count()` still close it even though the count itself
-   didn't book?  — genuinely unknown, worth checking explicitly).
-5. Only after single-item and multi-item tasked completion are both
-   confirmed should the UI/search-routing gaps above get built.
+**Remaining test plan**, same rigor as every test above (never trust
+response `success` alone — always independently re-query):
+1. Multi-item location under a real task — no-variance first, then
+   within-tolerance, then out-of-tolerance, mirroring how ad hoc was
+   proven, using `/api/complete_cycle_count_location` with
+   `isTasked: true` and every item's real quantity. (All three
+   tolerance outcomes are now confirmed at the *single-item* level —
+   this is specifically about whether the atomic multi-item behavior
+   ad hoc already relies on, e.g. one item's tolerance failure holding
+   back the whole location, carries over unchanged under a real task.)
+2. A task created via a real WM scheduling flow (not
+   `cycleCountTask/create`) with a different `TransactionId`/
+   `AssignedTaskPoolId` than both flavors tested so far, if one
+   becomes available, to widen confidence beyond these two known
+   shapes.
+3. Only after multi-item tasked completion is confirmed should the
+   UI/search-routing gaps above get built — single-item tasked
+   completion (happy path, within-tolerance, out-of-tolerance) is now
+   fully confirmed.
