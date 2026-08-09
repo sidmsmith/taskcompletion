@@ -1703,15 +1703,14 @@ it — not just reusing an old one):
 Multi-item locations under a real task are now confirmed too — see
 the section immediately below.
 
-**No UI wiring done** — there is still no way to reach `is_tasked=True`
-from the actual app UI. Two separate gaps remain, both still open:
-1. The search box doesn't route a real Cycle Count `TaskId` (like
-   `CCNTINM000548`) to the cycle-count UI at all yet — it would fall
-   into the generic Putaway-style task path instead.
-2. Even if it did, nothing in the UI/frontend sets `is_tasked: true`
-   when calling the two completion endpoints.
-Both need more confirmed backend behavior first (see below), so
-they're intentionally left until then.
+**Superseded — both since resolved, noted here only to avoid confusing
+a future read-through.** At the time this was written, neither gap was
+closed yet. Both were: the search-routing gap was closed later this
+session (see "Tasked Cycle Count UI wiring"), and the `is_tasked` flag
+itself was later retired entirely — see "Ad hoc completion now always
+closes the real task too — is_tasked retired," near the end of this
+document. `trigger_end_count()` is now called unconditionally for
+every cycle count completion, so there's no flag left to wire up.
 
 ## Multi-item location under a real task — confirmed, plus a genuine screenflow gotcha (2026-08-09, tenth session)
 
@@ -1854,25 +1853,29 @@ matching ad hoc's own behavior exactly in every case except the one
 documented caveat: task closure is independent of count booking, so
 task status alone is never proof a count was actually applied.
 
-**Remaining test plan**, same rigor as every test above (never trust
-response `success` alone — always independently re-query):
+**Status as of end of tenth session — both items below explicitly
+deprioritized by the user** ("my demo environment has stale data and
+there could be some bad tasks... we can always lock down the UI"),
+not because they were resolved:
 1. A task created via a real WM scheduling flow (not
    `cycleCountTask/create`) with a different `TransactionId`/
-   `AssignedTaskPoolId` than both flavors tested so far, if one
-   becomes available, to widen confidence beyond these two known
-   shapes.
-2. Decide deliberately (not reactively) whether/how this app should
-   guard against the stuck-location multi-task-trail scenario above
-   before any UI wiring happens — e.g. surfacing existing
-   `Pending Booking` state up front and blocking a fresh tasked count
-   attempt against an already-locked location, rather than letting it
-   silently mint another eventually-"Completed" task. Not yet decided
-   or built — flagged for explicit discussion first.
-3. All core tasked-cycle-count completion behavior (single-item and
-   multi-item, all three tolerance outcomes) is now fully confirmed.
-   UI/search-routing work is the remaining piece — worth deciding on
-   the stuck-location guard above first, since the UI is where a real
-   user would actually run into it.
+   `AssignedTaskPoolId` than both flavors tested so far — still only
+   two flavors confirmed. Low priority; revisit if one turns up.
+2. The stuck-location multi-task-trail guard (surfacing an existing
+   `Pending Booking` state up front, before minting another task) —
+   still not built. Deliberately not blocking anything else on it.
+
+UI/search-routing work proceeded anyway (per explicit instruction to
+build it despite the above) and is now complete — see "Tasked Cycle
+Count UI wiring" and the two follow-up fix sections below, plus
+"Ad hoc completion now always closes the real task too" (which also
+made the `is_tasked` distinction this whole section was originally
+about moot — every completion, ad hoc or tasked, now goes through the
+same call). **As of the end of the tenth session, Cycle Count (ad hoc
+and tasked, single-item and multi-item, all three tolerance outcomes,
+full UI) is considered done** — only the two explicitly-deprioritized
+items above remain, both by the user's own choice, not as unresolved
+bugs.
 
 ## Tasked Cycle Count UI wiring (2026-08-09, tenth session)
 
