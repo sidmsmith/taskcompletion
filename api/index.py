@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 from mawm_client import TASK_TYPES, get_manhattan_token, normalize_token, validate_org  # noqa: E402
 from task_service import (  # noqa: E402
     complete_container_putaway,
+    check_cycle_count_status,
     complete_cycle_count_line,
     complete_line,
     complete_putaway_line,
@@ -33,7 +34,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -252,6 +253,26 @@ def complete_cycle_count_line_route():
         return jsonify(result)
     except Exception as e:
         print(f"[COMPLETE_CYCLE_COUNT_LINE] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/check_cycle_count_status", methods=["POST"])
+def check_cycle_count_status_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    location_id = (data.get("locationId") or data.get("location_id") or "").strip()
+    item_id = (data.get("itemId") or data.get("item_id") or "").strip()
+    count_run_id = (data.get("countRunId") or data.get("count_run_id") or "").strip()
+    try:
+        result = check_cycle_count_status(
+            token, org, location_id, item_id, count_run_id, location=location
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[CHECK_CYCLE_COUNT_STATUS] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

@@ -1101,14 +1101,44 @@ in `app.js`) shows three distinct Result-cell states matching this:
 green "Booked: X → Y" (done, inputs disabled), muted/italic "Pending
 supervisor booking… Location locked — not yet applied" (left editable,
 not marked done — a corrected recount is plausible), red for a genuine
-failure. This is backend/data-model work, not the final UI — the user
-is still deciding how to surface this more richly (columns for
-previous/current qty, a location-lock indicator, and — since there's
-no reference to `InventoryCount`/`InventoryCountDetail` records
-anywhere else in this workspace — possibly a dedicated view onto the
-count run/result records themselves). `locationLockedBefore`/
-`locationLockedAfter` are already returned by
-`complete_cycle_count_line()` for exactly that future use.
+failure. `locationLockedBefore`/`locationLockedAfter` are returned by
+`complete_cycle_count_line()` but not yet surfaced in the UI.
+
+**Progressive UI, added same session per explicit instruction** ("it
+sometimes takes the system a few seconds to update to booked... first
+display the [in-flight] status and then poll a few times to update
+that field once its booked... show the previous/counted qty and the
+variances... so the user can see the full result"):
+
+- `complete_cycle_count_line()` no longer blocks synchronously waiting
+  for booking — it runs the six-call chain, checks
+  `inventoryCountResult` **once** immediately, and returns whatever
+  status that shows right then (often still `"Count Initiated"` or
+  `"Pending Booking"`), instead of the earlier version's ~3s blocking
+  poll loop before responding.
+- New `check_cycle_count_status()` (`POST /api/check_cycle_count_status`,
+  `{locationId, itemId, countRunId}`) is a lightweight re-check —
+  same `inventoryCountResult` lookup, no chain re-run. `app.js`'s
+  `pollCycleCountLineStatus()` calls it every 1.8s, up to 8 times,
+  after any non-`"Booked"` completion result, live-updating the row
+  each time. There's no way to tell an eventually-resolving in-flight
+  status apart from a genuinely stuck out-of-tolerance one from the
+  status text alone, so it always polls the full window regardless —
+  confirmed live for both: a within-tolerance count visibly flipped
+  from red "Count not booked (status: Count Initiated)" to green
+  "Booked: 10 → 9 (variance -1)" a few seconds later; an out-of-
+  tolerance count settled into the muted "Pending supervisor
+  booking…" state and correctly stopped polling rather than spinning
+  forever.
+- Table gained two new columns, **Previous Qty** and **Variance**
+  (`.cc-previous-qty`/`.cc-variance` cells, populated by the shared
+  `applyCycleCountResultToRow()` used by both the initial completion
+  and every subsequent poll tick) — both empty until a real
+  `inventoryCountResult` row exists.
+- Polling is fire-and-forget (not awaited by the caller) so **Complete
+  All** isn't blocked waiting for each line's booking to resolve
+  before moving to the next line — each line's poll runs independently
+  in the background.
 
 **Open, unexplained, and deliberately not chased further**:
 `A1AC0124` (an item location with 24+ pre-existing `inventoryCountRun`

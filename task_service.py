@@ -1760,6 +1760,55 @@ def resolve_cycle_count_search_multi(
     }
 
 
+def _cycle_count_result_response(
+    result_row: Optional[dict], location_id: str, item_id: str, count_run_id: str
+) -> Dict[str, Any]:
+    """Shared shape-builder for both complete_cycle_count_line() and
+    check_cycle_count_status() — `success` is only True when
+    `Status == "Booked"`; every other status (including "Pending
+    Booking", which is both a normal in-flight stage and the permanent
+    out-of-tolerance parked state — see complete_cycle_count_line()'s
+    docstring) comes back False with a real status/reason attached, not
+    a bare error.
+    """
+    if result_row is None:
+        return {
+            "success": False,
+            "error": "No count result available yet",
+            "locationId": location_id,
+            "itemId": item_id,
+            "countRunId": count_run_id,
+            "status": "",
+        }
+    status_label = str(result_row.get("Status") or "")
+    booked = status_label == "Booked"
+    response = {
+        "success": booked,
+        "locationId": location_id,
+        "itemId": item_id,
+        "countRunId": count_run_id,
+        "status": status_label,
+        "statusKey": str(result_row.get("StatusKey") or ""),
+        "previousQty": result_row.get("OriginalQuantity"),
+        "countedQty": result_row.get("CountQuantity"),
+        "varianceQty": result_row.get("VarianceQuantity"),
+        "bookingFailureReason": result_row.get("BookingFailureReason"),
+    }
+    if not booked:
+        if status_label == "Pending Booking":
+            response["error"] = (
+                "Out of tolerance — pending supervisor booking. "
+                "Location is locked; inventory not yet updated."
+            )
+        elif status_label:
+            response["error"] = (
+                result_row.get("BookingFailureReason") or f"Count not booked (status: {status_label})"
+            )
+        else:
+            response["error"] = "Count not booked yet"
+    return response
+
+
 def complete_cycle_count_line(
     token: str, org: str, location_id: str, item_id: str, quantity, location: str = None
 ) -> Dict[str, Any]:
@@ -1773,32 +1822,32 @@ def complete_cycle_count_line(
     mawm_cycle_count_location_investigation.md, user-captured) — none of
     these six calls' own HTTP status/messages reveal whether the count
     actually got applied. MAWM runs three real outcomes, invisible until
-    polled afterward:
+    checked afterward:
       - Perfect match: books synchronously, no warning anywhere.
       - Within tolerance: acceptQuantity returns a WARNING (INM::227
         "Quantity mismatch") but the count still books — ASYNCHRONOUSLY,
-        confirmed live to take a moment (the same posture as Modify
+        confirmed live to take a few seconds (same posture as Modify
         iLPN's endIlpn elsewhere in this app).
       - Out of tolerance: acceptQuantity returns that same WARNING plus
         an ERROR (INM::411 "Recount required"); persistCountDetails/
         endCount still both report success, but the count run parks in
         "Pending Booking" forever — a real human/supervisor decision
         outside this app, not something that resolves on its own.
-    So this now runs the chain to completion regardless of what any
+    So this runs the chain to completion regardless of what any
     individual step reports (a WARNING or ERROR message at validate/
     accept is not, by itself, treated as failure — confirmed live that
-    both still let the chain proceed), then polls
-    search_inventory_count_results() for the real, authoritative
-    outcome. Only a call that genuinely raises (network failure,
+    both still let the chain proceed), then checks
+    search_inventory_count_results() **once** for whatever the status
+    is right then — it does NOT block waiting for booking to finish
+    (2026-08-08, revised per explicit instruction: the first version
+    polled synchronously for up to ~3s before returning, which just
+    made the request slow; now it returns immediately with the
+    in-flight status, e.g. "Count Initiated"/"Pending Booking", and the
+    frontend calls check_cycle_count_status() every couple seconds
+    afterward to pick up the real resolution once MAWM finishes
+    booking it — see completeCycleCountLineAction()'s docstring in
+    app.js). Only a call that genuinely raises (network failure,
     unparseable non-2xx body) stops the chain early.
-
-    Returns the full count-result row's fields (previousQty/countedQty/
-    varianceQty/status/bookingFailureReason) so the caller has real data
-    to show, not just success/failure — `success` is only True when the
-    poll finds `Status == "Booked"`; "Pending Booking" (out of
-    tolerance, awaiting supervisor booking) and "Booking Failed"/
-    "Booking Rejected" all come back as `success: False` with the real
-    status and reason attached, distinct from an actual chain error.
 
     Each line runs its own independent chain (its own initiateCount/
     endCount) — including each item within a multi-item location's
@@ -1861,64 +1910,50 @@ def complete_cycle_count_line(
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"endCount failed: {exc}"}
 
-    # Booking is asynchronous for anything other than a perfect match —
-    # poll a few times with a brief wait rather than trusting the chain
-    # alone (confirmed live: an immediate re-query can still show the
-    # pre-count value even for a count that books moments later).
-    result_row = None
-    for _ in range(5):
-        time.sleep(0.6)
-        try:
-            rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
-        except Exception:  # noqa: BLE001
-            rows = []
-        row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
-        result_row = row
-        if row and str(row.get("Status") or "") != "Pending Booking":
-            break
+    try:
+        rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        rows = []
+    result_row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
+    response = _cycle_count_result_response(result_row, location_id, item_id, count_run_id)
 
     try:
         info_after = search_location_count_info(location_id, token, org, location=dest)
     except Exception:  # noqa: BLE001
         info_after = None
-    locked_after = bool(info_after and info_after.get("CycleCountPending"))
+    response["locationLockedBefore"] = locked_before
+    response["locationLockedAfter"] = bool(info_after and info_after.get("CycleCountPending"))
+    return response
 
-    if result_row is None:
-        return {
-            "success": False,
-            "error": "Could not retrieve the count result after completion",
-            "locationId": location_id,
-            "itemId": item_id,
-            "countRunId": count_run_id,
-            "locationLockedBefore": locked_before,
-            "locationLockedAfter": locked_after,
-        }
 
-    status_label = str(result_row.get("Status") or "")
-    booked = status_label == "Booked"
-    response = {
-        "success": booked,
-        "locationId": location_id,
-        "itemId": item_id,
-        "countRunId": count_run_id,
-        "status": status_label,
-        "statusKey": str(result_row.get("StatusKey") or ""),
-        "previousQty": result_row.get("OriginalQuantity"),
-        "countedQty": result_row.get("CountQuantity"),
-        "varianceQty": result_row.get("VarianceQuantity"),
-        "bookingFailureReason": result_row.get("BookingFailureReason"),
-        "locationLockedBefore": locked_before,
-        "locationLockedAfter": locked_after,
-    }
-    if not booked:
-        if status_label == "Pending Booking":
-            response["error"] = (
-                "Out of tolerance — pending supervisor booking. "
-                "Location is locked; inventory not yet updated."
-            )
-        else:
-            response["error"] = (
-                result_row.get("BookingFailureReason")
-                or f"Count not booked (status: {status_label or 'unknown'})"
-            )
+def check_cycle_count_status(
+    token: str, org: str, location_id: str, item_id: str, count_run_id: str, location: str = None
+) -> Dict[str, Any]:
+    """Lightweight poll target for the frontend (2026-08-08) — re-checks
+    search_inventory_count_results() for one already-started count run,
+    without re-running the six-call chain. Booking is asynchronous (see
+    complete_cycle_count_line()'s docstring), so the frontend calls this
+    every couple seconds after a non-"Booked" result to update the row
+    live once MAWM finishes booking it, rather than the original
+    request blocking for several seconds.
+    """
+    location_id = (location_id or "").strip().upper()
+    item_id = (item_id or "").strip()
+    count_run_id = (count_run_id or "").strip()
+    if not location_id or not item_id or not count_run_id:
+        return {"success": False, "error": "locationId, itemId, and countRunId are required"}
+
+    dest = resolve_location(org, location)
+    try:
+        rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"inventoryCountResult search failed: {exc}"}
+    result_row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
+    response = _cycle_count_result_response(result_row, location_id, item_id, count_run_id)
+
+    try:
+        info = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info = None
+    response["locationLocked"] = bool(info and info.get("CycleCountPending"))
     return response

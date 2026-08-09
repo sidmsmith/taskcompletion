@@ -909,6 +909,8 @@
               step="any"
             />
           </td>
+          <td class="col-qty-wide cc-previous-qty" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
+          <td class="col-qty-wide cc-variance" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
           <td class="col-reason cc-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}"></td>
         </tr>`;
   }
@@ -934,7 +936,7 @@
         <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}">
           <td>${escapeHtml(lines[0].lineNumber)}</td>
           <td>${escapeHtml(group.locationId)}</td>
-          <td colspan="4">
+          <td colspan="6">
             <button type="button" class="mixed-toggle" data-mixed-target="${escapeAttr(groupKey)}">
               <i class="fas fa-caret-right"></i> MIXED (${lines.length} items)
             </button>
@@ -1063,6 +1065,71 @@
     }
   }
 
+  /**
+   * Fills in the Previous Qty / Variance columns alongside the Status
+   * cell (2026-08-08, per explicit instruction — "show the previous/
+   * counted qty and the variances from the count details so the user
+   * can see the full result"), from either completeCycleCountLine()'s
+   * or check_cycle_count_status()'s identically-shaped result.
+   */
+  function applyCycleCountResultToRow(taskDetailId, result) {
+    const prevCell = el.cycleCountLinesBody.querySelector(
+      '.cc-previous-qty[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    const varCell = el.cycleCountLinesBody.querySelector(
+      '.cc-variance[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (prevCell) prevCell.textContent = result.previousQty != null ? result.previousQty : "";
+    if (varCell) varCell.textContent = result.varianceQty != null ? result.varianceQty : "";
+    setCycleCountResultCell(taskDetailId, cycleCountResultText(result), cycleCountResultKind(result), result.success);
+  }
+
+  const CYCLE_COUNT_POLL_INTERVAL_MS = 1800;
+  const CYCLE_COUNT_POLL_MAX_ATTEMPTS = 8;
+
+  /**
+   * Booking is asynchronous — a count that will eventually book (within
+   * tolerance) can sit at "Count Initiated"/"Pending Booking" for a few
+   * seconds first (2026-08-08, per explicit instruction: show that
+   * in-flight state immediately, then poll a few times to pick up
+   * "Booked" once it lands, instead of the original request blocking).
+   * Also covers a count that's genuinely stuck (out of tolerance) —
+   * there's no way to tell those two cases apart from the status text
+   * alone, so this always polls up to CYCLE_COUNT_POLL_MAX_ATTEMPTS
+   * times regardless of which status came back, then just stops,
+   * leaving whatever the last poll showed. Fire-and-forget: the caller
+   * doesn't await this, so Complete All isn't blocked waiting for each
+   * line's booking to resolve before moving to the next line.
+   */
+  async function pollCycleCountLineStatus(line, initialResult) {
+    if (initialResult.success || !initialResult.countRunId) return;
+    const itemInput = getCycleCountItemInput(line.taskDetailId);
+    const itemId = itemInput ? itemInput.value.trim() : line.itemId;
+    for (let attempt = 0; attempt < CYCLE_COUNT_POLL_MAX_ATTEMPTS; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, CYCLE_COUNT_POLL_INTERVAL_MS));
+      if (isCycleCountLineDone(line)) return; // already resolved (or resubmitted) by something else
+      let result;
+      try {
+        result = await api("check_cycle_count_status", {
+          org: state.org,
+          token: state.token,
+          location: state.facility,
+          locationId: line.locationId,
+          itemId,
+          countRunId: initialResult.countRunId,
+        });
+      } catch (e) {
+        return; // quietly stop polling -- the row still shows the last known state
+      }
+      applyCycleCountResultToRow(line.taskDetailId, result);
+      if (result.success) {
+        setActionStatus("Line " + line.lineNumber + " booked: " + result.previousQty + " → " + result.countedQty + ".", "success");
+        updateCycleCountLineActionButtons();
+        return;
+      }
+    }
+  }
+
   async function completeCycleCountLineAction(line) {
     const itemInput = getCycleCountItemInput(line.taskDetailId);
     const qtyInput = getCycleCountQtyInput(line.taskDetailId);
@@ -1116,10 +1183,10 @@
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
       const result = await completeCycleCountLineAction(line);
-      const kind = cycleCountResultKind(result);
-      setCycleCountResultCell(line.taskDetailId, cycleCountResultText(result), kind, result.success);
+      applyCycleCountResultToRow(line.taskDetailId, result);
       if (!result.success) {
-        setActionStatus(result.error || "Complete failed", kind === "pending" ? "" : "error");
+        setActionStatus(result.error || "Complete failed", cycleCountResultKind(result) === "pending" ? "" : "error");
+        pollCycleCountLineStatus(line, result); // fire-and-forget
         return;
       }
       setActionStatus("Completed line " + line.lineNumber + ".", "success");
@@ -1171,12 +1238,12 @@
       setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
       try {
         const result = await completeCycleCountLineAction(line);
-        const kind = cycleCountResultKind(result);
-        setCycleCountResultCell(line.taskDetailId, cycleCountResultText(result), kind, result.success);
+        applyCycleCountResultToRow(line.taskDetailId, result);
         if (result.success) {
           succeeded++;
         } else {
           failures.push("Line " + line.lineNumber + ": " + (result.error || "failed"));
+          pollCycleCountLineStatus(line, result); // fire-and-forget, doesn't block the rest of the loop
         }
       } catch (e) {
         failures.push("Line " + line.lineNumber + ": " + (e.message || String(e)));
