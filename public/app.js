@@ -26,6 +26,11 @@
     // classifySearchInput() before a search even runs, so the Load
     // button can already gate on it.
     searchMode: "task",
+    // Cycle count selection is tracked by groupKey, not taskDetailId
+    // (2026-08-08 — see cycleCountGroupRowsHtml()'s docstring): a
+    // location's items complete atomically together, so "select a
+    // line" for cycle count really means "select a location."
+    selectedCycleCountGroupKey: null,
   };
 
   function allLines() {
@@ -911,7 +916,7 @@
       ? ` data-mixed-parent="${escapeAttr(line.groupKey)}" style="display:none"`
       : "";
     return `
-        <tr class="${rowClass}" data-task-detail-id="${escapeAttr(line.taskDetailId)}"${extraAttrs}>
+        <tr class="${rowClass}" data-task-detail-id="${escapeAttr(line.taskDetailId)}" data-group-key="${escapeAttr(line.groupKey)}"${extraAttrs}>
           <td>${isSubRow ? "" : escapeHtml(line.lineNumber)}</td>
           <td>${isSubRow ? "" : escapeHtml(line.locationId) + cycleCountLockIconHtml(line.taskDetailId, line.locationLocked)}</td>
           <td>
@@ -943,10 +948,21 @@
    * docstring — this is only reachable for real different items, never
    * duplicate records for the same one) renders as the same MIXED
    * accordion pattern already used for multi-item no-task containers,
-   * per explicit instruction. Unlike that case, the summary row here
-   * has no completable entity of its own (there's no single aggregate
-   * to count across different items) — only the expanded sub-rows are
-   * ever selectable/completable.
+   * per explicit instruction.
+   *
+   * **Sub-rows are not independently completable** (2026-08-08,
+   * confirmed live and per explicit instruction) — MAWM only finalizes
+   * a location's count once every item present has been submitted
+   * under the same CountRunId; completing just one item leaves it
+   * parked at "Count Initiated" forever, and calling endCount before
+   * every item is addressed is explicitly rejected (`INM::230`, "Not
+   * all the Items in the Location are counted" — a real WARNING MAWM
+   * returns, not a silent "missing item = 0" that would risk a false
+   * tolerance failure). So selection/completion happens at the
+   * **group** level everywhere in this file (selectCycleCountGroup(),
+   * getSelectedCycleCountGroup(), etc) — a single-item location is
+   * just a "group of 1," no special-casing needed. Every row (summary
+   * and sub-rows alike) carries `data-group-key` for this.
    */
   function cycleCountGroupRowsHtml(group) {
     const lines = group.lines || [];
@@ -955,7 +971,7 @@
     }
     const groupKey = group.groupKey;
     const summaryRow = `
-        <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}">
+        <tr class="cc-line-row" data-task-detail-id="${escapeAttr(groupKey)}" data-group-key="${escapeAttr(groupKey)}">
           <td>${escapeHtml(lines[0].lineNumber)}</td>
           <td>${escapeHtml(group.locationId) + cycleCountLockIconHtml(groupKey, group.locationLocked)}</td>
           <td colspan="4">
@@ -979,7 +995,7 @@
   }
 
   function renderCycleCountGroups() {
-    state.selectedTaskDetailId = null;
+    state.selectedCycleCountGroupKey = null;
     el.linesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "";
     renderCycleCountTaskMeta();
@@ -1034,39 +1050,51 @@
     return !!resultCell && resultCell.dataset.done === "true";
   }
 
-  function allOutstandingCycleCountLines() {
-    return allLines().filter((l) => !isCycleCountLineDone(l));
+  /**
+   * Group-level gating (2026-08-08, per explicit instruction and live
+   * confirmation — see cycleCountGroupRowsHtml()'s docstring for why
+   * sub-rows can't complete independently) — "done"/"valid" for a
+   * location means every one of its items is done/valid, not just one.
+   * A single-item location is just a group of 1, so this applies
+   * uniformly without checking line count anywhere.
+   */
+  function isCycleCountGroupDone(group) {
+    return (group.lines || []).every((l) => isCycleCountLineDone(l));
   }
 
-  function allOutstandingCycleCountLinesValid() {
-    const outstanding = allOutstandingCycleCountLines();
-    if (!outstanding.length) return true; // let the click through to show "nothing to do"
-    return outstanding.every(
+  function isCycleCountGroupValid(group) {
+    return (group.lines || []).every(
       (l) => isCycleCountItemValid(l.taskDetailId) && isCycleCountQtyValid(l.taskDetailId)
     );
   }
 
-  function getSelectedCycleCountLine() {
-    if (state.selectedTaskDetailId === null) return null;
-    return getLineByTaskDetailId(state.selectedTaskDetailId);
+  function allOutstandingCycleCountGroups() {
+    return state.groups.filter((g) => !isCycleCountGroupDone(g));
+  }
+
+  function allOutstandingCycleCountGroupsValid() {
+    const outstanding = allOutstandingCycleCountGroups();
+    if (!outstanding.length) return true; // let the click through to show "nothing to do"
+    return outstanding.every((g) => isCycleCountGroupValid(g));
+  }
+
+  function getSelectedCycleCountGroup() {
+    if (!state.selectedCycleCountGroupKey) return null;
+    return state.groups.find((g) => g.groupKey === state.selectedCycleCountGroupKey) || null;
   }
 
   function updateCycleCountLineActionButtons() {
-    const selectedLine = getSelectedCycleCountLine();
-    const hasSelection = !!selectedLine;
-    const selectedValid =
-      hasSelection &&
-      !isCycleCountLineDone(selectedLine) &&
-      isCycleCountItemValid(selectedLine.taskDetailId) &&
-      isCycleCountQtyValid(selectedLine.taskDetailId);
+    const selectedGroup = getSelectedCycleCountGroup();
+    const hasSelection = !!selectedGroup;
+    const selectedValid = hasSelection && !isCycleCountGroupDone(selectedGroup) && isCycleCountGroupValid(selectedGroup);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
-    el.allLinesBtn.disabled = !allOutstandingCycleCountLinesValid();
+    el.allLinesBtn.disabled = !allOutstandingCycleCountGroupsValid();
   }
 
-  function selectCycleCountLine(taskDetailId) {
-    state.selectedTaskDetailId = taskDetailId;
-    el.cycleCountLinesBody.querySelectorAll("tr.cc-line-row, tr.mixed-item-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
+  function selectCycleCountGroup(groupKey) {
+    state.selectedCycleCountGroupKey = groupKey;
+    el.cycleCountLinesBody.querySelectorAll("tr[data-group-key]").forEach((row) => {
+      row.classList.toggle("selected", row.dataset.groupKey === String(groupKey));
     });
     updateCycleCountLineActionButtons();
   }
@@ -1114,18 +1142,38 @@
     return ' <span class="cc-variance-value">($' + rounded + ")</span>";
   }
 
-  /**
-   * Applies the location lock icon and the Status cell (2026-08-08,
-   * per explicit instruction) from either completeCycleCountLine()'s
-   * or check_cycle_count_status()'s identically-shaped result. The two
-   * endpoints name the lock flag differently (`locationLocked` for a
-   * live status check vs. `locationLockedAfter` for a fresh
-   * completion) — normalized here.
+  /** Applies one item's result (status cell only — no lock icon, see
+   * applyCycleCountLocationResultToGroup() for that, since the lock is
+   * a location-level property carried at the outer response level, not
+   * per-item).
    */
   function applyCycleCountResultToRow(taskDetailId, result) {
-    const locked = result.locationLocked !== undefined ? result.locationLocked : result.locationLockedAfter;
-    if (locked !== undefined) setCycleCountLockIcon(taskDetailId, locked);
     setCycleCountResultCell(taskDetailId, cycleCountResultText(result), cycleCountResultKind(result), result.success);
+  }
+
+  /**
+   * Applies a complete_cycle_count_location()/
+   * check_cycle_count_location_status() response — `{results: [...],
+   * locationLocked|locationLockedAfter}` — to every line in the group
+   * (2026-08-08, per explicit instruction: a location's items complete
+   * atomically together, not independently — see
+   * cycleCountGroupRowsHtml()'s docstring). The lock icon can be keyed
+   * either by the group's own key (MIXED summary row) or a line's own
+   * taskDetailId (single-item "group of 1") depending on which row
+   * actually rendered it — setCycleCountLockIcon() no-ops harmlessly
+   * for whichever key doesn't match a real icon, so both are always
+   * attempted rather than branching on group size here.
+   */
+  function applyCycleCountLocationResultToGroup(group, response) {
+    (response.results || []).forEach((result) => {
+      const line = (group.lines || []).find((l) => l.itemId === result.itemId);
+      if (line) applyCycleCountResultToRow(line.taskDetailId, result);
+    });
+    const locked = response.locationLocked !== undefined ? response.locationLocked : response.locationLockedAfter;
+    if (locked !== undefined) {
+      setCycleCountLockIcon(group.groupKey, locked);
+      (group.lines || []).forEach((l) => setCycleCountLockIcon(l.taskDetailId, locked));
+    }
   }
 
   const CYCLE_COUNT_POLL_INTERVAL_MS = 2000;
@@ -1157,47 +1205,59 @@
    * longer window costs little even for the out-of-tolerance case that
    * never resolves and just polls uselessly until it gives up.
    */
-  async function pollCycleCountLineStatus(line, initialResult) {
-    if (initialResult.success || !initialResult.countRunId) return;
-    const itemInput = getCycleCountItemInput(line.taskDetailId);
-    const itemId = itemInput ? itemInput.value.trim() : line.itemId;
+  async function pollCycleCountGroupStatus(group, initialResponse) {
+    if (initialResponse.success || !initialResponse.countRunId) return;
+    const itemIds = (group.lines || []).map((l) => {
+      const itemInput = getCycleCountItemInput(l.taskDetailId);
+      return itemInput ? itemInput.value.trim() : l.itemId;
+    });
     for (let attempt = 0; attempt < CYCLE_COUNT_POLL_MAX_ATTEMPTS; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, CYCLE_COUNT_POLL_INTERVAL_MS));
-      if (isCycleCountLineDone(line)) return; // already resolved (or resubmitted) by something else
-      let result;
+      if (isCycleCountGroupDone(group)) return; // already resolved (or resubmitted) by something else
+      let response;
       try {
-        result = await api("check_cycle_count_status", {
+        response = await api("check_cycle_count_location_status", {
           org: state.org,
           token: state.token,
           location: state.facility,
-          locationId: line.locationId,
-          itemId,
-          countRunId: initialResult.countRunId,
+          locationId: group.locationId,
+          itemIds,
+          countRunId: initialResponse.countRunId,
         });
       } catch (e) {
-        return; // quietly stop polling -- the row still shows the last known state
+        return; // quietly stop polling -- the rows still show the last known state
       }
-      applyCycleCountResultToRow(line.taskDetailId, result);
-      if (result.success) {
-        setActionStatus("Line " + line.lineNumber + " booked: " + result.previousQty + " → " + result.countedQty + ".", "success");
+      applyCycleCountLocationResultToGroup(group, response);
+      if (response.success) {
+        setActionStatus("Location " + group.locationId + " booked.", "success");
         updateCycleCountLineActionButtons();
         return;
       }
     }
   }
 
-  async function completeCycleCountLineAction(line) {
-    const itemInput = getCycleCountItemInput(line.taskDetailId);
-    const qtyInput = getCycleCountQtyInput(line.taskDetailId);
-    const itemId = itemInput ? itemInput.value.trim() : line.itemId;
-    const quantity = qtyInput ? Number(qtyInput.value) : null;
-    return api("complete_cycle_count_line", {
+  /**
+   * Submits every item in the group together, atomically (2026-08-08,
+   * per explicit instruction and live confirmation — see
+   * cycleCountGroupRowsHtml()'s docstring). A single-item location is
+   * just a group of 1, so this is the only completion path for cycle
+   * count now — there is no more per-line completion call.
+   */
+  async function completeCycleCountGroupAction(group) {
+    const itemAdjustments = (group.lines || []).map((line) => {
+      const itemInput = getCycleCountItemInput(line.taskDetailId);
+      const qtyInput = getCycleCountQtyInput(line.taskDetailId);
+      return {
+        itemId: itemInput ? itemInput.value.trim() : line.itemId,
+        quantity: qtyInput ? Number(qtyInput.value) : null,
+      };
+    });
+    return api("complete_cycle_count_location", {
       org: state.org,
       token: state.token,
       location: state.facility,
-      locationId: line.locationId,
-      itemId,
-      quantity,
+      locationId: group.locationId,
+      itemAdjustments,
     });
   }
 
@@ -1253,107 +1313,97 @@
   }
 
   async function completeCycleCountLine() {
-    const line = getSelectedCycleCountLine();
-    if (!line) return;
-    if (isCycleCountLineDone(line)) return;
-    setBusy(true, "Completing line " + line.lineNumber + "…");
+    const group = getSelectedCycleCountGroup();
+    if (!group) return;
+    if (isCycleCountGroupDone(group)) return;
+    setBusy(true, "Completing " + group.locationId + "…");
     try {
-      const result = await completeCycleCountLineAction(line);
-      applyCycleCountResultToRow(line.taskDetailId, result);
-      if (!result.success) {
-        setActionStatus(result.error || "Complete failed", cycleCountResultKind(result) === "pending" ? "" : "error");
-        pollCycleCountLineStatus(line, result); // fire-and-forget
+      const response = await completeCycleCountGroupAction(group);
+      applyCycleCountLocationResultToGroup(group, response);
+      if (!response.success) {
+        setActionStatus(response.error || "Complete failed", "error");
+        pollCycleCountGroupStatus(group, response); // fire-and-forget
         return;
       }
-      setActionStatus("Completed line " + line.lineNumber + ".", "success");
+      setActionStatus("Completed " + group.locationId + ".", "success");
       updateCycleCountLineActionButtons();
     } catch (e) {
-      setCycleCountResultCell(line.taskDetailId, e.message || String(e), "error", false);
+      (group.lines || []).forEach((l) => setCycleCountResultCell(l.taskDetailId, escapeHtml(e.message || String(e)), "error", false));
       setActionStatus(e.message || String(e), "error");
     } finally {
       setBusy(false);
     }
   }
 
-  let allCycleCountLinesPending = [];
+  let allCycleCountGroupsPending = [];
 
   function openAllCycleCountLinesModal() {
-    allCycleCountLinesPending = allOutstandingCycleCountLines();
-    if (!allCycleCountLinesPending.length) {
+    allCycleCountGroupsPending = allOutstandingCycleCountGroups();
+    if (!allCycleCountGroupsPending.length) {
       setActionStatus("No outstanding lines to complete.", "");
       return;
     }
-    if (!allOutstandingCycleCountLinesValid()) {
+    if (!allOutstandingCycleCountGroupsValid()) {
       setActionStatus("Enter an Item and Qty for every line before completing all.", "error");
       return;
     }
-    const multiGroup = state.groups.length > 1;
-    el.allLinesList.innerHTML = allCycleCountLinesPending
-      .map((l) => {
-        const groupPrefix = multiGroup ? "Location " + l.locationId + " — " : "";
-        const itemInput = getCycleCountItemInput(l.taskDetailId);
-        const qtyInput = getCycleCountQtyInput(l.taskDetailId);
-        const itemId = itemInput ? itemInput.value.trim() : l.itemId;
-        const qty = qtyInput ? qtyInput.value : "";
-        return (
-          "<li>" + escapeHtml(groupPrefix) + "Line " + escapeHtml(l.lineNumber) + " — " +
-          escapeHtml(itemId) + ": " + escapeHtml(qty) + "</li>"
-        );
+    el.allLinesList.innerHTML = allCycleCountGroupsPending
+      .map((g) => {
+        const itemSummaries = (g.lines || [])
+          .map((l) => {
+            const itemInput = getCycleCountItemInput(l.taskDetailId);
+            const qtyInput = getCycleCountQtyInput(l.taskDetailId);
+            const itemId = itemInput ? itemInput.value.trim() : l.itemId;
+            const qty = qtyInput ? qtyInput.value : "";
+            return escapeHtml(itemId) + ": " + escapeHtml(qty);
+          })
+          .join(", ");
+        return "<li>Location " + escapeHtml(g.locationId) + " — " + itemSummaries + "</li>";
       })
       .join("");
     allLinesModal.show();
   }
 
-  /**
-   * A location's own group always numbers its (usually single) line
-   * "1" (see resolve_cycle_count_location()) — with several locations
-   * in one Complete All batch, "Line 1: ..." repeated for every one of
-   * them is meaningless on its own (confirmed live, 2026-08-08: a real
-   * 3-location run showed "Line 1: ...; Line 1: ...; Line 1: ..." with
-   * no way to tell which was which). Always prefix with the location,
-   * not just when multiGroup — this failures list is exactly the case
-   * where it matters most.
-   */
-  function cycleCountFailureLabel(line, message) {
-    return "Location " + line.locationId + " (line " + line.lineNumber + "): " + message;
+  function cycleCountFailureLabel(group, message) {
+    return "Location " + group.locationId + ": " + message;
   }
 
   async function confirmAllCycleCountLines() {
     allLinesModal.hide();
-    const total = allCycleCountLinesPending.length;
+    const total = allCycleCountGroupsPending.length;
     let succeeded = 0;
     const failures = [];
     for (let i = 0; i < total; i++) {
-      const line = allCycleCountLinesPending[i];
-      setBusy(true, "Completing line " + (i + 1) + " of " + total + "…");
+      const group = allCycleCountGroupsPending[i];
+      setBusy(true, "Completing " + (i + 1) + " of " + total + "…");
       try {
-        const result = await completeCycleCountLineAction(line);
-        applyCycleCountResultToRow(line.taskDetailId, result);
-        if (result.success) {
+        const response = await completeCycleCountGroupAction(group);
+        applyCycleCountLocationResultToGroup(group, response);
+        if (response.success) {
           succeeded++;
         } else {
-          failures.push(cycleCountFailureLabel(line, result.error || "failed"));
-          pollCycleCountLineStatus(line, result); // fire-and-forget, doesn't block the rest of the loop
+          failures.push(cycleCountFailureLabel(group, response.error || "failed"));
+          pollCycleCountGroupStatus(group, response); // fire-and-forget, doesn't block the rest of the loop
         }
       } catch (e) {
-        failures.push(cycleCountFailureLabel(line, e.message || String(e)));
-        setCycleCountResultCell(line.taskDetailId, e.message || String(e), "error", false);
+        failures.push(cycleCountFailureLabel(group, e.message || String(e)));
+        (group.lines || []).forEach((l) => setCycleCountResultCell(l.taskDetailId, escapeHtml(e.message || String(e)), "error", false));
       }
     }
     setBusy(false);
     updateCycleCountLineActionButtons();
     if (!failures.length) {
-      setActionStatus("Completed " + fmtCount(succeeded, "line") + ".", "success");
+      setActionStatus("Completed " + fmtCount(succeeded, "location", "locations") + ".", "success");
     } else {
-      // Not a final tally (2026-08-08, per the same near-miss above) —
-      // booking is asynchronous, so a line counted here as an "issue"
-      // may still book moments later via pollCycleCountLineStatus()'s
-      // background poll updating its own row; this banner just
-      // reflects what was known the instant the loop finished, not
-      // necessarily what's true now.
+      // Not a final tally (2026-08-08) — booking is asynchronous, so a
+      // location counted here as an "issue" may still book moments
+      // later via pollCycleCountGroupStatus()'s background poll
+      // updating its own rows; this banner just reflects what was
+      // known the instant the loop finished, not necessarily what's
+      // true now.
       setActionStatus(
-        "Booked " + succeeded + " of " + total + " lines immediately. " +
-          fmtCount(failures.length, "line") +
+        "Booked " + succeeded + " of " + total + " locations immediately. " +
+          fmtCount(failures.length, "location", "locations") +
           " still processing or needs attention (status will keep updating): " +
           failures.join("; "),
         ""
@@ -1918,7 +1968,7 @@
     }
     const row = e.target.closest("tr.cc-line-row, tr.mixed-item-row");
     if (!row) return;
-    selectCycleCountLine(row.dataset.taskDetailId);
+    selectCycleCountGroup(row.dataset.groupKey);
   });
   el.cycleCountLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".cc-qty-input");

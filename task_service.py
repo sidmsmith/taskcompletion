@@ -1967,3 +1967,164 @@ def check_cycle_count_status(
         info = None
     response["locationLocked"] = bool(info and info.get("CycleCountPending"))
     return response
+
+
+def complete_cycle_count_location(
+    token: str, org: str, location_id: str, item_adjustments: List[dict], location: str = None
+) -> Dict[str, Any]:
+    """Atomic multi-item counterpart to complete_cycle_count_line() — for
+    a location with more than one distinct item, **every item must be
+    submitted together under one count run** (2026-08-08, confirmed
+    live after the per-item version's real failure mode: completing
+    just one item of a two-item location left it parked at "Count
+    Initiated" indefinitely; calling endCount before every item was
+    addressed returned HTTP 400 with `INM::230` "Not all the Items in
+    the Location are counted" — a WARNING, not silently defaulting the
+    untouched item to zero and evaluating tolerance against that, which
+    was the real risk this was built to rule out). One
+    `initiateCount`, then `validateItemAndGetItemDetails`/
+    `acceptQuantity`/`persistCountDetails` looped per item (all reusing
+    the same CountRunId/TaskId — MAWM's own initiateCount already
+    dedupes to the existing open run for a location, confirmed live),
+    and exactly one `endCount` call at the very end, only after every
+    item has been persisted.
+
+    `item_adjustments` is `[{"itemId": ..., "quantity": ...}, ...]` —
+    every item present at the location must appear (0 is a valid
+    quantity, per explicit instruction: an item genuinely not present
+    is not the same as "not addressed"). If any single item's
+    validate/accept/persist call raises, this stops immediately and
+    returns an error *without* calling endCount — better to leave the
+    run sitting at "Count Initiated" (safe, confirmed above: MAWM won't
+    finalize it) than to call endCount on incomplete data and get the
+    same rejection for a different, confusing reason.
+
+    Returns one result per item (same shape as
+    _cycle_count_result_response()) under `results`, plus an overall
+    `success` (only True when every item's own `success` is True) and
+    the location lock state before/after.
+    """
+    location_id = (location_id or "").strip().upper()
+    if not location_id:
+        return {"success": False, "error": "Location is required"}
+    cleaned: List[tuple] = []
+    for adj in item_adjustments or []:
+        item_id = str((adj or {}).get("itemId") or "").strip()
+        quantity = (adj or {}).get("quantity")
+        if not item_id:
+            continue
+        if quantity is None:
+            return {"success": False, "error": f"Quantity is required for item {item_id}"}
+        cleaned.append((item_id, quantity))
+    if not cleaned:
+        return {"success": False, "error": "At least one item/quantity is required"}
+
+    dest = resolve_location(org, location)
+
+    try:
+        info_before = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info_before = None
+    locked_before = bool(info_before and info_before.get("CycleCountPending"))
+
+    try:
+        initiate = initiate_count(location_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"initiateCount failed: {exc}"}
+    if not (200 <= int(initiate.get("_httpStatus") or 0) < 300):
+        return {"success": False, "error": extract_message(initiate) or "initiateCount failed"}
+    count_run_id = _extract_count_run_id(initiate)
+    task_id = _extract_count_task_id(initiate)
+    if not count_run_id or not task_id:
+        return {"success": False, "error": "initiateCount did not return a CountRunId/TaskId"}
+
+    for item_id, quantity in cleaned:
+        try:
+            validate_item_and_get_item_details(location_id, count_run_id, item_id, token, org, location=dest)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"validateItemAndGetItemDetails failed for {item_id}: {exc}",
+                "countRunId": count_run_id,
+            }
+        try:
+            accept_quantity(location_id, count_run_id, task_id, item_id, quantity, token, org, location=dest)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"acceptQuantity failed for {item_id}: {exc}",
+                "countRunId": count_run_id,
+            }
+        try:
+            persist_count_details(location_id, count_run_id, task_id, item_id, quantity, token, org, location=dest)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"persistCountDetails failed for {item_id}: {exc}",
+                "countRunId": count_run_id,
+            }
+
+    try:
+        end_count(location_id, count_run_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"endCount failed: {exc}", "countRunId": count_run_id}
+
+    try:
+        rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        rows = []
+    results = []
+    for item_id, _quantity in cleaned:
+        row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
+        results.append(_cycle_count_result_response(row, location_id, item_id, count_run_id))
+
+    try:
+        info_after = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info_after = None
+
+    return {
+        "success": all(r.get("success") for r in results),
+        "locationId": location_id,
+        "countRunId": count_run_id,
+        "results": results,
+        "locationLockedBefore": locked_before,
+        "locationLockedAfter": bool(info_after and info_after.get("CycleCountPending")),
+    }
+
+
+def check_cycle_count_location_status(
+    token: str, org: str, location_id: str, item_ids: List[str], count_run_id: str, location: str = None
+) -> Dict[str, Any]:
+    """Multi-item counterpart to check_cycle_count_status() — the
+    lightweight poll target complete_cycle_count_location()'s caller
+    uses to pick up the real (asynchronous) resolution for every item
+    in one call instead of one `check_cycle_count_status` call per item.
+    """
+    location_id = (location_id or "").strip().upper()
+    count_run_id = (count_run_id or "").strip()
+    item_ids = [str(i or "").strip() for i in (item_ids or []) if str(i or "").strip()]
+    if not location_id or not item_ids or not count_run_id:
+        return {"success": False, "error": "locationId, itemIds, and countRunId are required"}
+
+    dest = resolve_location(org, location)
+    try:
+        rows = search_inventory_count_results(count_run_id, location_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"inventoryCountResult search failed: {exc}"}
+    results = []
+    for item_id in item_ids:
+        row = next((r for r in rows if str(r.get("ItemId") or "") == item_id), None)
+        results.append(_cycle_count_result_response(row, location_id, item_id, count_run_id))
+
+    try:
+        info = search_location_count_info(location_id, token, org, location=dest)
+    except Exception:  # noqa: BLE001
+        info = None
+    return {
+        "success": all(r.get("success") for r in results),
+        "locationId": location_id,
+        "countRunId": count_run_id,
+        "results": results,
+        "locationLocked": bool(info and info.get("CycleCountPending")),
+    }

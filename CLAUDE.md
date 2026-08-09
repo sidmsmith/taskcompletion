@@ -1260,14 +1260,94 @@ specific artifact of the demo data rather than a general behavior —
 not reproduced on any genuinely fresh location — but flagged here
 rather than silently ignored.
 
-**Not yet tested**: a real multi-item location (the accordion path) —
-`complete_cycle_count_line()`'s docstring flags that running two counts
-against the *same* location within seconds of each other can produce a
-genuine `"Booking Failed"` concurrency conflict (`"Cycle count already
-in progress for different inventory read"` — confirmed live, though as
-a side effect of rapid-fire test automation, not normal single-visit
-usage), so a multi-item accordion completing several items at the same
-location may need to serialize its per-item completions rather than
-fire them concurrently. Also not yet built: the tasked (non-ad-hoc)
-Cycle Count flow — explicitly deferred by the user until ad hoc counts
-are solid.
+## Multi-item location: atomic completion required (2026-08-08, tenth session)
+
+**Test location found**: `A1AC0924` — `LocationTypeId: STORAGE`,
+`InventoryReservationTypeId: LOCATION` (non-LPN-tracked), two genuinely
+distinct real merchandise items (`5000001` "10 Pack SD Rice", OnHand
+1739; `5000002` "10 Pack SD Wheat", OnHand 750) — found by a broad
+`dcinventory/inventory/search` for `InventoryContainerTypeId='LOCATION'`
+grouped by `LocationId` in Python to find one with 2+ distinct
+`ItemId`s. Most multi-item hits in this org are equipment/asset
+records (`GAYLORD`, `CHEP PALLET`, `CAGE`, etc), not real SKUs — this
+one was the only clean real-merchandise match. Never locked, 0 prior
+count runs, before this session's testing.
+
+**Per-item independent completion does NOT work for a multi-item
+location — confirmed live, then fixed.** The original design (each
+item runs its own full `initiateCount`→...→`endCount` chain,
+independent of its siblings) was based on an untested assumption.
+Real behavior, confirmed by completing just one of the two items:
+
+- The count parks at `"Count Initiated"` **indefinitely** — polled for
+  30+ seconds straight with zero change, not just "a bit slower."
+- Calling `endCount` before every item at the location is addressed
+  returns HTTP 400 with `INM::230` ("Not all the Items in the Location
+  are counted") — a real `WARNING`, not a silent "unaddressed item
+  counts as 0" default. Confirmed safe by direct verification: the
+  addressed item's result stays at `"Count Initiated"` (not falsely
+  booked), the *unaddressed* item has **no `inventoryCountResult` row
+  created at all** (never force-evaluated, no phantom variance/
+  tolerance failure), and real on-hand for both items is untouched.
+  This directly answers a real concern raised before testing (an
+  uncounted item silently defaulting to 0 and triggering a false
+  out-of-tolerance/tolerance-check failure) — confirmed live that
+  MAWM's own safeguard rules this out; nothing on this app's side had
+  to compensate for it.
+- A second item's own `initiateCount` call against an already-open
+  count for the same location reuses the **same** `CountRunId`/
+  `TaskId` (MAWM's own dedup — confirmed live, not something this app
+  requests or controls). Once every item has been persisted under that
+  shared run, a single `endCount` call succeeds and every item
+  transitions together — through a previously unseen intermediate
+  status, `"Count Complete"` (`StatusKey: 30`), to `"Booked"`.
+
+**Fixed**: `task_service.complete_cycle_count_location()` (new,
+alongside `check_cycle_count_location_status()` for polling) runs the
+correct atomic sequence — one `initiateCount`, then
+`validateItemAndGetItemDetails`/`acceptQuantity`/`persistCountDetails`
+looped per item (all reusing the same `CountRunId`/`TaskId`), then
+exactly one `endCount` call at the very end, only once every item has
+been persisted. If any single item's own validate/accept/persist call
+raises, this stops immediately *without* calling `endCount` — leaving
+the run parked at `"Count Initiated"` (confirmed safe above) rather
+than calling `endCount` on incomplete data for a different, more
+confusing rejection. `complete_cycle_count_line()`/
+`check_cycle_count_status()` (the original per-item versions) are kept
+for the single-item case — a location with exactly one item has no
+"other items" to wait for, so the atomic version isn't strictly
+required there, but the frontend now always uses the atomic path
+uniformly (see below) since a single-item location is just "a group of
+1" and needs no special-casing.
+
+**Frontend reworked to select/complete by *location*, not by line**
+(`app.js`) — per explicit instruction ("we probably need to force a
+user to enter all lines, with 0 being a valid number"):
+- Every cycle-count row (single-item, MIXED summary, MIXED sub-rows)
+  now carries `data-group-key`; clicking any of them selects the whole
+  group (`selectCycleCountGroup()`), highlighting every row in it.
+- `isCycleCountGroupDone()`/`isCycleCountGroupValid()` require **every**
+  line in the group to be done/valid — Complete Line stays disabled
+  until every item in a MIXED location has a real quantity entered (0
+  valid, matching `isCycleCountQtyValid()`'s existing empty-string
+  check from earlier this session).
+- `completeCycleCountGroupAction()` calls the new
+  `/api/complete_cycle_count_location` with every item's current
+  itemId/quantity in one request; `pollCycleCountGroupStatus()` is the
+  group-level counterpart to the earlier per-line poller, calling
+  `/api/check_cycle_count_location_status` for all items at once.
+- Complete All now iterates *groups*, not flat lines — a MIXED
+  location counts as one unit in "N of M" progress and in the
+  confirmation modal/failure summary.
+
+**Confirmed live end-to-end through the real UI** (not just direct
+Python calls): `A1AC0924`, both items counted at their exact current
+on-hand (1739/750, no variance) via one Complete Line click on the
+selected group — both resolved to `"Booked"` (`"1739 → 1739"`/
+`"750 → 750"`, `"0 ($0)"` variance), the action-status banner read
+"Location A1AC0924 booked.", both rows correctly marked done
+(qty/item inputs disabled), and real MAWM data independently confirmed
+unchanged on-hand (1739/750) with the location unlocked afterward.
+
+Also not yet built: the tasked (non-ad-hoc) Cycle Count flow —
+explicitly deferred by the user until ad hoc counts are solid.
