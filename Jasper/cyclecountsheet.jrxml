@@ -57,11 +57,6 @@
         <property name="net.sf.jasperreports.jsonql.field.expression" value="DisplayLocation"/>
     </field>
 
-    <variable name="AllLocationsCsv" class="java.lang.String" resetType="Report" calculation="Nothing">
-        <variableExpression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></variableExpression>
-        <initialValueExpression><![CDATA[""]]></initialValueExpression>
-    </variable>
-
     <title>
         <band height="42" splitType="Stretch">
             <textField>
@@ -189,15 +184,4 @@
             </textField>
         </band>
     </pageFooter>
-
-    <summary>
-        <band height="98">
-            <componentElement>
-                <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
-                <jr:QRCode>
-                    <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
-                </jr:QRCode>
-            </componentElement>
-        </band>
-    </summary>
 </jasperReport>

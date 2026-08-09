@@ -29,7 +29,9 @@ rediscover all of this from scratch.
   plain JSON" below. **Never open/save this one in Jaspersoft Studio** —
   Studio will silently rewrite it back into the newer format and break it
   again. It carries an inline XML comment at the top saying the same
-  thing.
+  thing. **Currently has no QR code** — temporarily removed to isolate a
+  NullPointerException; see "QR code temporarily removed" below before
+  re-adding it.
 - **`location_inventory_sample.json`** — sample payload used by Studio's
   "Location Inventory JSON" data adapter for Preview. Root shape:
   `{ "Locations": [ { LocationId, DisplayLocation, LocationBarcode,
@@ -219,6 +221,61 @@ WMS's own validator error messages:
   find a different way to pre-compute all location IDs before the
   report starts filling (e.g. a two-pass query) rather than
   accumulating them during the fill.
+
+## QR code temporarily removed from cyclecountsheet.jrxml (as of this writing)
+
+After the field-mapping fix above, a real upload attempt still failed
+with a bare `java.lang.NullPointerException` — no message, no stack
+trace at all. Glean's diagnosis was that the self-referencing
+`AllLocationsCsv` variable itself was the unsafe part. **That specific
+theory is doubtful** — that accumulator pattern is a completely standard
+JasperReports idiom, and it was independently verified end-to-end
+against the real JasperReports 7.0.6 engine earlier in this project
+(full compile → fill → PDF export, no error) — but the *action* taken
+was reasonable regardless: both the variable and the entire `<summary>`
+band containing the QR component were removed, to isolate whether the
+core location/item table renders correctly on its own, deferring the QR
+feature until that's confirmed.
+
+**A more likely explanation**, matching the "Runtime library
+dependencies" section below: QR rendering needs barcode4j, ZXing, Batik,
+and a PDF backend all present on whatever engine executes the report,
+separate from anything in the JRXML — none of that has ever been
+confirmed present in MAWM's JasperReports 6.4.0 deployment. A bare,
+message-less NPE is a plausible symptom of that class of failure. If the
+location/item table now renders correctly with this QR-free version,
+that's evidence for this theory over the self-referencing-variable one —
+worth confirming with whoever manages the WMS's JasperReports deployment
+whether barcode/QR support is actually installed, rather than continuing
+to tweak the JRXML if it comes back to bite again once the QR is
+re-added.
+
+**To re-add the QR code once the core report is confirmed working**, the
+variable and summary band removed here were (immediately before removal):
+
+```xml
+<variable name="AllLocationsCsv" class="java.lang.String" resetType="Report" calculation="Nothing">
+    <variableExpression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></variableExpression>
+    <initialValueExpression><![CDATA[""]]></initialValueExpression>
+</variable>
+```
+
+```xml
+<summary>
+    <band height="98">
+        <componentElement>
+            <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
+            <jr:QRCode>
+                <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
+            </jr:QRCode>
+        </componentElement>
+    </band>
+</summary>
+```
+
+(`location_inventory_report.jrxml`, the Studio-editable copy, still has
+the QR code intact in its own compact-format equivalent — this removal
+only applies to the WMS deployment copy.)
 
 ## Runtime library dependencies (separate from the JRXML file itself)
 
