@@ -417,6 +417,67 @@ def _build_task_response(raw_task: dict, task_id: str, token: str, org: str, des
     }
 
 
+def _cycle_count_task_signature_ok(raw_task: dict) -> bool:
+    """Locks the search box's tasked Cycle Count routing down to the one
+    task-creation flavor confirmed live this session (see CLAUDE.md's
+    "Tasked (non-ad-hoc) Cycle Count" section) —
+    `cycleCountTask/create`'s `TransactionId: "Cycle Count"` +
+    `AssignedTaskPoolId: "SystemTaskPool"`. Per explicit instruction:
+    the demo org has stale/unverified tasks from other flavors (e.g.
+    the earlier `"Recount"`/`"Task Interleaving"` task, and genuine ad
+    hoc byproduct tasks with the same `SystemTaskPool` but a different
+    `TransactionId`), so anything not matching this exact signature is
+    refused here rather than guessed at.
+    """
+    transaction_id = str(_first(raw_task, "TransactionId") or "").strip()
+    task_pool = str(_first(raw_task, "AssignedTaskPoolId") or "").strip()
+    return transaction_id == "Cycle Count" and task_pool == "SystemTaskPool"
+
+
+def _resolve_cycle_count_task(
+    raw_task: dict, task_id: str, token: str, org: str, dest: str
+) -> Dict[str, Any]:
+    """Routes a real WM-scheduled Cycle Count task found via
+    resolve_search() into the cycle-count UI/completion path instead of
+    the generic task-line rendering _build_task_response() produces —
+    confirmed this session that a Cycle Count task's own `TaskDetail`
+    carries no item until counted (WM creates the task for the whole
+    location), so this reuses resolve_cycle_count_location() exactly
+    like ad hoc does, tagging the result with the real `taskId` so the
+    frontend sends `isTasked: true` on completion (trigger_end_count()
+    instead of end_count() — see mawm_client.trigger_end_count()'s
+    docstring; task closure requires it, count booking works either
+    way).
+    """
+    if not _cycle_count_task_signature_ok(raw_task):
+        transaction_id = str(_first(raw_task, "TransactionId") or "")
+        task_pool = str(_first(raw_task, "AssignedTaskPoolId") or "")
+        return {
+            "success": False,
+            "error": (
+                f"Cycle Count task {task_id} has an unsupported configuration "
+                f"(TransactionId={transaction_id!r}, TaskPool={task_pool!r}) — not processed here yet."
+            ),
+        }
+
+    location_id = str(_first(raw_task, "SourceLocationId", "BeginLocationId") or "").strip()
+    if not location_id:
+        return {"success": False, "error": f"Cycle Count task {task_id} has no location"}
+
+    result = resolve_cycle_count_location(token, org, location_id, location=dest)
+    if not result.get("success"):
+        return result
+
+    result["taskId"] = task_id
+    result["isTasked"] = True
+    result["taskStatus"] = str(_first(raw_task, "Status") or "")
+    result["taskStatusLabel"] = task_status_description(_first(raw_task, "Status"))
+    for line in result.get("lines") or []:
+        line["taskId"] = task_id
+        line["isTasked"] = True
+    return result
+
+
 def resolve_search(
     token: str,
     org: str,
@@ -445,6 +506,9 @@ def resolve_search(
 
     raw_task = search_task(search_value, token, org, location=dest)
     if raw_task:
+        transaction_type = str(_first(raw_task, "TransactionTypeId") or "").strip()
+        if transaction_type == "Cycle Count":
+            return _resolve_cycle_count_task(raw_task, search_value, token, org, dest)
         return _build_task_response(raw_task, search_value, token, org, dest)
 
     found_task_id = search_task_id_for_container(search_value, token, org, location=dest)
@@ -607,10 +671,13 @@ def resolve_search_multi(
     dest = resolve_location(org, location)
     groups: List[Dict[str, Any]] = []
     not_found: List[str] = []
+    not_found_reasons: List[str] = []
     for token_value in tokens:
         result = resolve_search(token, org, token_value, location=dest)
         if not result.get("success"):
             not_found.append(token_value)
+            if result.get("error"):
+                not_found_reasons.append(result["error"])
             continue
         group_key = f"{result['mode']}:{result.get('taskId') or result.get('containerId')}"
         for line in result.get("lines") or []:
@@ -627,6 +694,13 @@ def resolve_search_multi(
         groups.append(result)
 
     if not groups:
+        # A single failed token (the common case) gets its own specific
+        # reason surfaced directly — e.g. _resolve_cycle_count_task()'s
+        # "unsupported configuration" refusal — rather than a generic
+        # "not found" that would misleadingly suggest a typo for a task
+        # that actually exists but was deliberately refused.
+        if len(tokens) == 1 and not_found_reasons:
+            return {"success": False, "error": not_found_reasons[0]}
         return {
             "success": False,
             "error": f"No task or iLPN found for: {', '.join(not_found)}",

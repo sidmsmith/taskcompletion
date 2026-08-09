@@ -1873,3 +1873,123 @@ response `success` alone — always independently re-query):
    UI/search-routing work is the remaining piece — worth deciding on
    the stuck-location guard above first, since the UI is where a real
    user would actually run into it.
+
+## Tasked Cycle Count UI wiring (2026-08-09, tenth session)
+
+Per explicit instruction, items 1 and 2 above (the stuck-location
+multi-task-trail guard, and testing a different task-creation flavor)
+were deliberately deprioritized — "my demo environment has stale data
+and there could be some bad tasks... we can always lock down the UI to
+only allow TransactionId: 'Cycle Count', SystemTaskPool to ensure that
+we dont even try to process bad tasks." That's exactly what got built.
+
+**Search routing** (`task_service.py`): the existing "Task Id or iLPN"
+search box (`resolve_search()`/`resolve_search_multi()`, behind
+`/api/load_task`) previously found a real Cycle Count task fine via
+`search_task()` but rendered it through the generic Putaway-style
+`_build_task_response()` path — exactly the gap flagged earlier this
+session ("it would fall into the generic Putaway-style task path
+instead"), since a Cycle Count task's own `TaskDetail` carries no item
+until counted. Fixed: `resolve_search()` now checks
+`TransactionTypeId` right after `search_task()` succeeds; if it's
+`"Cycle Count"`, control passes to the new `_resolve_cycle_count_task()`
+instead of `_build_task_response()`.
+
+- `_cycle_count_task_signature_ok(raw_task)` — the lockdown itself:
+  `TransactionId == "Cycle Count"` and `AssignedTaskPoolId ==
+  "SystemTaskPool"`, exactly the one confirmed-safe flavor from
+  `cycleCountTask/create`. Anything else (including the earlier
+  `"Recount"`/`"Task Interleaving"` task, and genuine ad hoc byproduct
+  tasks that share `SystemTaskPool` but not `TransactionId`) is
+  refused with a specific error rather than guessed at.
+- **Important gotcha found and worked around**: `TransactionId` on a
+  Task record is **not stable** — it gets overwritten by whichever
+  transaction last processed the task. A task created with
+  `TransactionId: "Cycle Count"` reads back as `"Cycle Count
+  Active-API"` (this app's own constant) once *this app* has completed
+  it. So the signature check is only meaningful for a task that hasn't
+  been run through this app's completion chain yet — which is exactly
+  the real use case (searching for an open task before running it).
+  Confirmed live against a genuinely fresh, untouched task
+  (`CCNTINM000558`) to verify this, rather than reusing an
+  already-completed one (which would have shown the overwritten
+  value and given a false read on the check).
+- `_resolve_cycle_count_task()` — once the signature passes, extracts
+  the task's location (`SourceLocationId`, falling back to
+  `BeginLocationId` — confirmed live `SourceLocationId` is always the
+  populated one), delegates to the existing `resolve_cycle_count_location()`
+  (unchanged, exactly what ad hoc already uses), then tags the result
+  and every line with `taskId`/`isTasked: true` and the task's real
+  `taskStatus`/`taskStatusLabel`.
+- `resolve_search_multi()` needed **zero changes** — it already treats
+  whatever `resolve_search()` returns generically (keys off
+  `result['mode']`/`result.get('taskId')`), so a `mode: "cycle_count"`
+  result slots into its existing group-wrapping loop without any
+  special-casing. Confirmed live via both `resolve_search()` directly
+  and the actual `resolve_search_multi()` entry point `/api/load_task`
+  uses.
+- **Error message fix**: `resolve_search_multi()` originally collapsed
+  every per-token failure into a generic "No task or iLPN found for:
+  X" — which would have made the lockdown refusal read exactly like a
+  typo, even though the task genuinely exists and was deliberately
+  refused. Fixed: for a single-token search (the common case), the
+  specific failure reason (e.g. `_resolve_cycle_count_task()`'s
+  "unsupported configuration" message) is surfaced directly instead of
+  the generic fallback. Multi-token searches still collapse into the
+  generic list message, unchanged.
+
+**Frontend** (`app.js`): the "Task Id or iLPN" search box's existing
+`fetchAndRenderTask()` now detects when every returned group has
+`mode: "cycle_count"` and routes to the same `renderCycleCountGroups()`
+table ad hoc already uses, instead of the generic task table — a
+single-item location is "a group of 1" either way, so no new rendering
+logic was needed, just routing. Three supporting changes:
+- `state.lastSearchIsTaskedCycleCount` (new) — both ad hoc and tasked
+  cycle count share `state.lastSearchMode: "cycle_count"` (so every
+  existing button/completion check, e.g. Complete Line/Complete All
+  gating, keeps working unchanged for both), but `reloadCurrentSearch()`
+  needs to know which endpoint to re-fetch from (`/api/search_cycle_count`
+  for ad hoc, `/api/load_task` for tasked) — this flag is the only
+  place that distinction still matters.
+- `completeCycleCountGroupAction()` now sends `isTasked: !!group.isTasked`
+  in the `/api/complete_cycle_count_location` payload — the backend
+  flag wired in earlier this session (`trigger_end_count()` vs
+  `end_count()`), now actually reachable from the UI for the first
+  time.
+- `renderCycleCountTaskMeta()` shows the real `Task <id>` / `Status
+  <badge>` header for a tasked group (matching the generic task view's
+  own header), instead of ad hoc's plain Location-only header.
+
+**Mixed-mode multi-search not specially handled** — if a batch search
+mixes a Cycle Count TaskId with a regular Putaway TaskId/iLPN, it falls
+back to the generic task table (since not every group is `cycle_count`
+mode), which would misrender the cycle-count group. Realistic usage is
+one type at a time; not solved preemptively per "no premature
+abstraction" — flagged as a known limitation, not fixed.
+
+**Confirmed live end-to-end through the actual browser UI** (not just
+direct Python calls), using a genuinely fresh task created for this
+test, `CCNTINM000558` (`A1AC0123`, item `6000108`, on-hand `240`):
+1. Typed `CCNTINM000558` into the real search box — header correctly
+   showed `Task CCNTINM000558` / `Location A1AC0123` / `Status Ready
+   For Assignment`, rendered through the cycle-count table (item
+   `6000108` pre-filled, description "Dockside Oxford Shirt").
+2. Entered `240` (exact match), clicked **Complete Line** — UI showed
+   "Still processing (Count Initiated)", then resolved to "Location
+   A1AC0123 booked." within ~5s, matching ad hoc's own progressive
+   polling UX exactly.
+3. **Independently verified** (never trust the UI banner alone):
+   `Task.Status: 8000`, real `TaskDetail.CompletedQuantity: 240.0 ==
+   Quantity: 240.0`, real on-hand still `240` (correct, exact match).
+4. Searched the non-conforming `CCNTINM000023` (`"Recount"`/`"Task
+   Interleaving"`) in the same box — correctly refused with the
+   specific message (`"Cycle Count task CCNTINM000023 has an
+   unsupported configuration (TransactionId='Recount',
+   TaskPool='Task Interleaving') — not processed here yet."`), not a
+   crash or a misleading generic "not found."
+5. Regression-checked a known real Putaway TaskId (`IBPWIBPT0929`)
+   still resolves `mode: "task"` exactly as before — the new branch is
+   additive, existing task types are untouched.
+
+Version bumped to `v0.13.0` for this change (real new user-facing
+capability, not just a doc/investigation update).

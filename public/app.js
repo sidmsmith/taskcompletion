@@ -12,7 +12,14 @@
     // needs to cross-reference back into `groups` for a given row.
     groups: [],
     lastSearchValue: "", // raw search box text, re-used to refresh after a completion
-    lastSearchMode: "task", // which endpoint/table the last successful load used — see reloadCurrentSearch()
+    lastSearchMode: "task", // which table the last successful load used — see reloadCurrentSearch()
+    // True when the last load came from a real WM-scheduled Cycle Count
+    // TaskId typed into the Task Id/iLPN box (task_service.resolve_search()'s
+    // mode:"cycle_count" branch — see fetchAndRenderTask()), as opposed to
+    // ad hoc's own Storage-location search. Both render through the same
+    // cycle-count table/lastSearchMode value ("cycle_count"), but reload
+    // needs to know which endpoint to hit again — see reloadCurrentSearch().
+    lastSearchIsTaskedCycleCount: false,
     selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
     adjustmentReasonCodes: null, // [{key,value}] once preloaded, see preloadAdjustmentReasonCodes()
@@ -987,7 +994,18 @@
   function renderCycleCountTaskMeta() {
     const groups = state.groups;
     if (groups.length === 1) {
-      el.taskMeta.innerHTML = `<span><strong>Location</strong> ${escapeHtml(groups[0].locationId)}</span>`;
+      const g = groups[0];
+      // Tasked groups (real WM-scheduled Cycle Count TaskId, see
+      // fetchAndRenderTask()) show the real Task Id/status, same as the
+      // generic task view — ad hoc has neither, so it keeps the plain
+      // Location-only header it always had.
+      el.taskMeta.innerHTML = g.isTasked
+        ? `
+          <span><strong>Task</strong> ${escapeHtml(g.taskId)}</span>
+          <span><strong>Location</strong> ${escapeHtml(g.locationId)}</span>
+          <span><strong>Status</strong> ${statusBadgeHtml(g.taskStatusLabel, g.taskStatus)}</span>
+        `
+        : `<span><strong>Location</strong> ${escapeHtml(g.locationId)}</span>`;
     } else {
       el.taskMeta.innerHTML = `<span><strong>${groups.length} locations loaded</strong></span>`;
     }
@@ -1258,6 +1276,12 @@
       location: state.facility,
       locationId: group.locationId,
       itemAdjustments,
+      // trigger_end_count() vs end_count() at the final step — see
+      // task_service.complete_cycle_count_location()'s docstring. Only
+      // true for a real WM-scheduled task (group.isTasked, set by
+      // resolve_search()'s mode:"cycle_count" branch); ad hoc groups
+      // never carry it, so this is false/undefined for them, unchanged.
+      isTasked: !!group.isTasked,
     });
   }
 
@@ -1460,10 +1484,25 @@
       setStatus(data.error || "Load failed", "error");
       return false;
     }
-    state.groups = data.groups || [];
+    const groups = data.groups || [];
+    // A real WM-scheduled Cycle Count TaskId typed into this same box
+    // resolves server-side into cycle-count-shaped groups
+    // (task_service.resolve_search()'s mode:"cycle_count" branch,
+    // 2026-08-09) — route those through the cycle-count table exactly
+    // like ad hoc, rather than the generic task rendering that would
+    // otherwise misrender a Cycle Count task's own itemless TaskDetail.
+    // Mixed batches (some cycle-count, some not) aren't specially
+    // handled — falls back to the generic table, a known limitation.
+    const isTaskedCycleCount = groups.length > 0 && groups.every((g) => g.mode === "cycle_count");
+    state.groups = groups;
     state.lastSearchValue = searchValue;
-    state.lastSearchMode = "task";
-    renderGroups();
+    state.lastSearchMode = isTaskedCycleCount ? "cycle_count" : "task";
+    state.lastSearchIsTaskedCycleCount = isTaskedCycleCount;
+    if (isTaskedCycleCount) {
+      renderCycleCountGroups();
+    } else {
+      renderGroups();
+    }
     let statusText = fmtCount(allLines().length, "line");
     if (data.notFound && data.notFound.length) {
       statusText += " — not found: " + data.notFound.join(", ");
@@ -1487,6 +1526,7 @@
     state.groups = data.groups || [];
     state.lastSearchValue = searchValue;
     state.lastSearchMode = "cycle_count";
+    state.lastSearchIsTaskedCycleCount = false;
     renderCycleCountGroups();
     let statusText = fmtCount(allLines().length, "line");
     if (data.notFound && data.notFound.length) {
@@ -1532,7 +1572,12 @@
   /** Re-runs the same raw search text to refresh everything currently loaded. */
   async function reloadCurrentSearch() {
     if (!state.lastSearchValue) return;
-    if (state.lastSearchMode === "cycle_count") {
+    // Ad hoc cycle count and tasked cycle count share lastSearchMode
+    // ("cycle_count", so every other button/completion check below
+    // doesn't need to distinguish them) but came from different
+    // endpoints — lastSearchIsTaskedCycleCount is the only place that
+    // still needs to tell them apart, to re-fetch from the right one.
+    if (state.lastSearchMode === "cycle_count" && !state.lastSearchIsTaskedCycleCount) {
       await fetchAndRenderCycleCount(state.lastSearchValue);
     } else {
       await fetchAndRenderTask(state.lastSearchValue);
