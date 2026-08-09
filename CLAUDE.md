@@ -1119,17 +1119,16 @@ variances... so the user can see the full result"):
 - New `check_cycle_count_status()` (`POST /api/check_cycle_count_status`,
   `{locationId, itemId, countRunId}`) is a lightweight re-check —
   same `inventoryCountResult` lookup, no chain re-run. `app.js`'s
-  `pollCycleCountLineStatus()` calls it every 1.8s, up to 8 times,
-  after any non-`"Booked"` completion result, live-updating the row
-  each time. There's no way to tell an eventually-resolving in-flight
-  status apart from a genuinely stuck out-of-tolerance one from the
-  status text alone, so it always polls the full window regardless —
-  confirmed live for both: a within-tolerance count visibly flipped
-  from red "Count not booked (status: Count Initiated)" to green
-  "Booked: 10 → 9 (variance -1)" a few seconds later; an out-of-
-  tolerance count settled into the muted "Pending supervisor
-  booking…" state and correctly stopped polling rather than spinning
-  forever.
+  `pollCycleCountLineStatus()` calls it after any non-`"Booked"`
+  completion result, live-updating the row each time. There's no way
+  to tell an eventually-resolving in-flight status apart from a
+  genuinely stuck out-of-tolerance one from the status text alone, so
+  it always polls the full window regardless — confirmed live for
+  both: a within-tolerance count visibly flipped from red "Count not
+  booked (status: Count Initiated)" to green "Booked: 10 → 9
+  (variance -1)" a few seconds later; an out-of-tolerance count
+  settled into the muted "Pending supervisor booking…" state and
+  correctly stopped polling rather than spinning forever.
 - Table gained two new columns, **Previous Qty** and **Variance**
   (`.cc-previous-qty`/`.cc-variance` cells, populated by the shared
   `applyCycleCountResultToRow()` used by both the initial completion
@@ -1139,6 +1138,37 @@ variances... so the user can see the full result"):
   All** isn't blocked waiting for each line's booking to resolve
   before moving to the next line — each line's poll runs independently
   in the background.
+
+**Real near-miss found and fixed the same session** — the poll window
+started at 8 attempts × 1.8s (~14.4s), sized from a single isolated
+test. Running Complete All across 3 real sample locations
+(`A1AC0123`/`A1AC1201`/`A2AC1201`) exposed it as too tight: measured
+live via `inventoryCountRun`'s `Created`/`UpdatedTimestamp`,
+`A1AC1201`'s real booking took **~14.7 seconds** — past the old
+cutoff by about 300ms, so polling gave up moments before the
+resolution landed, leaving the row stuck on "Count not booked" even
+though the count had, in fact, booked (confirmed by re-querying
+`inventoryCountRun`/`search_location_inventory` directly afterward —
+`Status: 80` "Booked", `OnHand` matching the counted quantity).
+Widened to **30 attempts × 2s = 60s** — `check_cycle_count_status()`
+is a cheap read, so the wider window costs little even for the
+out-of-tolerance case that never resolves and just polls uselessly
+until giving up. Re-confirmed live afterward: Complete All across
+`A1AC0134`/`A1AC0139`/`A1AC0140` (perfect/within-tolerance/out-of-
+tolerance) all resolved correctly, including the within-tolerance
+line flipping from "Count not booked (status: In Booking)" to
+"Booked: 9 → 8 (variance -1)" a few seconds later.
+
+Also fixed in the same pass: Complete All's failure/issues summary
+used to read "Line 1: ...; Line 1: ...; Line 1: ..." for a 3-location
+batch — every location's own line numbering restarts at 1 (see
+`resolve_cycle_count_location()`), so bare `lineNumber` is ambiguous
+once more than one location is involved. `cycleCountFailureLabel()`
+now always prefixes with the location. The summary banner itself was
+also reworded — it used to read as a final tally ("Completed 0 of 3
+lines"), which is misleading given booking is asynchronous and a line
+counted as an "issue" the instant the loop finishes may still book
+moments later via the background poll.
 
 **Open, unexplained, and deliberately not chased further**:
 `A1AC0124` (an item location with 24+ pre-existing `inventoryCountRun`

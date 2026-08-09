@@ -1084,8 +1084,8 @@
     setCycleCountResultCell(taskDetailId, cycleCountResultText(result), cycleCountResultKind(result), result.success);
   }
 
-  const CYCLE_COUNT_POLL_INTERVAL_MS = 1800;
-  const CYCLE_COUNT_POLL_MAX_ATTEMPTS = 8;
+  const CYCLE_COUNT_POLL_INTERVAL_MS = 2000;
+  const CYCLE_COUNT_POLL_MAX_ATTEMPTS = 30;
 
   /**
    * Booking is asynchronous — a count that will eventually book (within
@@ -1100,6 +1100,18 @@
    * leaving whatever the last poll showed. Fire-and-forget: the caller
    * doesn't await this, so Complete All isn't blocked waiting for each
    * line's booking to resolve before moving to the next line.
+   *
+   * **Widened 2026-08-08 after a real near-miss** — the original 8
+   * attempts * 1.8s (~14.4s) window was measured live to be too short:
+   * running Complete All across 3 locations, one within-tolerance
+   * count's real booking took ~14.7s (confirmed via
+   * inventoryCountRun's Created/UpdatedTimestamp) — just past the old
+   * cutoff, so polling gave up moments before the resolution landed,
+   * leaving the row stuck showing "Count not booked" even though it
+   * had, in fact, booked. Now 30 * 2s = 60s, comfortably clear of that
+   * measurement; check_cycle_count_status() is a cheap read, so a
+   * longer window costs little even for the out-of-tolerance case that
+   * never resolves and just polls uselessly until it gives up.
    */
   async function pollCycleCountLineStatus(line, initialResult) {
     if (initialResult.success || !initialResult.countRunId) return;
@@ -1228,6 +1240,20 @@
     allLinesModal.show();
   }
 
+  /**
+   * A location's own group always numbers its (usually single) line
+   * "1" (see resolve_cycle_count_location()) — with several locations
+   * in one Complete All batch, "Line 1: ..." repeated for every one of
+   * them is meaningless on its own (confirmed live, 2026-08-08: a real
+   * 3-location run showed "Line 1: ...; Line 1: ...; Line 1: ..." with
+   * no way to tell which was which). Always prefix with the location,
+   * not just when multiGroup — this failures list is exactly the case
+   * where it matters most.
+   */
+  function cycleCountFailureLabel(line, message) {
+    return "Location " + line.locationId + " (line " + line.lineNumber + "): " + message;
+  }
+
   async function confirmAllCycleCountLines() {
     allLinesModal.hide();
     const total = allCycleCountLinesPending.length;
@@ -1242,11 +1268,11 @@
         if (result.success) {
           succeeded++;
         } else {
-          failures.push("Line " + line.lineNumber + ": " + (result.error || "failed"));
+          failures.push(cycleCountFailureLabel(line, result.error || "failed"));
           pollCycleCountLineStatus(line, result); // fire-and-forget, doesn't block the rest of the loop
         }
       } catch (e) {
-        failures.push("Line " + line.lineNumber + ": " + (e.message || String(e)));
+        failures.push(cycleCountFailureLabel(line, e.message || String(e)));
         setCycleCountResultCell(line.taskDetailId, e.message || String(e), "error", false);
       }
     }
@@ -1255,9 +1281,18 @@
     if (!failures.length) {
       setActionStatus("Completed " + fmtCount(succeeded, "line") + ".", "success");
     } else {
+      // Not a final tally (2026-08-08, per the same near-miss above) —
+      // booking is asynchronous, so a line counted here as an "issue"
+      // may still book moments later via pollCycleCountLineStatus()'s
+      // background poll updating its own row; this banner just
+      // reflects what was known the instant the loop finished, not
+      // necessarily what's true now.
       setActionStatus(
-        "Completed " + succeeded + " of " + total + " lines. Issues: " + failures.join("; "),
-        "error"
+        "Booked " + succeeded + " of " + total + " lines immediately. " +
+          fmtCount(failures.length, "line") +
+          " still processing or needs attention (status will keep updating): " +
+          failures.join("; "),
+        ""
       );
     }
   }
