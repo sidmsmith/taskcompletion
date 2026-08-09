@@ -277,6 +277,58 @@ variable and summary band removed here were (immediately before removal):
 the QR code intact in its own compact-format equivalent — this removal
 only applies to the WMS deployment copy.)
 
+## The real MAWM payload shape (confirmed, differs from the sample data)
+
+The `Locations`-rooted, simple `{ItemId, ItemDescription, OnHandQty,
+OnHandDisplay}` shape that `location_inventory_sample.json` uses (and
+that this whole report was originally designed against) turns out to be
+a simplified stand-in Glean invented early on — **not** what MAWM
+actually sends. A real captured payload from MAWM looks like this
+instead (irrelevant fields omitted; the real objects have dozens more,
+e.g. full `Inventories[]` detail per item):
+
+```json
+{
+  "Data": [
+    {
+      "LocationId": "A1AC0401",
+      "DisplayLocation": "A1AC0401",
+      "LocationBarcode": "A1AC0401",
+      "Items": [
+        {
+          "ItemId": "5000221",
+          "ItemDescription": "Floral Print Dress",
+          "OnHandSum": 2,
+          "...": "many other fields, unused by this report"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Key real differences from the original assumed shape, both fixed in
+`cyclecountsheet.jrxml`:
+- Root array is **`Data`**, not `Locations`.
+- Each item's on-hand quantity is **`OnHandSum`**, not `OnHandQty`.
+- There is no `OnHandDisplay` key at all on the real item object — the
+  closest equivalent is `OnHandSumDisplay` (e.g. `"2 UNIT"`). The
+  `OnHandDisplay` field is still declared in `ItemDataset` mapped to a
+  now-confirmed-nonexistent key, but since nothing in the report
+  actually displays that field, it's harmless — it just always
+  evaluates to null/empty. Worth fixing (or removing the unused field
+  entirely) if it's ever wired into the visible report.
+
+**`location_inventory_sample.json` and `location_inventory_report.jrxml`
+(the Studio-editable copy) have NOT been updated to match this real
+shape** — they still use the original synthetic `Locations`/`OnHandQty`
+structure, so Studio's Preview no longer reflects what MAWM actually
+sends. This wasn't done automatically since it's a bigger, deliberate
+decision (new sample JSON, re-verifying every field binding in the
+Studio copy) rather than a small fix — worth doing before the next
+round of design changes in Studio, so Preview stays meaningful, but
+flagged here rather than done unprompted.
+
 ## Runtime library dependencies (separate from the JRXML file itself)
 
 None of this is fixable by editing the report — it's about what needs to

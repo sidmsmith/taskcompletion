@@ -37,7 +37,7 @@
             <property name="net.sf.jasperreports.jsonql.field.expression" value="ItemDescription"/>
         </field>
         <field name="OnHandQty" class="java.lang.Double">
-            <property name="net.sf.jasperreports.jsonql.field.expression" value="OnHandQty"/>
+            <property name="net.sf.jasperreports.jsonql.field.expression" value="OnHandSum"/>
         </field>
         <field name="OnHandDisplay" class="java.lang.String">
             <property name="net.sf.jasperreports.jsonql.field.expression" value="OnHandDisplay"/>
@@ -48,7 +48,7 @@
         <defaultValueExpression><![CDATA["Cycle Count Sheet"]]></defaultValueExpression>
     </parameter>
 
-    <queryString language="jsonql"><![CDATA[Locations]]></queryString>
+    <queryString language="jsonql"><![CDATA[Data]]></queryString>
 
     <field name="LocationId" class="java.lang.String">
         <property name="net.sf.jasperreports.jsonql.field.expression" value="LocationId"/>
