@@ -2895,3 +2895,139 @@ that for now"): not wired into the UI or backend response shape yet —
 this section exists purely so a future session (or this one, resumed
 cold) knows the data already exists and where it lives, without
 needing to rediscover it.
+
+## Picking: tote/iLPN picking — backend built and confirmed live (2026-08-10, twelfth session)
+
+**Backend only, per explicit instruction** ("we don't have to update
+the UI just yet... please work on the backend for totes first"). No
+frontend changes this round.
+
+**Live-tested with raw payloads first, before touching any code**,
+against real `"Pick To Tote"` tasks (`PICK0546`, `PICK0534`) — same
+discipline as the cart-picking work:
+- Submitting `TargetContainerId`/`TargetContainerType: "ILPN"` instead
+  of `OlpnId` in the same `InventoryMove` shape `commitPickMove()`
+  already uses — **confirmed accepted**, `HTTP 200`, and independently
+  verified via a fresh `search_task()` re-query (never trusted the
+  response alone, which — same as every other Pick finding this
+  session — echoed mostly-null/wrong data back).
+- **MAWM creates a brand-new, real iLPN for any caller-chosen id** —
+  tested `"TOTE010001"`; confirmed immediately queryable via the
+  already-existing `search_ilpn_current_location()` (`Status: "5000"`
+  = Allocated, per `ILPN_STATUS_LABELS`) with **no pre-creation call
+  needed**.
+- **`TargetContainerId` is genuinely optional at the API level**:
+  omitting it entirely still succeeds — MAWM auto-generates its own
+  system container id (same numeric format as an oLPN id, e.g.
+  `"0000099999000010781"`) and still creates a real iLPN. The API
+  itself doesn't require a caller-supplied tote id; only this app's
+  intended UX will (per explicit instruction, to record the real
+  physical tote the picker used, not an arbitrary system id).
+- **Consolidation confirmed**: two different lines (different source
+  locations, same item) committed into the *same* `TargetContainerId`
+  correctly aggregate into one real inventory row
+  (`search_container_inventory()`: `OnHand: 3.0` after 3× qty-1
+  commits into one tote) — not three separate rows. Different lines on
+  the same task can also go to *different* totes in the same task,
+  confirmed via `PICK0534` (2 lines → `TOTE020001`, 2 lines →
+  `TOTE020002`), same task auto-close-on-last-line behavior as every
+  other Pick scenario tested this session.
+
+**What actually changed:**
+- `mawm_client.commit_pick_move()` — gained `target_container_id`/
+  `target_container_type` (both optional, default `None`). Mutually
+  exclusive with `olpn_id` in practice: when `target_container_id` is
+  provided, the payload sends `TargetContainerId`/`TargetContainerType`
+  and omits `OlpnId` entirely (confirmed live this is correct — no need
+  to send both). `olpn_id`'s type hint changed to `Optional[str]` since
+  callers now legitimately pass `None` for tote-destined lines.
+- `task_service._classify_pick_task()` — `TaskExecutionMode` allowlist
+  widened to include `PICK_INTO_TOTE` (now `{PICK_INTO_OLPN,
+  PICK_INTO_CART, PICK_INTO_TOTE}`). `PICK_INTO_ILPN` still
+  **deliberately excluded** — that execution mode was previously seen
+  paired with `SourceContainerTypeId: "ILPN"` (the unresolved
+  `PPK::0513` *source*-side bug), a different problem from
+  destination-tote picking; not conflated, not tested this session.
+- `task_service._normalize_pick_lines()` — each line gained
+  `plannedContainerTypeId` (raw `"OLPN"`/`"TOTE"`/`""`),
+  `isToteDestined` (boolean convenience derived from it), and
+  `targetContainerId` (the *actual* tote id once a tote line has
+  already been completed — `None`/empty before). **Confirmed live this
+  is a genuinely per-LINE signal, not derivable from
+  TaskExecutionMode/TransactionId text**: `PICK0180`, itself a real
+  `"Pick To Tote"`-transaction task, has a line whose
+  `PlannedContainerTypeId` is empty (`isToteDestined: false`) — so even
+  within tasks that share the same transaction label, don't assume
+  every line is tote-destined; always check the line's own field.
+- `task_service.complete_pick_line()` — gained `target_container_id`
+  (optional). When provided: passed through to `commit_pick_move()`
+  instead of `olpn_id`; post-commit re-verify reads the tote's own
+  status via `search_ilpn_current_location()` (not `search_olpn()`,
+  since a tote isn't an oLPN and has its own status ladder — see
+  `ILPN_STATUS_LABELS` vs `OLPN_STATUS_LABELS`) off the *real*
+  `TargetContainerId` the re-fetched `TaskDetail` shows, not just an
+  echo of what was requested. Result gains `toteId`/`toteStatus`/
+  `toteStatusLabel`, mirroring the existing `olpnId`/`olpnStatus`/
+  `olpnStatusLabel` shape; `olpnId` is blanked out in the result when a
+  tote id was used, since there's no real oLPN completion event for
+  that line. This function **trusts the caller's explicit choice**
+  (was a `target_container_id` passed or not) rather than re-deriving
+  it from the line's own `isToteDestined` — keeps it a thin pass-
+  through, consistent with its existing design.
+- `task_service.complete_pick_task()` — `line_completions` entries
+  gained an optional `targetContainerId` key, threaded straight through
+  to `complete_pick_line()` per line.
+- `api/index.py` `/api/complete_pick_line` — parses `targetContainerId`/
+  `target_container_id` from the request body, passes it through.
+  `/api/complete_pick_task` needed **no changes** — `line_completions`
+  was already passed through generically.
+
+**Confirmed end-to-end through the real service-layer functions**
+(not just raw payloads) — `PICK0540` (5 lines, all tote-destined,
+confirmed via `isToteDestined: true` from a real `resolve_search()`
+call): `complete_pick_line()` used directly for the first 2 lines (both
+into `TOTE0400001`), `complete_pick_task()` used for the remaining 3
+(2 more into `TOTE0400001`, 2 into a second tote `TOTE0400002`) — every
+result showed `success: true` with correct `toteId`/`toteStatus:
+"5000"`/`toteStatusLabel: "Allocated"` and blank `olpnId`, task
+auto-closed on the last line (`taskStatus: "8000"`). Independently
+re-verified via fresh `search_task()`/`search_ilpn_current_location()`/
+`search_container_inventory()` queries: all 5 `TaskDetail` rows show
+`Status: "8000"` with the correct `TargetContainerId` each, and both
+totes' real inventory correctly aggregated (`TOTE0400001`: 3 units of
+item `1000015`; `TOTE0400002`: 2 units).
+
+**One real, unrelated business-rule error hit and correctly
+identified, not chased further**: an early test attempt against
+`PICK0319` failed with `"Pick will drive the inventory to negative"` —
+independently confirmed via `search_location_inventory()` that the
+source location genuinely had `OnHand: 0.0` despite `Allocated: 20.0`
+for that item — a real demo-data inventory shortage at that specific
+location, not a bug in the tote-picking code. Switched to a task with
+verified real on-hand inventory (`PICK0540`, `A1AC0508`,
+`OnHand: 994.0`) for the actual test.
+
+**Not yet decided or built, explicitly deferred to a later round**:
+- The UI itself — no tote textbox, no grouping-by-tote display. The
+  user's stated plan: a `TOTE: {textbox}` shown per group, forcing the
+  user to enter the real physical tote id they used, analogous to how
+  oLPN ids already flow through today.
+- The UI redesign the user flagged wanting to test separately, for
+  when there's more than one oLPN group: repeating the blue column-
+  header row under each oLPN/tote group (`oLPN 1 xxx` / header / lines
+  / `oLPN 2 xxx` / header / lines / ...) instead of showing the header
+  once at the top of the table — not yet built, mentioned in the same
+  conversation as the tote work but explicitly a separate, not-yet-
+  started idea to test.
+- How a **hybrid cart** (see the pick-vs-pack section above) should
+  group/display a mix of oLPN-destined and tote-destined lines in one
+  task — today's `_resolve_pick_task()` still groups every line by its
+  raw `olpnId` field, which is meaningless for a tote-destined line
+  (just a stale downstream-preallocated reference). Works fine
+  backend-side (each line's own `isToteDestined`/`targetContainerId`
+  are always correct regardless of grouping), but the grouping/display
+  shape itself will need real design work once the tote UI is built.
+- Whether `PICK_INTO_ILPN` tasks (source-iLPN, not destination-tote)
+  are a separate problem worth revisiting, or related to the still-
+  unresolved `PPK::0513` full-container issue — not investigated this
+  session, deliberately kept out of scope.

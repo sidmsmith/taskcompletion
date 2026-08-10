@@ -1878,7 +1878,7 @@ def commit_pick_move(
     source_container_type: str,
     task_id: str,
     task_detail_id: str,
-    olpn_id: str,
+    olpn_id: Optional[str],
     transaction_id: str,
     quantity,
     token: str,
@@ -1886,6 +1886,8 @@ def commit_pick_move(
     location: str = None,
     exception_move: bool = False,
     reason_code_id: Optional[str] = None,
+    target_container_id: Optional[str] = None,
+    target_container_type: Optional[str] = None,
 ) -> dict:
     """CONFIRMED live — commits one Pick task-detail line. Deliberately
     the plain/minimal payload shape (not the fetch-then-enrich pattern
@@ -1907,18 +1909,45 @@ def commit_pick_move(
     optional — MAWM accepts a short pick with none supplied — but is
     sent as a top-level `ReasonCodeId` sibling field when provided, per
     the confirmed-accepted (though not confirmed-persisted) shape.
+
+    `target_container_id`/`target_container_type` — the confirmed
+    tote/iLPN-picking mechanism (2026-08-10, twelfth session — see
+    CLAUDE.md's "Picking: tote/iLPN picking" section). Mutually
+    exclusive with `olpn_id` in practice: pass `olpn_id` for an
+    oLPN-destined line (unchanged), or `target_container_id` (with
+    `target_container_type="ILPN"`) for a tote-destined line — do not
+    pass both, `olpn_id` is meaningless for a tote line (it's just a
+    pre-allocated downstream oLPN id from the *later* separate packing
+    step, not this pick). Confirmed live: MAWM accepts any caller-chosen
+    string as `TargetContainerId` and creates a brand-new, real,
+    immediately-queryable iLPN with that exact id (`Status: "5000"`,
+    Allocated) if one doesn't already exist — no pre-creation call
+    needed. Confirmed it also accepts multiple lines (even across
+    different source locations) consolidating into the *same*
+    `TargetContainerId`, and different lines on the same task going to
+    different totes. If `target_container_id` is omitted entirely,
+    MAWM auto-generates its own system container id (same numeric
+    format as an oLPN id) and still creates a real iLPN — so the API
+    itself doesn't require a caller-supplied tote id, only this app's
+    intended UX will (per explicit instruction, to record the real
+    physical tote the picker used).
     """
     token = normalize_token(token)
+    inventory_move = {
+        "SourceContainerId": source_container_id,
+        "SourceContainerType": source_container_type,
+        "TaskId": task_id,
+        "CurrentTaskDetailId": task_detail_id,
+        "TransactionId": transaction_id,
+        "CompletedQuantity": quantity,
+    }
+    if target_container_id:
+        inventory_move["TargetContainerId"] = target_container_id
+        inventory_move["TargetContainerType"] = target_container_type or "ILPN"
+    elif olpn_id:
+        inventory_move["OlpnId"] = olpn_id
     payload = {
-        "InventoryMove": {
-            "SourceContainerId": source_container_id,
-            "SourceContainerType": source_container_type,
-            "TaskId": task_id,
-            "CurrentTaskDetailId": task_detail_id,
-            "OlpnId": olpn_id,
-            "TransactionId": transaction_id,
-            "CompletedQuantity": quantity,
-        },
+        "InventoryMove": inventory_move,
         "ExceptionMove": bool(exception_move),
         "EndTargetContainer": False,
     }

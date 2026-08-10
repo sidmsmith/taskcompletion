@@ -576,14 +576,27 @@ def _resolve_cycle_count_task(
 # empty, as already documented) — reinforces why this app never
 # trusts the commit response and always independently re-verifies.
 #
-# `PICK_INTO_TOTE` deliberately NOT added here despite also being
-# LOCATION-sourced with a real per-line OlpnId (confirmed live,
-# PICK0540) — its destination container during picking is a TOTE, not
-# an oLPN, an untested and different downstream shape. Left for a
-# future decision, not silently folded in.
+# `PICK_INTO_TOTE` added 2026-08-10 (twelfth session, backend-only —
+# no UI changes yet, per explicit instruction). Picking and Packing are
+# two distinct WMS operations (see CLAUDE.md's "pick vs. pack" section)
+# — a tote-destined line is picked now, packed later by a separate,
+# not-yet-built app, into a real iLPN rather than an oLPN. Confirmed
+# live via mawm_client.commit_pick_move()'s `target_container_id`:
+# MAWM creates a brand-new, real, immediately-queryable iLPN for any
+# caller-chosen id (no pre-creation call needed), accepts multiple
+# lines consolidating into the same tote, and accepts different totes
+# on the same task. `PlannedContainerTypeId` on each TaskDetail line
+# (`"OLPN"` vs `"TOTE"`, absent on a plain non-cart task) is the
+# confirmed per-LINE signal for which path a line needs — not
+# TaskExecutionMode/TransactionId text, since a single hybrid cart task
+# can mix both kinds of line. `_normalize_pick_lines()` surfaces this
+# as `plannedContainerTypeId` per line; completion callers
+# (complete_pick_line()/complete_pick_task()) decide which mechanism
+# to use based on whether a `target_container_id` was actually passed
+# in, not by re-deriving it here.
 # ---------------------------------------------------------------------
 
-_PICK_SUPPORTED_EXECUTION_MODES = {"PICK_INTO_OLPN", "PICK_INTO_CART"}
+_PICK_SUPPORTED_EXECUTION_MODES = {"PICK_INTO_OLPN", "PICK_INTO_CART", "PICK_INTO_TOTE"}
 
 
 def _classify_pick_task(raw_task: dict) -> tuple:
@@ -595,7 +608,7 @@ def _classify_pick_task(raw_task: dict) -> tuple:
     if exec_mode not in _PICK_SUPPORTED_EXECUTION_MODES:
         return False, (
             f"execution mode {exec_mode!r} is not yet supported here "
-            f"(only direct-to-oLPN and cart picking are) — planned for later"
+            f"(only direct-to-oLPN, cart, and tote picking are) — planned for later"
         )
     for line in raw_task.get("TaskDetail") or []:
         source_type = str(_first(line, "SourceContainerTypeId") or "").strip()
@@ -629,6 +642,17 @@ def _normalize_pick_lines(raw_task: dict, items: Dict[str, dict]) -> List[dict]:
                 "uomTypeId": str(_first(line, "UomTypeId") or ""),
                 "olpnId": str(_first(line, "OlpnId") or ""),
                 "plannedSlotId": str(_first(line, "PlannedSlotId") or ""),
+                # `plannedContainerTypeId`/`isToteDestined` (2026-08-10,
+                # twelfth session) — "TOTE" vs "OLPN" (vs absent, on a
+                # plain non-cart task) is the confirmed per-line signal
+                # for which completion mechanism a line needs; see the
+                # Picking module comment above. `targetContainerId` is
+                # the *actual* container id once a tote line has
+                # already been completed (raw `TargetContainerId`,
+                # populated by MAWM after commit — None before).
+                "plannedContainerTypeId": str(_first(line, "PlannedContainerTypeId") or ""),
+                "isToteDestined": str(_first(line, "PlannedContainerTypeId") or "").upper() == "TOTE",
+                "targetContainerId": str(_first(line, "TargetContainerId") or ""),
                 "plannedQuantity": _num(planned),
                 "completedQuantity": _num(completed),
                 "status": str(_first(line, "Status") or ""),
@@ -2682,6 +2706,7 @@ def complete_pick_line(
     location: str = None,
     exception_move: bool = False,
     reason_code_id: Optional[str] = None,
+    target_container_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Commits one Pick task-detail line via commitPickMove() and
     independently re-verifies the outcome — confirmed live this session
@@ -2704,6 +2729,18 @@ def complete_pick_line(
     `exception_move` whenever the entered quantity is less than planned,
     and requires a reason-code selection before allowing the submit in
     that case; `reason_code_id` is otherwise optional.
+
+    `target_container_id` (2026-08-10, twelfth session) — the caller's
+    signal that this is a **tote-destined** line: when provided, this
+    is passed to commitPickMove() as `TargetContainerId`/
+    `TargetContainerType` instead of `olpn_id` (see
+    commit_pick_move()'s docstring — the two are mutually exclusive),
+    and the post-commit re-verify checks the tote's own status via
+    `search_ilpn_current_location()` instead of `search_olpn()`. Omit
+    for an oLPN-destined line (unchanged existing behavior). This
+    function trusts the caller's choice rather than re-deriving it from
+    the line's own `PlannedContainerTypeId` — see the Picking module
+    comment above `_classify_pick_task()`.
     """
     task_id = (task_id or "").strip()
     task_detail_id = (task_detail_id or "").strip()
@@ -2713,6 +2750,7 @@ def complete_pick_line(
         return {"success": False, "error": "Quantity is required", "taskDetailId": task_detail_id}
 
     dest = resolve_location(org, location)
+    target_container_id = (target_container_id or "").strip() or None
 
     try:
         commit_result = commit_pick_move(
@@ -2720,7 +2758,7 @@ def complete_pick_line(
             source_container_type,
             task_id,
             task_detail_id,
-            olpn_id,
+            None if target_container_id else olpn_id,
             transaction_id,
             quantity,
             token,
@@ -2728,6 +2766,8 @@ def complete_pick_line(
             location=dest,
             exception_move=exception_move,
             reason_code_id=reason_code_id,
+            target_container_id=target_container_id,
+            target_container_type="ILPN" if target_container_id else None,
         )
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"commitPickMove failed: {exc}", "taskDetailId": task_detail_id}
@@ -2764,14 +2804,34 @@ def complete_pick_line(
     # this per oLPN (see _resolve_pick_task()'s olpnStatuses), so it
     # needs a fresh read here too, the same reasoning as taskStatus
     # above. Best-effort — a lookup failure shouldn't fail the whole
-    # completion result.
+    # completion result. A tote-destined line has no real oLPN
+    # completion event at all (see the Picking module comment above),
+    # so this only runs for oLPN-destined lines.
     olpn_status = ""
-    if olpn_id:
+    if olpn_id and not target_container_id:
         try:
             olpn = search_olpn(olpn_id, token, org, location=dest)
         except Exception:  # noqa: BLE001
             olpn = None
         olpn_status = str((olpn or {}).get("Status") or "")
+
+    # Tote's own status (2026-08-10) — mirrors the oLPN lookup above,
+    # via ILPN_STATUS_LABELS/ilpn_status_description() (already used
+    # elsewhere in this app for Putaway/Cycle Count) rather than
+    # OLPN_STATUS_LABELS, since a tote is a genuinely different object
+    # type/status ladder. Reads back the *real* TargetContainerId the
+    # actual line's TaskDetail now shows (not just what was asked for)
+    # — confirmed live this session that the commit response's own
+    # echo can't be trusted, so this re-derives from the independently
+    # re-fetched `line`, the same discipline already applied above.
+    tote_id = str(line.get("TargetContainerId") or "") if target_container_id else ""
+    tote_status = ""
+    if tote_id:
+        try:
+            ilpn = search_ilpn_current_location(tote_id, token, org, location=dest)
+        except Exception:  # noqa: BLE001
+            ilpn = None
+        tote_status = str((ilpn or {}).get("Status") or "")
 
     return {
         "success": line_status == "8000",
@@ -2783,9 +2843,12 @@ def complete_pick_line(
         "error": None if line_status == "8000" else f"Line not completed (status: {line_status})",
         "taskStatus": str(task.get("Status") or "") if task else "",
         "taskStatusLabel": task_status_description(task.get("Status")) if task else "",
-        "olpnId": olpn_id,
+        "olpnId": olpn_id if not target_container_id else "",
         "olpnStatus": olpn_status,
         "olpnStatusLabel": olpn_status_description(olpn_status),
+        "toteId": tote_id,
+        "toteStatus": tote_status,
+        "toteStatusLabel": ilpn_status_description(tote_status) if tote_status else "",
     }
 
 
@@ -2803,8 +2866,10 @@ def complete_pick_task(
 
     `line_completions` is `[{"taskDetailId", "sourceContainerId",
     "sourceContainerType", "olpnId", "transactionId", "quantity",
-    "exceptionMove", "reasonCodeId"}, ...]` — the last two are optional
-    per-line, same short-pick mechanism as complete_pick_line().
+    "exceptionMove", "reasonCodeId", "targetContainerId"}, ...]` — the
+    last three are optional per-line; `targetContainerId` is the
+    tote-picking signal, same mutually-exclusive-with-olpnId mechanism
+    as complete_pick_line().
     """
     task_id = (task_id or "").strip()
     if not task_id:
@@ -2836,6 +2901,9 @@ def complete_pick_task(
                 exception_move=bool(completion.get("exceptionMove")),
                 reason_code_id=(str(completion.get("reasonCodeId")).strip() or None)
                 if completion.get("reasonCodeId")
+                else None,
+                target_container_id=(str(completion.get("targetContainerId")).strip() or None)
+                if completion.get("targetContainerId")
                 else None,
             )
         )

@@ -39,7 +39,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.17.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -351,6 +351,7 @@ def complete_pick_line_route():
     quantity = data.get("quantity")
     exception_move = bool(data.get("exceptionMove") or data.get("exception_move"))
     reason_code_id = (data.get("reasonCodeId") or data.get("reason_code_id") or "").strip() or None
+    target_container_id = (data.get("targetContainerId") or data.get("target_container_id") or "").strip() or None
     try:
         result = complete_pick_line(
             token,
@@ -365,6 +366,7 @@ def complete_pick_line_route():
             location=location,
             exception_move=exception_move,
             reason_code_id=reason_code_id,
+            target_container_id=target_container_id,
         )
         forward_usage_event(
             {
