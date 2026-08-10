@@ -2495,3 +2495,74 @@ misleading success. Not a new code path — just confirms the
 already-built error surfacing works correctly for a real exception,
 even though exceptions are still explicitly out of scope for this
 feature's happy-path v1.
+
+## Picking: short-pick exception mechanism confirmed (2026-08-10, eleventh session)
+
+**The `ExceptionMove` field — already sent on every `commitPickMove`
+call, hardcoded `false` — is the short-pick mechanism**, confirmed
+live. The user's specific concern: if the required quantity is 8 and
+the picker only picks 5, the task/oLPN must not still expect the
+remaining 3.
+
+- **Naive short pick, `ExceptionMove: false`, `CompletedQuantity`
+  less than planned** (`PICK0110`, required `10`, submitted `5`):
+  confirmed this does exactly what the user was worried about. Real
+  inventory decremented by 5 (partial, real), but
+  `TaskDetail.Status` stayed `"7000"` (In Progress), `CompletedQuantity:
+  5.0` next to unchanged `Quantity: 10.0` — the system is still
+  waiting for the remaining 5. Task also stayed open.
+- **The fix, confirmed in a single call**: same line, but
+  `ExceptionMove: true` submitted *with* the actual short quantity in
+  one call (not the naive call followed by a second closing call —
+  tried both, the single-call version is sufficient and simpler).
+  Response includes an `INFO`-level message, `PPK::0045 "End of
+  oLPN(s)"` — the same message the real mobile app's own HAR capture
+  showed at the natural end of a normal (non-short) pick, i.e. this is
+  MAWM's own "this line/oLPN is done" signal, not an error.
+  Independently verified (`PICK0206`, required `10`, submitted `5`
+  with `ExceptionMove: true`): `Task.Status: "8000"`,
+  `TaskDetail.Status: "8000"`, and — the important part —
+  **`TaskDetail.Quantity` itself was retroactively rewritten from
+  `10.0` down to `5.0`**, so nothing is left "expecting" the original
+  amount. Real on-hand decremented by exactly 5, not 10. The
+  destination oLPN closed the same way: `Status: "7200"` (Packed),
+  `OlpnDetail.InitialQuantity` also retroactively adjusted from `10.0`
+  to `5.0`, matching `PickedQuantity: 5.0` exactly.
+- **`ShortedQuantity`** (present on both `TaskDetail` and
+  `OlpnDetail`) stayed `0.0`/`null` in every test — MAWM records the
+  shortage by *retroactively resizing the requirement*, not by
+  populating a separate shortage-quantity field. Worth knowing if a
+  future reporting need wants to distinguish "this line was originally
+  smaller" from "this line was shorted" — that distinction isn't
+  preserved in these fields; only order/allocation-level records
+  further upstream would show the original ask, if anywhere.
+
+**Reason code — confirmed optional, not required.** Every short-pick
+test above succeeded with no reason code at all. Found the real reason
+code list anyway (`POST {host}/pickpack/api/pickpack/reasonCode/search`,
+`Query: ""` — a *different* endpoint from Putaway's own
+`PUTAWAY_REASON_CODE_SEARCH_URL`, confirmed via live 404 that
+`pickpack/api/pickpack/pick/reasonCode/search` — the naive guess
+mirroring Putaway's path shape — is wrong; the real one has no `pick/`
+segment). 18 real codes exist, several genuinely relevant to this
+scenario: `PickCancel` ("Cancel Pick Shortage Requirement"), `Short
+Pick and Lock`, `Short Pick and Lock Location`, `Short pick carton`,
+`Cancel` ("Cancel Shortage Requirement") — plus others clearly meant
+for different scenarios (`Damaged Item`, `Substitute LPN`, `Unpick`,
+etc.), not investigated further. Tested passing `"ReasonCodeId":
+"PickCancel"` as a top-level sibling field (alongside `InventoryMove`/
+`ExceptionMove`/`EndTargetContainer`) — accepted without error,
+identical closing behavior — but the completed `TaskDetail`'s own
+`ReasonCodeId` field read back `None` afterward, so **it's not yet
+confirmed where (or whether) the reason code actually gets recorded**
+for later reporting; only confirmed that passing one doesn't break
+anything.
+
+**Not yet decided or built**: whether/how to wire this into the UI —
+options include auto-detecting a short entry (`quantity <
+plannedQuantity`) and silently setting `ExceptionMove: true`, or
+requiring an explicit user action (a "Short Pick" button/checkbox,
+optionally with a reason-code dropdown from the confirmed list above)
+before allowing a short quantity to submit at all. Flagged for
+explicit discussion before implementing, per this app's own established
+practice of confirming the UX shape before writing it.

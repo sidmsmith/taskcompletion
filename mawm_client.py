@@ -350,6 +350,26 @@ ILPN_STATUS_LABELS = {
     "11000": "Canceled",
 }
 
+# mawm_api_library/_conventions/statuses.json, domain "olpn_status" —
+# a DIFFERENT status ladder from ILPN_STATUS_LABELS above (oLPN and
+# iLPN are different object types with their own domains, same as
+# Task vs iLPN — do not merge). Confirmed live 2026-08-10: a fresh
+# Pick task's oLPN reads "1000" before any line is picked, "7200"
+# once every line on it is — matches "Created"/"Packed" here exactly.
+OLPN_STATUS_LABELS = {
+    "0000": "Initiated",
+    "1000": "Created",
+    "6800": "Picking",
+    "7000": "Picked",
+    "7100": "Packing",
+    "7200": "Packed",
+    "7600": "Manifested",
+    "7800": "Loaded",
+    "7900": "Pending Ship Confirm",
+    "8000": "Shipped",
+    "9000": "Cancelled",
+}
+
 USERNAME_BASE = os.getenv("MANHATTAN_USERNAME_BASE", "sdtadmin@")
 CLIENT_ID = os.getenv("MANHATTAN_CLIENT_ID", "omnicomponent.1.0.0")
 REQUEST_TIMEOUT = 60
@@ -490,6 +510,14 @@ def ilpn_status_description(status_id) -> str:
         return ""
     key = str(status_id).strip()
     return ILPN_STATUS_LABELS.get(key) or key
+
+
+def olpn_status_description(status_id) -> str:
+    """Human oLPN status, e.g. 'Packed'. See OLPN_STATUS_LABELS."""
+    if status_id in (None, ""):
+        return ""
+    key = str(status_id).strip()
+    return OLPN_STATUS_LABELS.get(key) or key
 
 
 def _response_data_list(body) -> List[dict]:

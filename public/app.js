@@ -2121,12 +2121,12 @@
    * statusBadgeHtml(null, status) shows the raw code in a badge rather
    * than guessing at a translation.
    */
-  function pickOlpnHeaderRowHtml(olpnId, status) {
+  function pickOlpnHeaderRowHtml(olpnId, status, statusLabel) {
     return `
         <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(olpnId)}">
           <td colspan="8">
             <strong>oLPN</strong> ${escapeHtml(olpnId)}
-            <span class="pick-olpn-status">${status ? statusBadgeHtml(null, status) : ""}</span>
+            <span class="pick-olpn-status">${status ? statusBadgeHtml(statusLabel, status) : ""}</span>
           </td>
         </tr>`;
   }
@@ -2134,22 +2134,23 @@
   /**
    * Refreshes one oLPN's status badge in place after a completion
    * (2026-08-10) — confirmed live an oLPN's own status can change the
-   * moment a line commits (e.g. "1000" -> "7200"), same reasoning as
+   * moment a line commits (e.g. "1000" -> "7200", i.e. "Created" ->
+   * "Packed" — see mawm_client.OLPN_STATUS_LABELS), same reasoning as
    * the task-status live-update fix earlier this session. Updates both
    * the DOM (no full re-render needed) and state.groups so a later
    * reload/re-render still has the right value.
    */
-  function updatePickOlpnStatus(olpnId, status) {
+  function updatePickOlpnStatus(olpnId, status, statusLabel) {
     if (!olpnId) return;
     state.groups.forEach((g) => {
       if (g.olpnStatuses && g.olpnStatuses[olpnId] !== undefined) {
-        g.olpnStatuses[olpnId] = { status };
+        g.olpnStatuses[olpnId] = { status, statusLabel };
       }
     });
     const header = el.pickLinesBody.querySelector(
       'tr.pick-olpn-header[data-olpn-id="' + CSS.escape(String(olpnId)) + '"] .pick-olpn-status'
     );
-    if (header) header.innerHTML = status ? statusBadgeHtml(null, status) : "";
+    if (header) header.innerHTML = status ? statusBadgeHtml(statusLabel, status) : "";
   }
 
   function renderPickTaskMeta() {
@@ -2198,9 +2199,8 @@
       .map((olpnId) => {
         const groupLines = byOlpn.get(olpnId);
         const owningGroup = state.groups.find((g) => g.taskId === groupLines[0].groupTaskId);
-        const status =
-          owningGroup && owningGroup.olpnStatuses ? (owningGroup.olpnStatuses[olpnId] || {}).status : "";
-        const header = olpnId ? pickOlpnHeaderRowHtml(olpnId, status) : "";
+        const olpnInfo = owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[olpnId] || {} : {};
+        const header = olpnId ? pickOlpnHeaderRowHtml(olpnId, olpnInfo.status, olpnInfo.statusLabel) : "";
         return header + groupLines.map((line) => pickLineRowHtml(line)).join("");
       })
       .join("");
@@ -2309,7 +2309,7 @@
         });
         renderPickTaskMeta();
       }
-      if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus);
+      if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus, result.olpnStatusLabel);
       updatePickLineActionButtons();
     } catch (e) {
       setPickResultCell(line.taskDetailId, e.message || String(e), "error", false);
@@ -2382,7 +2382,7 @@
         });
         (response.results || []).forEach((r) => {
           setPickResultCell(r.taskDetailId, pickResultText(r), pickResultKind(r), r.success);
-          if (r.olpnId) updatePickOlpnStatus(r.olpnId, r.olpnStatus);
+          if (r.olpnId) updatePickOlpnStatus(r.olpnId, r.olpnStatus, r.olpnStatusLabel);
           if (r.success) succeeded++;
           else failures.push("Line " + r.taskDetailId + ": " + (r.error || "failed"));
         });

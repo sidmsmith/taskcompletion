@@ -76,6 +76,7 @@ from mawm_client import (
     fetch_putaway_move,
     ilpn_status_description,
     initiate_count,
+    olpn_status_description,
     persist_count_details,
     refresh_ilpn_read_timestamp,
     resolve_location,
@@ -640,16 +641,18 @@ def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest:
     # PICK_INTO_CART thing), so the frontend groups lines by oLPN and
     # shows each one's own status — fetched here, one search_olpn()
     # call per distinct oLPN (typically 1-4 per task, so looping is
-    # fine). No confirmed status-code label mapping exists for oLPNs
-    # yet (unlike Task/iLPN, which both have one) — raw code only,
-    # rather than guessing at a translation.
+    # fine). Status label comes from OLPN_STATUS_LABELS
+    # (mawm_api_library/_conventions/statuses.json's "olpn_status"
+    # domain, confirmed live 2026-08-10 — "1000"/"7200" read back as
+    # "Created"/"Packed" exactly as the reference library says).
     olpn_statuses: Dict[str, Dict[str, Any]] = {}
     for olpn_id in olpn_ids:
         try:
             olpn = search_olpn(olpn_id, token, org, location=dest)
         except Exception:  # noqa: BLE001
             olpn = None
-        olpn_statuses[olpn_id] = {"status": str((olpn or {}).get("Status") or "")}
+        status = str((olpn or {}).get("Status") or "")
+        olpn_statuses[olpn_id] = {"status": status, "statusLabel": olpn_status_description(status)}
 
     return {
         "success": True,
@@ -2704,6 +2707,7 @@ def complete_pick_line(
         "taskStatusLabel": task_status_description(task.get("Status")) if task else "",
         "olpnId": olpn_id,
         "olpnStatus": olpn_status,
+        "olpnStatusLabel": olpn_status_description(olpn_status),
     }
 
 
