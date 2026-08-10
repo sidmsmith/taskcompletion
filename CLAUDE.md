@@ -2742,13 +2742,16 @@ shot, task auto-closed (`Status: "8000"`), both oLPNs closed
 `search_task()`/`search_olpn()` query, not just the UI's own success
 message.
 
-**Also noticed, not chased further**: SS-DEMO's task data appears to
-reset periodically — `PICK0094` and `PICK0100`, both fully completed
-earlier this same session, came back with their original
-untouched quantities on a later re-query. Convenient for testing
-(never permanently runs out of fresh tasks), but means task state
-observed in this file may not persist indefinitely in the live
-environment.
+**Correction**: `PICK0094` and `PICK0100`, both fully completed
+earlier this same session, came back with their original untouched
+quantities on a later re-query. Not an automatic/periodic reset —
+per the user, SS-DEMO is a personal demo environment they can
+manually refresh themselves; a refresh takes about 35 minutes and
+isn't run automatically. Convenient for testing (never permanently
+runs out of fresh tasks once the user runs one), but means task state
+observed in this file may not persist indefinitely, and any given
+task/oLPN id referenced here could be gone or reset after the user's
+next manual refresh.
 
 ## Picking: pick vs. pack, hybrid carts, and totes/iLPNs (2026-08-10, twelfth session)
 
