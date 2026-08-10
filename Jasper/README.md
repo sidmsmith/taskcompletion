@@ -118,13 +118,41 @@ must use the `jsonql` variant. The `<property>` element goes as the
 `<fieldDescription>` (confirmed against JasperReports' own bundled
 classic `jasperreport.xsd`).
 
-The `.*`-suffix question from the original research (whether `Locations`
-needs to become `Locations.*` to iterate array elements as separate
-records) was never actually confirmed as the cause of the blank-data
-symptom — the field-mapping properties above are the diagnosed fix, and
-have not yet been re-tested against the WMS as of this writing. If a
-future upload with these field mappings in place *still* comes back
-blank or shows only one row, the `.*` suffix is the next thing to try.
+**Update — the `.*` suffix question is now resolved, and it does matter.**
+After the field-mapping fix, the QR removal, and the `Locations`→`Data`/
+`OnHandQty`→`OnHandSum` payload-shape fixes (see later sections), the
+report finally deployed and rendered a PDF — but kept excluding data.
+The root cause was exactly the `.*` question flagged above: **both**
+`<queryString language="jsonql">Data</queryString>` **and**
+`subDataSource("Items")` needed the suffix — `Data.*` and `Items.*`.
+
+Glean's own diagnosis at this point only proposed fixing the root query
+(`Data` → `Data.*`) and explicitly said to leave `subDataSource("Items")`
+unchanged. **That second half was checked against `JsonQLDataSource`'s
+actual source before applying anything** (fetched directly from
+`TIBCOSoftware/jasperreports` on GitHub) — `subDataSource(String)`
+constructs a new `JsonQLDataSource` using the exact same
+`jsonQLExecuter.selectNodes(root, selectExpression)` call, with
+`next()`/`recordCount()` just iterating whatever list that returns, as
+the root query. There's no special-casing between the two — a
+`subDataSource()` call is mechanically just another JsonQL query,
+evaluated with the current location object as its root instead of the
+whole document. If `Data` needs `.*` to iterate, `Items` needs it for
+the identical mechanical reason. Both were changed together:
+
+- `<queryString language="jsonql"><![CDATA[Data.*]]></queryString>`
+- `subDataSource("Items.*")`
+
+**General rule for any future JsonQL query in this file (or a new
+report)**: a bare field name referring to an array (`Foo`) selects the
+array itself as a single node. Appending `.*` (`Foo.*`) expands it into
+one node per element — required whenever the intent is "one report
+record per array element," which is true for essentially every
+list/subreport binding in a report like this one. Apply it consistently
+to *every* JsonQL selectExpression that targets an array, not just
+whichever one the visible symptom happens to point at first — this
+whole detour happened because the two array-selecting expressions in
+this file were fixed one upload at a time instead of both at once.
 
 Since Studio 7.0.6 doesn't have `JsonQLDataSource` at all (JsonQL support
 was restructured again in the 7.x line), none of this can be verified
@@ -400,8 +428,9 @@ Jaspersoft Studio's classes reachable. Outside Studio, it always returns
    bug this section documents. If you add a *new* subreport/list table
    (not just editing this one), its `dataSourceExpression`/
    `subDataSource()` call needs the same JsonQL treatment — see "JsonQL
-   vs plain JSON" above, including the
-   unresolved `.*` question.
+   vs plain JSON" above, **including appending `.*` to any
+   selectExpression that targets an array** (both the root `queryString`
+   and every `subDataSource()` call need it — confirmed, not optional).
 4. Re-upload `cyclecountsheet.jrxml` to the WMS and treat whatever error
    (if any) comes back as authoritative — that engine's exact version
    and available modules aren't fully known, so each new upload attempt
