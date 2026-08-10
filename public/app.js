@@ -2209,16 +2209,86 @@
     return /^slot\b/i.test(slotId) ? slotId : `Slot ${slotId}`;
   }
 
-  function pickOlpnHeaderRowHtml(olpnId, status, statusLabel, slotId, containerTypeId, containerSizeId) {
-    const typeSize = [containerTypeId, containerSizeId].filter(Boolean).join(" / ");
-    const slotLabel = pickOlpnSlotLabel(slotId);
+  /**
+   * The grouping key for a line (2026-08-10, thirteenth session — tote-
+   * picking UI). An oLPN-destined line groups by its real, already-
+   * known `olpnId` (unchanged). A tote-destined line has no known
+   * container id yet — nothing to group by until the picker types one
+   * in — so it groups by its cart slot when one exists (every line
+   * sharing a slot is physically the same tote, confirmed live for
+   * oLPN slots this session, assumed to hold the same way for tote
+   * slots), or falls back to a group of exactly one line (keyed by its
+   * own taskDetailId) when there's no slot at all — a plain non-cart
+   * "Pick To Tote" task line has nothing else stable to group on.
+   */
+  function pickGroupKey(line) {
+    if (line.isToteDestined) {
+      return line.plannedSlotId ? "slot:" + line.plannedSlotId : "line:" + line.taskDetailId;
+    }
+    return line.olpnId || "";
+  }
+
+  function getPickGroupToteInput(groupKey) {
+    return el.pickLinesBody.querySelector(
+      '.tote-id-input[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
+    );
+  }
+
+  /**
+   * A repeated column-header row rendered once per group (2026-08-10,
+   * per explicit instruction to test this layout instead of one fixed
+   * header at the top of the table) — same 9 columns as
+   * #pickLinesTable's own (now-hidden, see .pick-repeats-headers)
+   * <thead>, kept in sync by hand since there's no single source of
+   * truth for both.
+   */
+  function pickColumnHeaderRowHtml() {
     return `
-        <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(olpnId)}">
+        <tr class="pick-column-header">
+          <td class="col-line">Line</td>
+          <td class="col-loc">Source Location</td>
+          <td class="col-item">Item</td>
+          <td class="col-desc-narrow">Description</td>
+          <td class="col-qty-wide">Planned Qty</td>
+          <td class="col-uom"></td>
+          <td class="col-qty-wide">Completed Qty</td>
+          <td class="col-reason">Reason Code</td>
+          <td class="col-reason">Status</td>
+        </tr>`;
+  }
+
+  /**
+   * One group's header row — either an oLPN (id, Type/Size, Slot,
+   * status badge — unchanged from before) or a TOTE (a required
+   * textbox instead of an id, since the real container doesn't exist
+   * until the picker enters one; see isPickToteValid()). `info` comes
+   * from renderPickGroups()'s own groupInfoFor().
+   */
+  function pickGroupHeaderRowHtml(groupKey, info) {
+    const slotLabel = pickOlpnSlotLabel(info.slotId);
+    if (info.kind === "tote") {
+      return `
+        <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="9">
-            <strong>oLPN</strong> ${escapeHtml(olpnId)}
+            <strong>TOTE</strong>
+            <input
+              type="text"
+              class="form-control tote-id-input invalid"
+              data-group-key="${escapeAttr(groupKey)}"
+              placeholder="Enter tote id"
+            />
+            ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
+          </td>
+        </tr>`;
+    }
+    const typeSize = [info.containerTypeId, info.containerSizeId].filter(Boolean).join(" / ");
+    return `
+        <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(info.containerId)}" data-group-key="${escapeAttr(groupKey)}">
+          <td colspan="9">
+            <strong>oLPN</strong> ${escapeHtml(info.containerId)}
             ${typeSize ? `<span class="pick-olpn-type-size">${escapeHtml(typeSize)}</span>` : ""}
             ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
-            <span class="pick-olpn-status">${status ? statusBadgeHtml(statusLabel, status) : ""}</span>
+            <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
         </tr>`;
   }
@@ -2250,6 +2320,35 @@
     if (header) header.innerHTML = status ? statusBadgeHtml(statusLabel, status) : "";
   }
 
+  /**
+   * Mirrors updatePickOlpnStatus() for a tote group (2026-08-10) — once
+   * a tote-destined line actually commits, the real iLPN now exists
+   * (see mawm_client.commit_pick_move()'s docstring), so the textbox
+   * gets locked to whatever value just succeeded (further edits to a
+   * container that's already real would be misleading) and a status
+   * badge appears next to it, same visual language as an oLPN group.
+   */
+  function updatePickToteStatus(groupKey, toteId, status, statusLabel) {
+    if (!groupKey) return;
+    const header = el.pickLinesBody.querySelector(
+      'tr.pick-tote-header[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
+    );
+    if (!header) return;
+    const input = header.querySelector(".tote-id-input");
+    if (input) {
+      input.value = toteId || input.value;
+      input.disabled = true;
+      input.classList.remove("invalid");
+    }
+    let badge = header.querySelector(".pick-olpn-status");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "pick-olpn-status";
+      header.querySelector("td").appendChild(badge);
+    }
+    badge.innerHTML = status ? statusBadgeHtml(statusLabel, status) : "";
+  }
+
   function renderPickTaskMeta() {
     const groups = state.groups;
     if (groups.length === 1) {
@@ -2267,21 +2366,25 @@
   }
 
   /**
-   * Grouped by oLPN, not one flat line list (2026-08-10, per explicit
-   * instruction) — each distinct oLPN gets its own header row (id +
-   * status) followed by just its own lines, so a multi-oLPN task (or a
-   * pick-cart task with many more) reads as separate sections rather
-   * than one undifferentiated table. Line ordering within each oLPN
-   * follows the order lines already came back in (task-detail
-   * sequence), not re-sorted.
+   * Grouped by container (oLPN or, since 2026-08-10, tote — see
+   * pickGroupKey()), not one flat line list — each group gets its own
+   * header row followed by its own repeated column-header row (see
+   * pickColumnHeaderRowHtml() — per explicit instruction to test this
+   * layout instead of one fixed header at the top) and just its own
+   * lines, so a multi-oLPN/multi-tote task reads as separate sections.
+   * Line ordering *within* a group follows the order lines already
+   * came back in (task-detail sequence), not re-sorted.
    *
-   * Group ORDER (2026-08-10, twelfth session, cart-picking support):
-   * if any oLPN in this result carries a `slotId`, every group is
-   * sorted by slot number instead of first-appearance order — per
-   * explicit instruction, this check is purely data-driven (does a
-   * slot value actually exist), not based on TaskExecutionMode or
-   * TransactionId text. A task with no slots at all keeps the
-   * original first-appearance order, unchanged.
+   * Group ORDER (2026-08-10, thirteenth session, per explicit
+   * instruction: "group and sort by slot and then by olpn/tote") —
+   * groups sort by slot number first (when present; extracted from the
+   * slot text, not a bare Number() — see slotSortKey()), then by the
+   * group's own label (its oLPN id, or its group key for a tote group
+   * with no real id yet) as a stable secondary/tie-break — this always
+   * runs now, not just for slotted tasks, so even a plain multi-oLPN
+   * task with no slots gets a deterministic (alphabetical) order
+   * instead of first-appearance order. This is an intentional behavior
+   * change from the cart-only sort built earlier this session.
    */
   function renderPickGroups() {
     state.selectedTaskDetailId = null;
@@ -2290,21 +2393,27 @@
     el.pickLinesTable.style.display = "";
     renderPickTaskMeta();
 
-    const olpnKeys = [];
-    const byOlpn = new Map();
+    const groupKeys = [];
+    const byGroup = new Map();
     allLines().forEach((line) => {
-      const key = line.olpnId || "";
-      if (!byOlpn.has(key)) {
-        byOlpn.set(key, []);
-        olpnKeys.push(key);
+      const key = pickGroupKey(line);
+      if (!byGroup.has(key)) {
+        byGroup.set(key, []);
+        groupKeys.push(key);
       }
-      byOlpn.get(key).push(line);
+      byGroup.get(key).push(line);
     });
 
-    const olpnInfoFor = (olpnId) => {
-      const groupLines = byOlpn.get(olpnId);
-      const owningGroup = state.groups.find((g) => g.taskId === groupLines[0].groupTaskId);
-      return owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[olpnId] || {} : {};
+    const groupInfoFor = (key) => {
+      const groupLines = byGroup.get(key);
+      const firstLine = groupLines[0];
+      if (firstLine.isToteDestined) {
+        return { kind: "tote", containerId: "", slotId: firstLine.plannedSlotId };
+      }
+      const owningGroup = state.groups.find((g) => g.taskId === firstLine.groupTaskId);
+      const olpnInfo =
+        owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[firstLine.olpnId] || {} : {};
+      return { kind: "olpn", containerId: firstLine.olpnId, ...olpnInfo };
     };
 
     // slotId's own text isn't always a bare number (see
@@ -2315,31 +2424,33 @@
       const match = String(slotId || "").match(/\d+/);
       return match ? Number(match[0]) : NaN;
     };
-    const isSlotTask = olpnKeys.some((olpnId) => olpnId && olpnInfoFor(olpnId).slotId);
-    if (isSlotTask) {
-      olpnKeys.sort((a, b) => {
-        const slotA = slotSortKey(olpnInfoFor(a).slotId);
-        const slotB = slotSortKey(olpnInfoFor(b).slotId);
-        if (Number.isFinite(slotA) && Number.isFinite(slotB)) return slotA - slotB;
-        return Number.isFinite(slotA) ? -1 : Number.isFinite(slotB) ? 1 : 0;
-      });
-    }
+    // A group with no real container id yet — an ungrouped tote line
+    // with no slot, keyed synthetically by its own taskDetailId (see
+    // pickGroupKey()) — has nothing meaningful to sort by; comparing
+    // "" to "" ties (localeCompare returns 0), so Array.sort's
+    // stability keeps these in their original line order instead of
+    // an arbitrary UUID-ish ordering the synthetic key itself would
+    // otherwise produce.
+    const groupLabel = (key, info) => info.containerId || "";
 
-    el.pickLinesBody.innerHTML = olpnKeys
-      .map((olpnId) => {
-        const groupLines = byOlpn.get(olpnId);
-        const olpnInfo = olpnInfoFor(olpnId);
-        const header = olpnId
-          ? pickOlpnHeaderRowHtml(
-              olpnId,
-              olpnInfo.status,
-              olpnInfo.statusLabel,
-              olpnInfo.slotId,
-              olpnInfo.containerTypeId,
-              olpnInfo.containerSizeId
-            )
-          : "";
-        return header + groupLines.map((line) => pickLineRowHtml(line)).join("");
+    groupKeys.sort((a, b) => {
+      const infoA = groupInfoFor(a);
+      const infoB = groupInfoFor(b);
+      const slotA = slotSortKey(infoA.slotId);
+      const slotB = slotSortKey(infoB.slotId);
+      const aHasSlot = Number.isFinite(slotA);
+      const bHasSlot = Number.isFinite(slotB);
+      if (aHasSlot && bHasSlot && slotA !== slotB) return slotA - slotB;
+      if (aHasSlot !== bHasSlot) return aHasSlot ? -1 : 1;
+      return groupLabel(a, infoA).localeCompare(groupLabel(b, infoB));
+    });
+
+    el.pickLinesBody.innerHTML = groupKeys
+      .map((key) => {
+        const groupLines = byGroup.get(key);
+        const info = groupInfoFor(key);
+        const header = key ? pickGroupHeaderRowHtml(key, info) : "";
+        return header + pickColumnHeaderRowHtml() + groupLines.map((line) => pickLineRowHtml(line)).join("");
       })
       .join("");
     updatePickLineActionButtons();
@@ -2388,6 +2499,16 @@
     return !!(select && select.value);
   }
 
+  /** A tote-destined line requires its group's TOTE textbox to be
+   * filled in before it can complete (2026-08-10) — an oLPN-destined
+   * line always passes, since its container id is already known. */
+  function isPickToteValid(taskDetailId) {
+    const line = getLineByTaskDetailId(taskDetailId);
+    if (!line || !line.isToteDestined) return true;
+    const input = getPickGroupToteInput(pickGroupKey(line));
+    return !!(input && input.value.trim());
+  }
+
   function selectPickLine(taskDetailId) {
     state.selectedTaskDetailId = taskDetailId;
     el.pickLinesBody.querySelectorAll("tr.pick-line-row").forEach((row) => {
@@ -2405,12 +2526,18 @@
     const hasSelection = !!line;
     const selectedDone = hasSelection && isPickLineDone(line.taskDetailId);
     const selectedValid =
-      hasSelection && !selectedDone && isPickQtyValid(line.taskDetailId) && isPickReasonValid(line.taskDetailId);
+      hasSelection &&
+      !selectedDone &&
+      isPickQtyValid(line.taskDetailId) &&
+      isPickReasonValid(line.taskDetailId) &&
+      isPickToteValid(line.taskDetailId);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
     const outstanding = outstandingPickLines();
     el.allLinesBtn.disabled =
       !outstanding.length ||
-      !outstanding.every((l) => isPickQtyValid(l.taskDetailId) && isPickReasonValid(l.taskDetailId));
+      !outstanding.every(
+        (l) => isPickQtyValid(l.taskDetailId) && isPickReasonValid(l.taskDetailId) && isPickToteValid(l.taskDetailId)
+      );
   }
 
   function setPickResultCell(taskDetailId, message, kind, done) {
@@ -2448,6 +2575,7 @@
     const quantity = qtyInput ? Number(qtyInput.value) : null;
     const short = isPickShort(line.taskDetailId);
     const reasonSelect = short ? getPickReasonSelect(line.taskDetailId) : null;
+    const toteInput = line.isToteDestined ? getPickGroupToteInput(pickGroupKey(line)) : null;
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
       const result = await api("complete_pick_line", {
@@ -2463,6 +2591,7 @@
         quantity,
         exceptionMove: short,
         reasonCodeId: reasonSelect ? reasonSelect.value : null,
+        targetContainerId: toteInput ? toteInput.value.trim() : null,
       });
       setPickResultCell(line.taskDetailId, pickResultText(result), pickResultKind(result), result.success);
       setActionStatus(
@@ -2479,6 +2608,7 @@
         renderPickTaskMeta();
       }
       if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus, result.olpnStatusLabel);
+      if (result.toteId) updatePickToteStatus(pickGroupKey(line), result.toteId, result.toteStatus, result.toteStatusLabel);
       updatePickLineActionButtons();
     } catch (e) {
       setPickResultCell(line.taskDetailId, e.message || String(e), "error", false);
@@ -2502,6 +2632,10 @@
     }
     if (!allPickLinesPending.every((l) => isPickReasonValid(l.taskDetailId))) {
       setActionStatus("Choose a Reason Code for every short-picked line before completing all.", "error");
+      return;
+    }
+    if (!allPickLinesPending.every((l) => isPickToteValid(l.taskDetailId))) {
+      setActionStatus("Enter a Tote Id for every tote-destined line before completing all.", "error");
       return;
     }
     el.allLinesList.innerHTML = allPickLinesPending
@@ -2538,6 +2672,7 @@
         const qtyInput = getPickQtyInput(l.taskDetailId);
         const short = isPickShort(l.taskDetailId);
         const reasonSelect = short ? getPickReasonSelect(l.taskDetailId) : null;
+        const toteInput = l.isToteDestined ? getPickGroupToteInput(pickGroupKey(l)) : null;
         return {
           taskDetailId: l.taskDetailId,
           sourceContainerId: l.sourceContainerId,
@@ -2547,6 +2682,7 @@
           quantity: qtyInput ? Number(qtyInput.value) : null,
           exceptionMove: short,
           reasonCodeId: reasonSelect ? reasonSelect.value : null,
+          targetContainerId: toteInput ? toteInput.value.trim() : null,
         };
       });
       try {
@@ -2560,6 +2696,10 @@
         (response.results || []).forEach((r) => {
           setPickResultCell(r.taskDetailId, pickResultText(r), pickResultKind(r), r.success);
           if (r.olpnId) updatePickOlpnStatus(r.olpnId, r.olpnStatus, r.olpnStatusLabel);
+          if (r.toteId) {
+            const rLine = getLineByTaskDetailId(r.taskDetailId);
+            if (rLine) updatePickToteStatus(pickGroupKey(rLine), r.toteId, r.toteStatus, r.toteStatusLabel);
+          }
           if (r.success) succeeded++;
           else failures.push("Line " + r.taskDetailId + ": " + (r.error || "failed"));
         });
@@ -2591,13 +2731,20 @@
   });
   el.pickLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".pick-qty-input");
-    if (!qtyInput) return;
-    const value = Number(qtyInput.value);
-    const planned = Number(qtyInput.dataset.defaultQty);
-    const short = Number.isFinite(value) && Number.isFinite(planned) && value < planned;
-    qtyInput.classList.toggle("overridden", short);
-    toggleReasonSelect(qtyInput, short);
-    updatePickLineActionButtons();
+    if (qtyInput) {
+      const value = Number(qtyInput.value);
+      const planned = Number(qtyInput.dataset.defaultQty);
+      const short = Number.isFinite(value) && Number.isFinite(planned) && value < planned;
+      qtyInput.classList.toggle("overridden", short);
+      toggleReasonSelect(qtyInput, short);
+      updatePickLineActionButtons();
+      return;
+    }
+    const toteInput = e.target.closest(".tote-id-input");
+    if (toteInput) {
+      toteInput.classList.toggle("invalid", !toteInput.value.trim());
+      updatePickLineActionButtons();
+    }
   });
   el.pickLinesBody.addEventListener("change", (e) => {
     const select = e.target.closest(".reason-code-select");

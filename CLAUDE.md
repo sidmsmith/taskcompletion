@@ -3031,3 +3031,95 @@ verified real on-hand inventory (`PICK0540`, `A1AC0508`,
   are a separate problem worth revisiting, or related to the still-
   unresolved `PPK::0513` full-container issue — not investigated this
   session, deliberately kept out of scope.
+
+## Picking: tote UI + repeated-header layout — built and confirmed live (2026-08-10, thirteenth session)
+
+**Both UI changes the user flagged wanting to test, built together**:
+repeating the blue column-header row under each group instead of one
+fixed header at the top of the table, and a required `TOTE:
+{textbox}` per tote group. Per explicit instruction: **group and sort
+by slot first, then by oLPN/tote**.
+
+**Grouping key** (`pickGroupKey()`, `app.js`): an oLPN-destined line
+groups by its real, already-known `olpnId` (unchanged). A tote-
+destined line has no known container id until the picker types one
+in, so it groups by its cart slot when one exists (confirmed live this
+session that every line sharing a slot is physically the same
+container) — or, for a plain non-cart "Pick To Tote" line with no
+slot at all, falls back to a group of exactly one line, keyed by its
+own `taskDetailId`.
+
+**Sort order** (`renderPickGroups()`): primary key is slot number
+(reused `slotSortKey()`'s digit-extraction from the cart-picking work,
+since slot text formats still vary — `"2"`/`"Slot 1"`/`"slot1"`);
+secondary/tie-break key is the group's own label — its real oLPN id
+for an oLPN group, or empty string for a tote group with no assigned
+id yet (`groupLabel()` returns `""`, not the synthetic key, so
+`Array.sort`'s stability keeps synthetic single-line tote groups in
+their original line order rather than an arbitrary UUID-based one —
+found and fixed live, see below). **This sort now always runs**, not
+just for slotted/cart tasks as built in the twelfth session — a plain
+multi-oLPN task with no slots at all now sorts alphabetically by oLPN
+id instead of first-appearance order, an intentional behavior change
+per this session's explicit instruction.
+
+**Rendering**: `pickGroupHeaderRowHtml()` replaces the old
+`pickOlpnHeaderRowHtml()` — branches on `info.kind` (`"olpn"`:
+unchanged id/Type-Size/Slot/status badge; `"tote"`: `TOTE:` +
+`<input class="tote-id-input">`, red/invalid until filled in, +
+Slot when the group has one). `pickColumnHeaderRowHtml()` is new —
+the same 9 columns as `#pickLinesTable`'s own `<thead>`, now rendered
+once per group in `<tbody>` instead; the real `<thead>` is hidden via
+a new `.pick-repeats-headers` class on the table (plain `<td>`s in the
+repeated row, not `<th>`s, since several `position: sticky; top: 0`
+headers would stack/overlap instead of behaving sensibly).
+
+**Tote validation and completion**: `isPickToteValid()` requires a
+non-empty value in the group's tote input before Complete Line/
+Complete All will submit any line in that group (same gating pattern
+as the reason-code requirement). `completePickLineAction()`/
+`confirmAllPickLines()` read the group's tote input value and send it
+as `targetContainerId`. Once any line in a tote group actually
+commits, `updatePickToteStatus()` locks that group's textbox
+(`disabled = true`, keeps the committed value) and shows a real status
+badge (`toteStatus`/`toteStatusLabel` from the backend, e.g.
+"Allocated") next to it — mirrors `updatePickOlpnStatus()`'s existing
+live-update pattern.
+
+**Confirmed end-to-end through the real browser UI**, three cases:
+- **A genuine hybrid cart** (`PICK0391`, `TransactionId: "Hybrid Pick
+  Cart"` — confirmed live this is a real MAWM transaction label, not
+  just a cart-plan name): 4 lines across 3 slots — slot 1 (1 tote
+  line), slot 2 (2 tote lines, different stale/irrelevant `OlpnId`
+  values each — confirmed grouped together correctly anyway, since
+  grouping keys off slot, not that field), slot 3 (1 oLPN line).
+  Rendered correctly sorted 1/2/3, both buttons correctly disabled
+  until both tote textboxes were filled in. Completed via "Complete
+  All": all 4 lines closed, task auto-closed, both totes correctly
+  assigned to the right lines (independently re-verified —
+  `TOTE0500001` → slot 1's line, `TOTE0500002` → both of slot 2's
+  lines), oLPN correctly reached `"7200"` (Packed).
+- **A plain non-cart "Pick To Tote" task, no slots** (`PICK0543`, 2
+  lines): each line rendered as its own one-line tote group, as
+  designed. First render exposed the sort-order bug described above
+  (fixed, then re-verified: correct natural line order). Both lines
+  given the *same* tote id (`TOTE0600001`) to test manual
+  consolidation via the textbox — completed via "Complete All",
+  independently re-verified: both lines closed, `TargetContainerId:
+  "TOTE0600001"` on both, real inventory shows `OnHand: 2.0` (both
+  units correctly consolidated into the one real tote).
+- **A plain single-oLPN task, regression check** (`PICK0603`): renders
+  exactly as before — one oLPN header (id, Type/Size, status badge),
+  one repeated column header, no tote textbox, "Complete All"
+  correctly enabled with no tote gating. Confirms the new grouping/
+  sorting/rendering logic didn't change behavior for the
+  already-working non-tote case.
+
+**Browser automation note, not a real app bug**: after the hybrid-cart
+"Complete All" test, the confirmation modal appeared stuck open in a
+screenshot even though the underlying completion had already fully
+succeeded (independently confirmed via a fresh backend re-query
+showing all 4 lines correctly closed). Recovered with a page reload;
+not chased further — most likely an artifact of this session's
+scripted rapid-fire clicks racing Bootstrap's modal transition, not a
+functional issue with the completion logic itself.
