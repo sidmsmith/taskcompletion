@@ -2566,3 +2566,91 @@ optionally with a reason-code dropdown from the confirmed list above)
 before allowing a short quantity to submit at all. Flagged for
 explicit discussion before implementing, per this app's own established
 practice of confirming the UX shape before writing it.
+
+## Picking: 3 reason codes live-tested clean; one location-lock side effect confirmed (2026-08-10)
+
+Per explicit instruction, manually re-tested 3 of the 10 real
+`PICK_EXCEPTION` codes through a real short pick each, checking
+specifically for any unexpected WM warning or blocking prompt (not
+downstream config side effects in general — those are explicitly out
+of scope for now per the user's own instruction). All 3 came back
+clean — same benign `PPK::0045 "End of oLPN(s)"` INFO message every
+other short pick already showed, no warnings, no extra prompts:
+
+- **`Short Pick and Lock Location`** (`PICK0101`, required `10`,
+  submitted `6`) — clean completion, but has a real, confirmed side
+  effect: it set `CycleCountPending: True` on the source location
+  (`A1AC0924`). A later, unrelated test against that same
+  location/item then failed with `PPK::0522 "iLPN/Location/Inventory
+  has Condition Code [LW] and cannot be Picked"` — confirmed via retest
+  against a clean, different location that this was a cascading
+  side effect of the lock, not a flaw in whatever reason code was used
+  the second time.
+- **`PickCancel`** (`PICK0149`, required `5`, submitted `3`) — clean
+  completion, no location-lock side effect (`CycleCountPending` stayed
+  `None`).
+- **`Short pick carton`** (`PICK0161`, required `15`, submitted `9`,
+  a fresh untouched location) — clean completion, same benign INFO
+  message. (An earlier attempt on the same reason code against the
+  location `Short Pick and Lock Location` had just tainted failed with
+  `PPK::0522` — that failure belonged to the tainted location, not this
+  code; the clean retest on a fresh location confirms it.)
+
+**Reason-code dropdown UI built** (`public/index.html`/`app.js`,
+`task_service.preload_pick_reason_codes()`,
+`mawm_client.search_pick_reason_codes()`) — mirrors Putaway's existing
+`.reason-code-select`/`toggleReasonSelect()`/`isReasonValid()` pattern
+almost exactly, scoped to `el.pickLinesBody` instead of `el.linesBody`.
+Per explicit instruction, the dropdown lists **all 10** real
+`PICK_EXCEPTION` codes (not just the 3 tested so far) — a `TESTED_PICK_REASON_CODES`
+constant in `app.js` marks confirmed-clean codes with a trailing `*` in
+the option label; update that set as more codes get manually tested
+and reported back. A short pick (`Completed Qty` entered below
+`Planned Qty`) reveals the dropdown and requires a real selection
+(starts on an invalid "Select Reason Code" placeholder) before either
+Complete Line or Complete All will submit that line; a full-quantity
+pick never shows or requires it. `commit_pick_move()` now accepts
+`exception_move`/`reason_code_id` and sends `ExceptionMove: true` +
+`ReasonCodeId` accordingly; `complete_pick_line()`/`complete_pick_task()`
+and both `/api/complete_pick_*` routes thread these through.
+
+Live-tested end-to-end through the real browser UI (`PICK0100`,
+required `10`, submitted `9`, reason code `Short pick carton`) —
+completed cleanly, `Task.Status: "8000"`, `TaskDetail.Quantity`
+retroactively resized `10.0` → `9.0` matching `CompletedQuantity`, same
+as the earlier direct-API short-pick tests. Also re-confirmed the
+plain full-quantity path (`exceptionMove: false`, no reason code) still
+works unchanged after these edits.
+
+**One transient anomaly observed once, not reproduced**: during the
+first browser test (`PICK0062`), the app's own post-commit re-verify
+briefly read back the line's *old* status (`"7000"`) immediately after
+a successful `ExceptionMove: true` commit, so the UI reported "Line not
+completed" even though the pick had actually succeeded (independently
+confirmed via a follow-up query: `Status: "8000"`,
+`CompletedQuantity == Quantity`, correctly resized). Every other test
+this session — including a second full end-to-end UI run — saw the
+correct status immediately, no delay needed. Given this app already
+never trusts the commit response alone and always re-verifies (see
+`complete_pick_line()`'s docstring), the only consequence of hitting
+this again would be a false "failed" message on an actually-successful
+short pick; worth a reload/re-search to confirm before assuming a real
+failure if it's ever seen again. Not chased further — couldn't
+reproduce it after several more attempts, and it may be the same class
+of transient backend read lag as the `.token` auth flakiness noted
+below, not something specific to the exception-move path.
+
+**Unrelated but worth remembering**: while chasing what first looked
+like a live authentication problem (`.token` genuinely valid and
+unexpired by its own `exp` claim, byte-for-byte clean, yet
+intermittently rejected by MAWM with `invalid_token` / "Cannot convert
+access token to JSON"), the real cause turned out to be a bug in the
+**diagnostic script**, not the environment — an accidental
+`resolve_search(search_value, token, org, ...)` call when the real
+signature is `resolve_search(token, org, search_value, ...)`. Passing
+a 15-line JWT into the `org` header/query position obviously fails,
+and misread as token flakiness at first because a *different*,
+correctly-ordered raw call kept succeeding in between attempts. Worth
+remembering next time an "auth" failure doesn't reproduce consistently
+across two superficially similar calls — check argument order before
+assuming the server is flaky.

@@ -23,6 +23,7 @@
     selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
     adjustmentReasonCodes: null, // [{key,value}] once preloaded, see preloadAdjustmentReasonCodes()
+    pickReasonCodes: null, // [{key,value}] once preloaded, see preloadPickReasonCodes()
     // "task" (Task Id/iLPN search, the existing #linesTable) or
     // "cycle_count" (Storage location search, the separate
     // #cycleCountLinesTable — per explicit instruction, ad hoc Cycle
@@ -75,6 +76,28 @@
     } catch (e) {
       // Leave state.adjustmentReasonCodes null — reasonCodeOptionsHtml()
       // falls back to FALLBACK_REASON_CODES.
+    }
+  }
+
+  /**
+   * Every PICK_EXCEPTION reason code, not a hand-picked subset
+   * (2026-08-10, per explicit instruction) — the user is manually
+   * testing more of the 10 real codes over time and will report results
+   * back in chat, so the dropdown always shows the full list;
+   * TESTED_PICK_REASON_CODES below just marks which ones are confirmed
+   * so far. See pickReasonCodeOptionsHtml().
+   */
+  async function preloadPickReasonCodes() {
+    try {
+      const data = await api("preload_pick_reason_codes", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+      });
+      if (data.success) state.pickReasonCodes = data.entries || [];
+    } catch (e) {
+      // Leave state.pickReasonCodes null — pickReasonCodeOptionsHtml()
+      // renders just the placeholder until this resolves.
     }
   }
 
@@ -278,6 +301,7 @@
       state.facility = state.org + "-DM1";
       preloadStorageLocations(); // fire-and-forget, see its own docstring
       preloadAdjustmentReasonCodes(); // fire-and-forget, see its own docstring
+      preloadPickReasonCodes(); // fire-and-forget, see its own docstring
       el.org.value = state.org;
       el.orgSection.style.display = "none";
       el.mainUI.style.display = "block";
@@ -2086,6 +2110,44 @@
   // a clear reason at search time and never reach this rendering code.
   // ---------------------------------------------------------------------
 
+  /**
+   * Codes the user has manually re-tested through the real WM UI/API and
+   * confirmed clean — no unexpected warnings or blocking prompts (see
+   * CLAUDE.md's "Picking: short-pick exception mechanism confirmed"
+   * section for the first three and the location-tainting caveat on
+   * "Short Pick and Lock Location"). Update this set as the user reports
+   * more over time (2026-08-10, per explicit instruction) — the dropdown
+   * itself always lists all 10 real PICK_EXCEPTION codes
+   * (state.pickReasonCodes), this only controls the "*" marker.
+   */
+  const TESTED_PICK_REASON_CODES = new Set([
+    "PickCancel",
+    "Short Pick and Lock Location",
+    "Short pick carton",
+  ]);
+
+  function pickReasonCodeOptionsHtml() {
+    const codes = state.pickReasonCodes || [];
+    const options = codes
+      .map((c) => {
+        const label = c.key + (TESTED_PICK_REASON_CODES.has(c.value) ? " *" : "");
+        return `<option value="${escapeAttr(c.value)}">${escapeHtml(label)}</option>`;
+      })
+      .join("");
+    return '<option value="" selected>Select Reason Code</option>' + options;
+  }
+
+  /**
+   * A short pick (Completed Qty entered below Planned Qty) requires an
+   * explicit reason-code selection before it can submit (2026-08-10, per
+   * explicit instruction — mirrors Putaway's own reason-code-select
+   * pattern: `.reason-code-select`/`.overridden`/`toggleReasonSelect()`/
+   * the "invalid" placeholder are all reused as-is, scoped to
+   * el.pickLinesBody instead of el.linesBody). A plain full-quantity
+   * pick never shows or requires this — see the qty `input` handler
+   * below, which is the only place `.overridden`/visibility gets set for
+   * Pick rows.
+   */
   function pickLineRowHtml(line) {
     const isDone = line.status === "8000";
     const qtyValue = isDone ? line.completedQuantity : line.plannedQuantity;
@@ -2102,10 +2164,16 @@
               type="number"
               class="form-control pick-qty-input"
               data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              data-default-qty="${escapeAttr(line.plannedQuantity)}"
               value="${escapeAttr(qtyValue)}"
               step="any"
               ${isDone ? "disabled" : ""}
             />
+          </td>
+          <td class="col-reason">
+            <select class="form-select reason-code-select invalid" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+              ${pickReasonCodeOptionsHtml()}
+            </select>
           </td>
           <td class="col-reason pick-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}" data-done="${isDone}">${isDone ? "Completed" : ""}</td>
         </tr>`;
@@ -2124,7 +2192,7 @@
   function pickOlpnHeaderRowHtml(olpnId, status, statusLabel) {
     return `
         <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(olpnId)}">
-          <td colspan="8">
+          <td colspan="9">
             <strong>oLPN</strong> ${escapeHtml(olpnId)}
             <span class="pick-olpn-status">${status ? statusBadgeHtml(statusLabel, status) : ""}</span>
           </td>
@@ -2228,6 +2296,28 @@
     return !!cell && cell.dataset.done === "true";
   }
 
+  /** A short pick = entered qty strictly less than Planned Qty — see the
+   * qty `input` handler, the only place `.overridden` is set for Pick
+   * rows (unlike Putaway, an equal or larger entry never counts). */
+  function isPickShort(taskDetailId) {
+    const input = getPickQtyInput(taskDetailId);
+    return !!input && input.classList.contains("overridden");
+  }
+
+  function getPickReasonSelect(taskDetailId) {
+    return el.pickLinesBody.querySelector(
+      '.reason-code-select[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+  }
+
+  /** Only required once a line is actually short (see isPickShort()) —
+   * a full-quantity pick never needs a reason code. */
+  function isPickReasonValid(taskDetailId) {
+    if (!isPickShort(taskDetailId)) return true;
+    const select = getPickReasonSelect(taskDetailId);
+    return !!(select && select.value);
+  }
+
   function selectPickLine(taskDetailId) {
     state.selectedTaskDetailId = taskDetailId;
     el.pickLinesBody.querySelectorAll("tr.pick-line-row").forEach((row) => {
@@ -2244,10 +2334,13 @@
     const line = state.selectedTaskDetailId ? getLineByTaskDetailId(state.selectedTaskDetailId) : null;
     const hasSelection = !!line;
     const selectedDone = hasSelection && isPickLineDone(line.taskDetailId);
-    const selectedValid = hasSelection && !selectedDone && isPickQtyValid(line.taskDetailId);
+    const selectedValid =
+      hasSelection && !selectedDone && isPickQtyValid(line.taskDetailId) && isPickReasonValid(line.taskDetailId);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
     const outstanding = outstandingPickLines();
-    el.allLinesBtn.disabled = !outstanding.length || !outstanding.every((l) => isPickQtyValid(l.taskDetailId));
+    el.allLinesBtn.disabled =
+      !outstanding.length ||
+      !outstanding.every((l) => isPickQtyValid(l.taskDetailId) && isPickReasonValid(l.taskDetailId));
   }
 
   function setPickResultCell(taskDetailId, message, kind, done) {
@@ -2261,6 +2354,8 @@
     if (done) {
       const qtyInput = getPickQtyInput(taskDetailId);
       if (qtyInput) qtyInput.disabled = true;
+      const reasonSelect = getPickReasonSelect(taskDetailId);
+      if (reasonSelect) reasonSelect.disabled = true;
     }
   }
 
@@ -2281,6 +2376,8 @@
     if (isPickLineDone(line.taskDetailId)) return;
     const qtyInput = getPickQtyInput(line.taskDetailId);
     const quantity = qtyInput ? Number(qtyInput.value) : null;
+    const short = isPickShort(line.taskDetailId);
+    const reasonSelect = short ? getPickReasonSelect(line.taskDetailId) : null;
     setBusy(true, "Completing line " + line.lineNumber + "…");
     try {
       const result = await api("complete_pick_line", {
@@ -2294,6 +2391,8 @@
         olpnId: line.olpnId,
         transactionId: line.groupTaskTransactionId,
         quantity,
+        exceptionMove: short,
+        reasonCodeId: reasonSelect ? reasonSelect.value : null,
       });
       setPickResultCell(line.taskDetailId, pickResultText(result), pickResultKind(result), result.success);
       setActionStatus(
@@ -2331,6 +2430,10 @@
       setActionStatus("Enter a Completed Qty for every line before completing all.", "error");
       return;
     }
+    if (!allPickLinesPending.every((l) => isPickReasonValid(l.taskDetailId))) {
+      setActionStatus("Choose a Reason Code for every short-picked line before completing all.", "error");
+      return;
+    }
     el.allLinesList.innerHTML = allPickLinesPending
       .map((l) => {
         const qtyInput = getPickQtyInput(l.taskDetailId);
@@ -2363,6 +2466,8 @@
     for (const [taskId, lines] of byTask.entries()) {
       const lineCompletions = lines.map((l) => {
         const qtyInput = getPickQtyInput(l.taskDetailId);
+        const short = isPickShort(l.taskDetailId);
+        const reasonSelect = short ? getPickReasonSelect(l.taskDetailId) : null;
         return {
           taskDetailId: l.taskDetailId,
           sourceContainerId: l.sourceContainerId,
@@ -2370,6 +2475,8 @@
           olpnId: l.olpnId,
           transactionId: l.groupTaskTransactionId,
           quantity: qtyInput ? Number(qtyInput.value) : null,
+          exceptionMove: short,
+          reasonCodeId: reasonSelect ? reasonSelect.value : null,
         };
       });
       try {
@@ -2414,7 +2521,19 @@
   });
   el.pickLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".pick-qty-input");
-    if (qtyInput) updatePickLineActionButtons();
+    if (!qtyInput) return;
+    const value = Number(qtyInput.value);
+    const planned = Number(qtyInput.dataset.defaultQty);
+    const short = Number.isFinite(value) && Number.isFinite(planned) && value < planned;
+    qtyInput.classList.toggle("overridden", short);
+    toggleReasonSelect(qtyInput, short);
+    updatePickLineActionButtons();
+  });
+  el.pickLinesBody.addEventListener("change", (e) => {
+    const select = e.target.closest(".reason-code-select");
+    if (!select) return;
+    select.classList.toggle("invalid", !select.value);
+    updatePickLineActionButtons();
   });
 
   const allLinesModal = window.bootstrap

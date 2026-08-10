@@ -91,6 +91,7 @@ from mawm_client import (
     search_location_count_info,
     search_location_inventory,
     search_olpn,
+    search_pick_reason_codes,
     search_putaway_reason_codes,
     search_task,
     search_task_id_for_container,
@@ -979,6 +980,31 @@ def preload_putaway_reason_codes(
     """
     dest = resolve_location(org, location)
     rows = search_putaway_reason_codes(token, org, location=dest)
+    entries = []
+    for row in rows:
+        value = str(_first(row, "ReasonCodeId") or "").strip()
+        key = str(_first(row, "Description") or "").strip() or value
+        if not value:
+            continue
+        entries.append({"key": key, "value": value})
+    entries.sort(key=lambda e: e["key"].lower())
+    return {"success": True, "count": len(entries), "entries": entries}
+
+
+def preload_pick_reason_codes(
+    token: str, org: str, location: str = None
+) -> Dict[str, Any]:
+    """Every PICK_EXCEPTION reason code (see
+    mawm_client.search_pick_reason_codes()'s docstring) — the frontend
+    shows the full list in a dropdown for a short pick (per explicit
+    instruction, 2026-08-10: display all of them, not just the
+    hand-picked subset live-tested so far, since the user is manually
+    testing more over time and wants the untested ones visible too, just
+    unmarked). `value` (ReasonCodeId) is what's sent back to MAWM;
+    `key` (Description) is the human label shown in the picker.
+    """
+    dest = resolve_location(org, location)
+    rows = search_pick_reason_codes(token, org, location=dest)
     entries = []
     for row in rows:
         value = str(_first(row, "ReasonCodeId") or "").strip()
@@ -2612,6 +2638,8 @@ def complete_pick_line(
     transaction_id: str,
     quantity,
     location: str = None,
+    exception_move: bool = False,
+    reason_code_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Commits one Pick task-detail line via commitPickMove() and
     independently re-verifies the outcome — confirmed live this session
@@ -2628,6 +2656,12 @@ def complete_pick_line(
     layer (`_classify_pick_task()`) already refuses to surface any task
     containing an unsupported line, so this function doesn't re-check
     that itself.
+
+    `exception_move`/`reason_code_id` — the confirmed short-pick
+    mechanism (see commit_pick_move()'s docstring). The frontend sets
+    `exception_move` whenever the entered quantity is less than planned,
+    and requires a reason-code selection before allowing the submit in
+    that case; `reason_code_id` is otherwise optional.
     """
     task_id = (task_id or "").strip()
     task_detail_id = (task_detail_id or "").strip()
@@ -2650,6 +2684,8 @@ def complete_pick_line(
             token,
             org,
             location=dest,
+            exception_move=exception_move,
+            reason_code_id=reason_code_id,
         )
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"commitPickMove failed: {exc}", "taskDetailId": task_detail_id}
@@ -2724,7 +2760,9 @@ def complete_pick_task(
     lines now and leave an exception for later.
 
     `line_completions` is `[{"taskDetailId", "sourceContainerId",
-    "sourceContainerType", "olpnId", "transactionId", "quantity"}, ...]`.
+    "sourceContainerType", "olpnId", "transactionId", "quantity",
+    "exceptionMove", "reasonCodeId"}, ...]` — the last two are optional
+    per-line, same short-pick mechanism as complete_pick_line().
     """
     task_id = (task_id or "").strip()
     if not task_id:
@@ -2753,6 +2791,10 @@ def complete_pick_task(
                 str(completion.get("transactionId") or ""),
                 quantity,
                 location=dest,
+                exception_move=bool(completion.get("exceptionMove")),
+                reason_code_id=(str(completion.get("reasonCodeId")).strip() or None)
+                if completion.get("reasonCodeId")
+                else None,
             )
         )
 

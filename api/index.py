@@ -25,6 +25,7 @@ from task_service import (  # noqa: E402
     complete_pick_task,
     complete_putaway_line,
     preload_adjustment_reason_codes,
+    preload_pick_reason_codes,
     preload_putaway_locations,
     preload_putaway_reason_codes,
     preload_task_transactions,
@@ -38,7 +39,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.14.2"
+APP_VERSION = "0.15.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -348,6 +349,8 @@ def complete_pick_line_route():
     olpn_id = (data.get("olpnId") or data.get("olpn_id") or "").strip()
     transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
     quantity = data.get("quantity")
+    exception_move = bool(data.get("exceptionMove") or data.get("exception_move"))
+    reason_code_id = (data.get("reasonCodeId") or data.get("reason_code_id") or "").strip() or None
     try:
         result = complete_pick_line(
             token,
@@ -360,6 +363,8 @@ def complete_pick_line_route():
             transaction_id,
             quantity,
             location=location,
+            exception_move=exception_move,
+            reason_code_id=reason_code_id,
         )
         forward_usage_event(
             {
@@ -469,6 +474,21 @@ def preload_putaway_reason_codes_route():
         return jsonify(result)
     except Exception as e:
         print(f"[PRELOAD_PUTAWAY_REASON_CODES] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/preload_pick_reason_codes", methods=["POST"])
+def preload_pick_reason_codes_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    try:
+        result = preload_pick_reason_codes(token, org, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[PRELOAD_PICK_REASON_CODES] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

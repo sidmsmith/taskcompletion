@@ -1779,6 +1779,41 @@ PICK_TRANSACTION_TYPE_ID = "Pick"
 PICK_COMMIT_MOVE_URL = f"{HOST}/pickpack/api/pickpack/pick/commitPickMove"
 PICK_OLPN_SEARCH_URL = f"{HOST}/pickpack/api/pickpack/olpn/search"
 
+# CONFIRMED live — a *different* endpoint from Putaway's own
+# PUTAWAY_REASON_CODE_SEARCH_URL (the naive guess mirroring Putaway's
+# path shape, `pickpack/api/pickpack/pick/reasonCode/search`, 404s; the
+# real one has no `pick/` segment). `ReasonCodeCategoryId` is a real,
+# filterable field — confirmed 10 codes carry `"PICK_EXCEPTION"`, and
+# for these `ReasonCodeId` matches `Description` verbatim except
+# `PickCancel` (Description: "Cancel Pick Shortage Requirement").
+PICK_REASON_CODE_SEARCH_URL = f"{HOST}/pickpack/api/pickpack/reasonCode/search"
+PICK_EXCEPTION_REASON_CATEGORY = "PICK_EXCEPTION"
+
+
+def search_pick_reason_codes(token: str, org: str, location: str = None) -> List[dict]:
+    """CONFIRMED live — every reason code under the PICK_EXCEPTION
+    category (10 real codes in SS-DEMO as of 2026-08-10). Each row's
+    `ReasonCodeId` is the value to send back to MAWM via
+    commit_pick_move()'s `reason_code_id`; `Description` is the human
+    label.
+    """
+    token = normalize_token(token)
+    payload = {
+        "Query": f"ReasonCodeCategoryId ='{PICK_EXCEPTION_REASON_CATEGORY}'",
+        "Size": 1000,
+        "Page": 0,
+    }
+    response = _post(
+        PICK_REASON_CODE_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"pick reason code search failed: {response.status_code} {response.text[:500]}"
+        )
+    return _response_data_list(response.json())
+
 
 def search_task_id_for_olpn(olpn_id: str, token: str, org: str, location: str = None) -> List[str]:
     """Real, open (not Completed/Canceled) Pick TaskIds whose own
@@ -1849,6 +1884,8 @@ def commit_pick_move(
     token: str,
     org: str,
     location: str = None,
+    exception_move: bool = False,
+    reason_code_id: Optional[str] = None,
 ) -> dict:
     """CONFIRMED live — commits one Pick task-detail line. Deliberately
     the plain/minimal payload shape (not the fetch-then-enrich pattern
@@ -1860,6 +1897,16 @@ def commit_pick_move(
     with) the richer fetch/enrich/commit shape — see the module
     docstring above; this function is intentionally not used for that
     case at all (locked out one layer up, in task_service.py).
+
+    `exception_move`/`reason_code_id` — the confirmed short-pick
+    mechanism (see CLAUDE.md's "Picking: short-pick exception mechanism
+    confirmed" section): submitting the actual short quantity with
+    `ExceptionMove: true` in this single call retroactively resizes
+    `TaskDetail.Quantity`/`OlpnDetail.InitialQuantity` down to match, so
+    nothing is left "expecting" the shortfall. `reason_code_id` is
+    optional — MAWM accepts a short pick with none supplied — but is
+    sent as a top-level `ReasonCodeId` sibling field when provided, per
+    the confirmed-accepted (though not confirmed-persisted) shape.
     """
     token = normalize_token(token)
     payload = {
@@ -1872,9 +1919,11 @@ def commit_pick_move(
             "TransactionId": transaction_id,
             "CompletedQuantity": quantity,
         },
-        "ExceptionMove": False,
+        "ExceptionMove": bool(exception_move),
         "EndTargetContainer": False,
     }
+    if reason_code_id:
+        payload["ReasonCodeId"] = reason_code_id
     response = _post(
         PICK_COMMIT_MOVE_URL,
         headers=build_task_headers(token, org, location=location),
