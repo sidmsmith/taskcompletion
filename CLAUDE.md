@@ -2395,3 +2395,48 @@ at all — this session's scope stayed within the current tasked
 SS-DEMO environment), and closing/`EndTargetContainer` behavior beyond
 what's already been observed (every task tested so far auto-closed on
 its own without it being set).
+
+**UOM display bug, found and fixed same session**: the Pick table's
+column header literally read "UOM" — inconsistent with this app's own
+established convention (Putaway's equivalent column header is blank;
+the unit code displays inline instead). Fixed. The *quantity/label*
+itself (e.g. `PICK1907` showing `UomTypeId: "PACK"` with the raw
+`Quantity` value, 3 and 2) was flagged as a possible bug but turned
+out not to be one — the user captured a real mobile RF session (HAR
+file, `PICK1907.har` in Downloads, not checked into this repo) for the
+same task and confirmed the real WM mobile app shows the identical
+"3 Packs"/"2 Packs" — i.e. no real UOM conversion is happening on
+either side for this item/task combination, both correctly show the
+raw base quantity with a `PACK` label. Confirmed from the mobile
+session's own captured response:
+`UniqueAttributeCaptureUOM: {uomConversionFactor: 1, standardQuantityUomId: "PACK"}`
+— conversion factor 1, i.e. no real scaling either way. (Root cause,
+for reference: this item's "PACK" `ItemPackage` entry has
+`Standard: false` — this app's own existing `_package_conversion_factor()`
+helper, already used for Putaway/Cycle Count display, only matches
+`Standard: true` entries, so it would have fallen back to the exact
+same unconverted-raw-value behavior anyway had it been applied here.)
+
+**Reference find, not acted on**: the same HAR capture reveals the
+real mobile RF app does *not* use `commitPickMove` at all — it uses
+the much heavier `dmmobile-facade/services/rest/workflow/execute/...`
+state-machine pattern (`EnterTask` → `Pick/AcceptItem` →
+`Pick/AcceptQuantity`, repeated per line → `OutboundPutaway/AcceptLocation`
+at the end — the "location scan at the end" the user described,
+confirmed real, explicitly deferred: "not too worried about that
+just yet"). This mirrors Putaway's own two parallel families in this
+app — the workflow/state-machine one ("Path A") is commented out and
+unused there in favor of the simpler execution/task REST pair ("Path
+C") this app actually uses. Reassuring, not alarming: dug one level
+into the mobile workflow's own request body and found
+`currentMove.InventoryMove.Quantity`/`TaskDetailEaches[0].Quantity` —
+the *same* `InventoryMove`/`TaskDetailEaches` shape `commitPickMove`/
+`fetchNextMove` already use, just wrapped in the bigger state-machine
+envelope. Confirms `commitPickMove` is the real, canonical mechanism
+under the hood, not a workaround — this app's simpler REST-only
+approach reaches the same underlying data model through a more direct
+door, matching the same architectural choice already made for
+Putaway. Worth revisiting **only** if the iLPN/full-container
+`PPK::0513` mystery above is still unresolved and everything else is
+exhausted — a completely different code path might not hit the same
+bug — but not pursued now.
