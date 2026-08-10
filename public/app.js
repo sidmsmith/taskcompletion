@@ -39,6 +39,49 @@
     // location's items complete atomically together, so "select a
     // line" for cycle count really means "select a location."
     selectedCycleCountGroupKey: null,
+    // Pick row selection is tracked separately from
+    // state.selectedTaskDetailId (2026-08-10, thirteenth session) — a
+    // split line (see pickSplits below) means one taskDetailId can now
+    // render as more than one row, so taskDetailId alone is no longer
+    // a unique row identifier the way resolve_search_multi() documents
+    // for the rest of this file. See getPickRows()'s `splitId`.
+    selectedPickSplitId: null,
+    // taskDetailId -> [{splitId, quantity}, ...] (2026-08-10) — only
+    // present once a line has been explicitly split via splitPickRow();
+    // absent means "render as one row covering the full line," the
+    // pre-split default. Quantities are independently editable per
+    // split, not linked/auto-balanced — see splitPickRow()'s docstring
+    // for why.
+    pickSplits: {},
+    // splitId -> groupKey (2026-08-10) — set when a row is dragged to a
+    // different tote group; overrides pickGroupKey()'s natural
+    // (slot-or-per-line) grouping for just that row. Cleared implicitly
+    // by a fresh search (new state.groups), never explicitly reset.
+    pickGroupOverride: {},
+    // splitId -> the last complete_pick_line()-shaped result (2026-08-10)
+    // — completion state now lives here, not just in the DOM, because
+    // splitting/dragging/adding a tote all require re-running
+    // renderPickGroups() (grouping itself changes), which would
+    // otherwise wipe already-completed rows' status on every such
+    // action the way a plain re-render did before this session.
+    pickRowStatus: {},
+    // Synthetic keys for empty tote groups created via "+ Add Tote"
+    // (2026-08-10) — a drop target needs to exist before anything's
+    // been dragged into it. Array, not a Set, so insertion order is
+    // preserved for tie-broken sorting (see renderPickGroups()).
+    extraToteGroups: [],
+    // groupKey -> {value, locked, status, statusLabel} (2026-08-10) —
+    // the source of truth for every TOTE textbox's own state, since
+    // renderPickGroups() now re-runs on every split/drag/add-tote
+    // action and would otherwise reset each box to empty on every
+    // re-render (it did, briefly, before this was added — see
+    // getToteGroupState()). `locked` mirrors what used to be a
+    // DOM-only `disabled` flag, set once any row in that group has
+    // actually committed (see updatePickToteStatus()).
+    toteGroupState: {},
+    // taskDetailId -> integer (2026-08-10) — mints unique splitIds
+    // across repeated splits of the same line; see nextSplitId().
+    pickSplitCounters: {},
   };
 
   function allLines() {
@@ -143,6 +186,7 @@
     cycleCountLinesBody: document.getElementById("cycleCountLinesBody"),
     pickLinesTable: document.getElementById("pickLinesTable"),
     pickLinesBody: document.getElementById("pickLinesBody"),
+    addToteBtn: document.getElementById("addToteBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
     actionStatus: document.getElementById("actionStatus"),
@@ -529,6 +573,7 @@
     el.cycleCountLinesTable.style.display = "none";
     el.pickLinesTable.style.display = "none";
     el.linesTable.style.display = "";
+    el.addToteBtn.style.display = "none";
     renderTaskMeta();
     const multiGroup = state.groups.length > 1;
     el.linesTable.classList.toggle("multi-group", multiGroup);
@@ -1044,6 +1089,7 @@
     el.linesTable.style.display = "none";
     el.pickLinesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "";
+    el.addToteBtn.style.display = "none";
     renderCycleCountTaskMeta();
     el.cycleCountLinesBody.innerHTML = state.groups.map((g) => cycleCountGroupRowsHtml(g)).join("");
     // A view-only group (task_service._resolve_cycle_count_task()'s
@@ -1584,6 +1630,19 @@
     // known limitation.
     const isTaskedCycleCount = groups.length > 0 && groups.every((g) => g.mode === "cycle_count");
     const isPick = groups.length > 0 && groups.every((g) => g.mode === "pick");
+    // A genuinely new search must not carry over the previous search's
+    // Pick split/drag/tote state (2026-08-10, thirteenth session, found
+    // live — a stale state.extraToteGroups entry from an earlier Pick
+    // search rendered as a phantom extra header on an unrelated later
+    // one). Reset here regardless of what this search turns out to be,
+    // not just when it's Pick — the whole point is nothing should
+    // survive past the task/oLPN box being searched again.
+    state.pickSplits = {};
+    state.pickGroupOverride = {};
+    state.pickRowStatus = {};
+    state.extraToteGroups = [];
+    state.toteGroupState = {};
+    state.pickSplitCounters = {};
     state.groups = groups;
     state.lastSearchValue = searchValue;
     state.lastSearchMode = isTaskedCycleCount ? "cycle_count" : isPick ? "pick" : "task";
@@ -2147,35 +2206,49 @@
    * pick never shows or requires this — see the qty `input` handler
    * below, which is the only place `.overridden`/visibility gets set for
    * Pick rows.
+   *
+   * Renders a `row` (see getPickRows()), not a raw line — everything
+   * interactive keys off `row.splitId`, the only value guaranteed
+   * unique once a line's been split (2026-08-10). "Planned Qty" still
+   * shows the *line's* original full quantity (the overall ask);
+   * "Completed Qty" defaults to *this row's* own quantity (its slice,
+   * whether split or the whole thing) and is independently editable.
+   * Split/drag (see splitPickRow()/the dragstart handler below) are
+   * only offered on a not-yet-done tote-destined row — an oLPN row's
+   * destination is already fixed by the task data, nothing to split or
+   * move.
    */
-  function pickLineRowHtml(line) {
-    const isDone = line.status === "8000";
-    const qtyValue = isDone ? line.completedQuantity : line.plannedQuantity;
+  function pickLineRowHtml(row) {
+    const isDone = isPickRowDone(row.splitId);
+    const tracked = state.pickRowStatus[row.splitId];
+    const qtyValue = isDone ? (tracked && tracked.completedQuantity != null ? tracked.completedQuantity : row.quantity) : row.quantity;
+    const canSplitOrDrag = row.isToteDestined && !isDone;
     return `
-        <tr class="pick-line-row line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
-          <td>${escapeHtml(line.lineNumber)}</td>
-          <td>${escapeHtml(line.sourceLocationId)}</td>
-          <td>${escapeHtml(line.itemId)}</td>
-          <td><div class="col-desc-narrow" title="${escapeAttr(line.description)}">${escapeHtml(line.description)}</div></td>
-          <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
-          <td class="col-uom">${escapeHtml(line.uomTypeId)}</td>
+        <tr class="pick-line-row line-row" data-split-id="${escapeAttr(row.splitId)}" data-task-detail-id="${escapeAttr(row.taskDetailId)}" ${canSplitOrDrag ? 'draggable="true"' : ""}>
+          <td>${escapeHtml(row.lineNumber)}</td>
+          <td>${escapeHtml(row.sourceLocationId)}</td>
+          <td>${escapeHtml(row.itemId)}</td>
+          <td><div class="col-desc-narrow" title="${escapeAttr(row.description)}">${escapeHtml(row.description)}</div></td>
+          <td class="col-qty-wide">${escapeHtml(row.plannedQuantity)}</td>
+          <td class="col-uom">${escapeHtml(row.uomTypeId)}</td>
           <td class="col-qty-wide">
             <input
               type="number"
               class="form-control pick-qty-input"
-              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
-              data-default-qty="${escapeAttr(line.plannedQuantity)}"
+              data-split-id="${escapeAttr(row.splitId)}"
+              data-default-qty="${escapeAttr(row.quantity)}"
               value="${escapeAttr(qtyValue)}"
               step="any"
               ${isDone ? "disabled" : ""}
             />
+            ${canSplitOrDrag ? `<button type="button" class="pick-split-btn" data-split-id="${escapeAttr(row.splitId)}" title="Split this line across totes">Split</button>` : ""}
           </td>
           <td class="col-reason">
-            <select class="form-select reason-code-select invalid" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+            <select class="form-select reason-code-select invalid" data-split-id="${escapeAttr(row.splitId)}">
               ${pickReasonCodeOptionsHtml()}
             </select>
           </td>
-          <td class="col-reason pick-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}" data-done="${isDone}">${isDone ? "Completed" : ""}</td>
+          <td class="col-reason pick-result" data-split-id="${escapeAttr(row.splitId)}" data-done="${isDone}">${isDone ? "Completed" : ""}</td>
         </tr>`;
   }
 
@@ -2228,10 +2301,84 @@
     return line.olpnId || "";
   }
 
-  function getPickGroupToteInput(groupKey) {
-    return el.pickLinesBody.querySelector(
-      '.tote-id-input[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
-    );
+  /**
+   * A row's *actual* group — the natural key (pickGroupKey()) unless
+   * the user dragged it elsewhere (2026-08-10, thirteenth session,
+   * split/drag UI — see state.pickGroupOverride's docstring). Rows,
+   * not lines, are what get grouped/rendered from here on; see
+   * getPickRows().
+   */
+  function pickRowGroupKey(row) {
+    return state.pickGroupOverride[row.splitId] || pickGroupKey(row);
+  }
+
+  /**
+   * A row is "done" if this app has already tracked a real completion
+   * result for it (state.pickRowStatus — set by completePickRow()),
+   * or — only for the default, never-split case, where splitId equals
+   * the real taskDetailId — if the original search already showed it
+   * completed (line.status). A synthetic split row can never fall into
+   * the second case: splitting only ever happens on a not-yet-done
+   * line (see splitPickRow()), and its splitId never matches a real
+   * taskDetailId, so getLineByTaskDetailId() correctly returns null.
+   */
+  function isPickRowDone(splitId) {
+    const tracked = state.pickRowStatus[splitId];
+    if (tracked) return !!tracked.success;
+    const line = getLineByTaskDetailId(splitId);
+    return !!line && line.status === "8000";
+  }
+
+  /**
+   * Expands allLines() into render rows (2026-08-10) — one row per
+   * line by default (covering its full remaining quantity), or one row
+   * per entry in state.pickSplits[taskDetailId] once a line has been
+   * explicitly split. `splitId` is the unique per-row key everything
+   * else in this section (selection, qty/reason inputs, completion,
+   * done-tracking) keys off from now on — taskDetailId is no longer
+   * unique once a line is split, so it's kept on the row only for
+   * building the completion payload (the backend commit still targets
+   * the real taskDetailId; confirmed live this session that MAWM
+   * correctly handles multiple independent partial commits against the
+   * same TaskDetailId, each with its own quantity/target container —
+   * see CLAUDE.md's incremental-split-picking section).
+   */
+  function getPickRows() {
+    const rows = [];
+    allLines().forEach((line) => {
+      const splits = state.pickSplits[line.taskDetailId];
+      if (splits && splits.length) {
+        splits.forEach((part) => {
+          rows.push({ ...line, splitId: part.splitId, quantity: part.quantity });
+        });
+      } else {
+        rows.push({ ...line, splitId: line.taskDetailId, quantity: line.plannedQuantity });
+      }
+    });
+    return rows;
+  }
+
+  function getPickRowBySplitId(splitId) {
+    return getPickRows().find((r) => r.splitId === String(splitId)) || null;
+  }
+
+  /** Lazily-initialized per-group TOTE textbox state — see
+   * state.toteGroupState's docstring. Always returns the same object
+   * for a given groupKey across calls, so callers can mutate it
+   * in-place (e.g. `getToteGroupState(key).value = "..."`). */
+  function getToteGroupState(groupKey) {
+    if (!state.toteGroupState[groupKey]) {
+      state.toteGroupState[groupKey] = { value: "", locked: false, status: "", statusLabel: "" };
+    }
+    return state.toteGroupState[groupKey];
+  }
+
+  /** Mints a unique splitId for a new piece of a split line
+   * (2026-08-10) — see splitPickRow(). */
+  function nextSplitId(taskDetailId) {
+    const n = (state.pickSplitCounters[taskDetailId] || 0) + 1;
+    state.pickSplitCounters[taskDetailId] = n;
+    return taskDetailId + "#" + n;
   }
 
   /**
@@ -2262,22 +2409,33 @@
    * status badge — unchanged from before) or a TOTE (a required
    * textbox instead of an id, since the real container doesn't exist
    * until the picker enters one; see isPickToteValid()). `info` comes
-   * from renderPickGroups()'s own groupInfoFor().
+   * from renderPickGroups()'s own groupInfoFor() — for a tote group it
+   * includes state.toteGroupState's own fields (value/locked/status/
+   * statusLabel), so a re-render (now routine once split/drag/add-tote
+   * are in play, see getPickRows()) doesn't reset an already-typed or
+   * already-committed tote box back to empty. Also a drop target for
+   * dragging a line into this group — see the dragover/drop listeners
+   * near the bottom of this section — and its own drop target even
+   * when empty (an "+ Add Tote" group with zero rows so far).
    */
   function pickGroupHeaderRowHtml(groupKey, info) {
     const slotLabel = pickOlpnSlotLabel(info.slotId);
     if (info.kind === "tote") {
+      const hasValue = !!(info.value && info.value.trim());
       return `
         <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="9">
             <strong>TOTE</strong>
             <input
               type="text"
-              class="form-control tote-id-input invalid"
+              class="form-control tote-id-input${hasValue ? "" : " invalid"}"
               data-group-key="${escapeAttr(groupKey)}"
               placeholder="Enter tote id"
+              value="${escapeAttr(info.value || "")}"
+              ${info.locked ? "disabled" : ""}
             />
             ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
+            <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
         </tr>`;
     }
@@ -2327,16 +2485,25 @@
    * gets locked to whatever value just succeeded (further edits to a
    * container that's already real would be misleading) and a status
    * badge appears next to it, same visual language as an oLPN group.
+   * Updates state.toteGroupState first (so a later re-render — routine
+   * now, see getPickRows()'s docstring — keeps this locked/labeled
+   * instead of reverting), then patches the live DOM directly for
+   * immediate feedback without waiting on a full re-render.
    */
   function updatePickToteStatus(groupKey, toteId, status, statusLabel) {
     if (!groupKey) return;
+    const gs = getToteGroupState(groupKey);
+    gs.value = toteId || gs.value;
+    gs.locked = true;
+    gs.status = status;
+    gs.statusLabel = statusLabel;
     const header = el.pickLinesBody.querySelector(
       'tr.pick-tote-header[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
     );
     if (!header) return;
     const input = header.querySelector(".tote-id-input");
     if (input) {
-      input.value = toteId || input.value;
+      input.value = gs.value;
       input.disabled = true;
       input.classList.remove("invalid");
     }
@@ -2366,14 +2533,17 @@
   }
 
   /**
-   * Grouped by container (oLPN or, since 2026-08-10, tote — see
-   * pickGroupKey()), not one flat line list — each group gets its own
+   * Grouped by container (oLPN, or — since 2026-08-10 — tote, see
+   * pickRowGroupKey()), not one flat row list — each group gets its own
    * header row followed by its own repeated column-header row (see
    * pickColumnHeaderRowHtml() — per explicit instruction to test this
    * layout instead of one fixed header at the top) and just its own
-   * lines, so a multi-oLPN/multi-tote task reads as separate sections.
-   * Line ordering *within* a group follows the order lines already
-   * came back in (task-detail sequence), not re-sorted.
+   * rows. Renders `getPickRows()` (a line expanded per its splits, if
+   * any — see that function's docstring), not raw lines directly, so
+   * split parts of the same line can end up in different groups. Row
+   * ordering *within* a group follows the order rows were produced in
+   * (task-detail sequence, split parts immediately after their
+   * siblings), not re-sorted.
    *
    * Group ORDER (2026-08-10, thirteenth session, per explicit
    * instruction: "group and sort by slot and then by olpn/tote") —
@@ -2383,37 +2553,54 @@
    * with no real id yet) as a stable secondary/tie-break — this always
    * runs now, not just for slotted tasks, so even a plain multi-oLPN
    * task with no slots gets a deterministic (alphabetical) order
-   * instead of first-appearance order. This is an intentional behavior
-   * change from the cart-only sort built earlier this session.
+   * instead of first-appearance order.
+   *
+   * Called far more often now than when first built (2026-08-10) — any
+   * split, drag, or "+ Add Tote" click re-runs this, not just a fresh
+   * search — which is exactly why completion/tote state moved out of
+   * the DOM and into state.pickRowStatus/state.toteGroupState: without
+   * that, every one of those actions would silently wipe already-
+   * completed rows and already-typed tote ids.
    */
   function renderPickGroups() {
-    state.selectedTaskDetailId = null;
+    state.selectedPickSplitId = null;
     el.linesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "none";
     el.pickLinesTable.style.display = "";
     renderPickTaskMeta();
 
+    const rows = getPickRows();
     const groupKeys = [];
     const byGroup = new Map();
-    allLines().forEach((line) => {
-      const key = pickGroupKey(line);
+    rows.forEach((row) => {
+      const key = pickRowGroupKey(row);
       if (!byGroup.has(key)) {
         byGroup.set(key, []);
         groupKeys.push(key);
       }
-      byGroup.get(key).push(line);
+      byGroup.get(key).push(row);
+    });
+    // Empty drop targets from "+ Add Tote" (2026-08-10) — a group has
+    // to exist before anything's been dragged into it.
+    state.extraToteGroups.forEach((key) => {
+      if (!byGroup.has(key)) {
+        byGroup.set(key, []);
+        groupKeys.push(key);
+      }
     });
 
+    el.addToteBtn.style.display = rows.some((r) => r.isToteDestined) ? "" : "none";
+
     const groupInfoFor = (key) => {
-      const groupLines = byGroup.get(key);
-      const firstLine = groupLines[0];
-      if (firstLine.isToteDestined) {
-        return { kind: "tote", containerId: "", slotId: firstLine.plannedSlotId };
+      const groupRows = byGroup.get(key) || [];
+      const firstRow = groupRows[0];
+      if (!firstRow || firstRow.isToteDestined) {
+        return { kind: "tote", containerId: "", slotId: firstRow ? firstRow.plannedSlotId : "", ...getToteGroupState(key) };
       }
-      const owningGroup = state.groups.find((g) => g.taskId === firstLine.groupTaskId);
+      const owningGroup = state.groups.find((g) => g.taskId === firstRow.groupTaskId);
       const olpnInfo =
-        owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[firstLine.olpnId] || {} : {};
-      return { kind: "olpn", containerId: firstLine.olpnId, ...olpnInfo };
+        owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[firstRow.olpnId] || {} : {};
+      return { kind: "olpn", containerId: firstRow.olpnId, ...olpnInfo };
     };
 
     // slotId's own text isn't always a bare number (see
@@ -2424,13 +2611,13 @@
       const match = String(slotId || "").match(/\d+/);
       return match ? Number(match[0]) : NaN;
     };
-    // A group with no real container id yet — an ungrouped tote line
-    // with no slot, keyed synthetically by its own taskDetailId (see
-    // pickGroupKey()) — has nothing meaningful to sort by; comparing
-    // "" to "" ties (localeCompare returns 0), so Array.sort's
-    // stability keeps these in their original line order instead of
-    // an arbitrary UUID-ish ordering the synthetic key itself would
-    // otherwise produce.
+    // A group with no real container id yet — an empty "+ Add Tote"
+    // group, or an ungrouped tote line with no slot, keyed
+    // synthetically by its own splitId (see pickGroupKey()) — has
+    // nothing meaningful to sort by; comparing "" to "" ties
+    // (localeCompare returns 0), so Array.sort's stability keeps these
+    // in their original order instead of an arbitrary ordering the
+    // synthetic key itself would otherwise produce.
     const groupLabel = (key, info) => info.containerId || "";
 
     groupKeys.sort((a, b) => {
@@ -2447,113 +2634,155 @@
 
     el.pickLinesBody.innerHTML = groupKeys
       .map((key) => {
-        const groupLines = byGroup.get(key);
+        const groupRows = byGroup.get(key) || [];
         const info = groupInfoFor(key);
         const header = key ? pickGroupHeaderRowHtml(key, info) : "";
-        return header + pickColumnHeaderRowHtml() + groupLines.map((line) => pickLineRowHtml(line)).join("");
+        return header + pickColumnHeaderRowHtml() + groupRows.map((row) => pickLineRowHtml(row)).join("");
       })
       .join("");
     updatePickLineActionButtons();
   }
 
-  function getPickQtyInput(taskDetailId) {
+  function getPickQtyInput(splitId) {
     return el.pickLinesBody.querySelector(
-      '.pick-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+      '.pick-qty-input[data-split-id="' + CSS.escape(String(splitId)) + '"]'
     );
   }
 
-  function isPickQtyValid(taskDetailId) {
-    const input = getPickQtyInput(taskDetailId);
+  function isPickQtyValid(splitId) {
+    const input = getPickQtyInput(splitId);
     if (!input) return false;
     const raw = input.value.trim();
     if (raw === "") return false;
     return Number.isFinite(Number(raw));
   }
 
-  function isPickLineDone(taskDetailId) {
-    const cell = el.pickLinesBody.querySelector(
-      '.pick-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
-    );
-    return !!cell && cell.dataset.done === "true";
-  }
-
   /** A short pick = entered qty strictly less than Planned Qty — see the
    * qty `input` handler, the only place `.overridden` is set for Pick
-   * rows (unlike Putaway, an equal or larger entry never counts). */
-  function isPickShort(taskDetailId) {
-    const input = getPickQtyInput(taskDetailId);
+   * rows (unlike Putaway, an equal or larger entry never counts). Also
+   * true, harmlessly, for a split row whose own slice is naturally less
+   * than the line's original Planned Qty — the reason-code prompt this
+   * triggers is a reasonable "why are you not doing the whole line as
+   * one pick" nudge, not a bug; the picker can just note the split
+   * reason or a real short reason, whichever applies. */
+  function isPickShort(splitId) {
+    const input = getPickQtyInput(splitId);
     return !!input && input.classList.contains("overridden");
   }
 
-  function getPickReasonSelect(taskDetailId) {
+  function getPickReasonSelect(splitId) {
     return el.pickLinesBody.querySelector(
-      '.reason-code-select[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+      '.reason-code-select[data-split-id="' + CSS.escape(String(splitId)) + '"]'
     );
   }
 
   /** Only required once a line is actually short (see isPickShort()) —
    * a full-quantity pick never needs a reason code. */
-  function isPickReasonValid(taskDetailId) {
-    if (!isPickShort(taskDetailId)) return true;
-    const select = getPickReasonSelect(taskDetailId);
+  function isPickReasonValid(splitId) {
+    if (!isPickShort(splitId)) return true;
+    const select = getPickReasonSelect(splitId);
     return !!(select && select.value);
   }
 
-  /** A tote-destined line requires its group's TOTE textbox to be
+  /** A tote-destined row requires its group's TOTE textbox to be
    * filled in before it can complete (2026-08-10) — an oLPN-destined
-   * line always passes, since its container id is already known. */
-  function isPickToteValid(taskDetailId) {
-    const line = getLineByTaskDetailId(taskDetailId);
-    if (!line || !line.isToteDestined) return true;
-    const input = getPickGroupToteInput(pickGroupKey(line));
-    return !!(input && input.value.trim());
+   * row always passes, since its container id is already known. Takes
+   * a row (not just a splitId) since it needs pickRowGroupKey(), which
+   * needs the row's own isToteDestined/plannedSlotId/olpnId fields. */
+  function isPickToteValid(row) {
+    if (!row || !row.isToteDestined) return true;
+    return !!getToteGroupState(pickRowGroupKey(row)).value.trim();
   }
 
-  function selectPickLine(taskDetailId) {
-    state.selectedTaskDetailId = taskDetailId;
+  function selectPickRow(splitId) {
+    state.selectedPickSplitId = splitId;
     el.pickLinesBody.querySelectorAll("tr.pick-line-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
+      row.classList.toggle("selected", row.dataset.splitId === String(splitId));
     });
     updatePickLineActionButtons();
   }
 
-  function outstandingPickLines() {
-    return allLines().filter((l) => !isPickLineDone(l.taskDetailId));
+  function outstandingPickRows() {
+    return getPickRows().filter((r) => !isPickRowDone(r.splitId));
   }
 
   function updatePickLineActionButtons() {
-    const line = state.selectedTaskDetailId ? getLineByTaskDetailId(state.selectedTaskDetailId) : null;
-    const hasSelection = !!line;
-    const selectedDone = hasSelection && isPickLineDone(line.taskDetailId);
+    const row = state.selectedPickSplitId ? getPickRowBySplitId(state.selectedPickSplitId) : null;
+    const hasSelection = !!row;
+    const selectedDone = hasSelection && isPickRowDone(row.splitId);
     const selectedValid =
       hasSelection &&
       !selectedDone &&
-      isPickQtyValid(line.taskDetailId) &&
-      isPickReasonValid(line.taskDetailId) &&
-      isPickToteValid(line.taskDetailId);
+      isPickQtyValid(row.splitId) &&
+      isPickReasonValid(row.splitId) &&
+      isPickToteValid(row);
     el.fullLineBtn.disabled = !hasSelection || !selectedValid;
-    const outstanding = outstandingPickLines();
+    const outstanding = outstandingPickRows();
     el.allLinesBtn.disabled =
       !outstanding.length ||
-      !outstanding.every(
-        (l) => isPickQtyValid(l.taskDetailId) && isPickReasonValid(l.taskDetailId) && isPickToteValid(l.taskDetailId)
-      );
+      !outstanding.every((r) => isPickQtyValid(r.splitId) && isPickReasonValid(r.splitId) && isPickToteValid(r));
   }
 
-  function setPickResultCell(taskDetailId, message, kind, done) {
+  function setPickResultCell(splitId, message, kind, done) {
     const cell = el.pickLinesBody.querySelector(
-      '.pick-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+      '.pick-result[data-split-id="' + CSS.escape(String(splitId)) + '"]'
     );
     if (!cell) return;
     cell.textContent = message;
     cell.className = "col-reason pick-result" + (kind ? " " + kind : "");
     cell.dataset.done = done ? "true" : "false";
     if (done) {
-      const qtyInput = getPickQtyInput(taskDetailId);
+      const qtyInput = getPickQtyInput(splitId);
       if (qtyInput) qtyInput.disabled = true;
-      const reasonSelect = getPickReasonSelect(taskDetailId);
+      const reasonSelect = getPickReasonSelect(splitId);
       if (reasonSelect) reasonSelect.disabled = true;
+      const splitBtn = el.pickLinesBody.querySelector(
+        '.pick-split-btn[data-split-id="' + CSS.escape(String(splitId)) + '"]'
+      );
+      if (splitBtn) splitBtn.remove();
     }
+  }
+
+  /**
+   * Splits a not-yet-done tote-destined row into two sibling rows
+   * within the *same* group (2026-08-10, per explicit instruction:
+   * split first, then drag either half to a different tote — never one
+   * gesture trying to do both). Defaults to a ceil/floor half split of
+   * whatever quantity is currently in the box (not necessarily the
+   * line's original Planned Qty, if it's already been split once);
+   * both halves are independently editable afterward, not linked —
+   * confirmed live this session that MAWM doesn't require split
+   * quantities to sum to any particular total (each partial commit is
+   * evaluated against whatever's actually remaining at commit time,
+   * not a client-side total), so there's nothing to enforce here.
+   * Re-splitting an already-split row works the same way: its one
+   * entry in state.pickSplits is replaced by two new ones.
+   */
+  function splitPickRow(splitId) {
+    const row = getPickRowBySplitId(splitId);
+    if (!row || isPickRowDone(splitId)) return;
+    const qtyInput = getPickQtyInput(splitId);
+    const currentQty = qtyInput ? Number(qtyInput.value) : row.quantity;
+    if (!Number.isFinite(currentQty) || currentQty <= 0) {
+      setActionStatus("Enter a valid quantity before splitting this line.", "error");
+      return;
+    }
+    const part1Qty = Math.ceil(currentQty / 2);
+    const part2Qty = currentQty - part1Qty;
+    const groupKey = pickRowGroupKey(row);
+    const newId1 = nextSplitId(row.taskDetailId);
+    const newId2 = nextSplitId(row.taskDetailId);
+
+    const existing = state.pickSplits[row.taskDetailId] || [{ splitId: row.taskDetailId, quantity: row.quantity }];
+    const remaining = existing.filter((s) => s.splitId !== splitId);
+    remaining.push({ splitId: newId1, quantity: part1Qty }, { splitId: newId2, quantity: part2Qty });
+    state.pickSplits[row.taskDetailId] = remaining;
+
+    state.pickGroupOverride[newId1] = groupKey;
+    state.pickGroupOverride[newId2] = groupKey;
+    delete state.pickGroupOverride[splitId];
+
+    renderPickGroups();
   }
 
   function pickResultKind(result) {
@@ -2567,40 +2796,55 @@
     return result.error || "Failed";
   }
 
-  async function completePickLineAction() {
-    const line = getSelectedLine();
-    if (!line) return;
-    if (isPickLineDone(line.taskDetailId)) return;
-    const qtyInput = getPickQtyInput(line.taskDetailId);
+  /**
+   * Commits one row (2026-08-10) — the selected splitId, per
+   * state.selectedPickSplitId. The backend commit always targets the
+   * row's real, shared taskDetailId (a split row's own splitId is a
+   * frontend-only concept, never sent) with just this row's own
+   * quantity and, for a tote-destined row, this row's *group's* tote
+   * id (see pickRowGroupKey()) — confirmed live this session that
+   * MAWM correctly accepts repeated independent partial commits
+   * against the same taskDetailId, each with its own quantity and
+   * target container (see CLAUDE.md's incremental-split section), so
+   * two split rows completing separately is not a new backend
+   * capability, just a new frontend way of driving an already-real one.
+   */
+  async function completePickRow() {
+    const row = state.selectedPickSplitId ? getPickRowBySplitId(state.selectedPickSplitId) : null;
+    if (!row) return;
+    if (isPickRowDone(row.splitId)) return;
+    const qtyInput = getPickQtyInput(row.splitId);
     const quantity = qtyInput ? Number(qtyInput.value) : null;
-    const short = isPickShort(line.taskDetailId);
-    const reasonSelect = short ? getPickReasonSelect(line.taskDetailId) : null;
-    const toteInput = line.isToteDestined ? getPickGroupToteInput(pickGroupKey(line)) : null;
-    setBusy(true, "Completing line " + line.lineNumber + "…");
+    const short = isPickShort(row.splitId);
+    const reasonSelect = short ? getPickReasonSelect(row.splitId) : null;
+    const groupKey = pickRowGroupKey(row);
+    const toteValue = row.isToteDestined ? getToteGroupState(groupKey).value.trim() : null;
+    setBusy(true, "Completing line " + row.lineNumber + "…");
     try {
       const result = await api("complete_pick_line", {
         org: state.org,
         token: state.token,
         location: state.facility,
-        taskId: line.groupTaskId,
-        taskDetailId: line.taskDetailId,
-        sourceContainerId: line.sourceContainerId,
-        sourceContainerType: line.sourceContainerTypeId,
-        olpnId: line.olpnId,
-        transactionId: line.groupTaskTransactionId,
+        taskId: row.groupTaskId,
+        taskDetailId: row.taskDetailId,
+        sourceContainerId: row.sourceContainerId,
+        sourceContainerType: row.sourceContainerTypeId,
+        olpnId: row.olpnId,
+        transactionId: row.groupTaskTransactionId,
         quantity,
         exceptionMove: short,
         reasonCodeId: reasonSelect ? reasonSelect.value : null,
-        targetContainerId: toteInput ? toteInput.value.trim() : null,
+        targetContainerId: toteValue,
       });
-      setPickResultCell(line.taskDetailId, pickResultText(result), pickResultKind(result), result.success);
+      state.pickRowStatus[row.splitId] = result;
+      setPickResultCell(row.splitId, pickResultText(result), pickResultKind(result), result.success);
       setActionStatus(
-        result.success ? "Completed line " + line.lineNumber + "." : result.error || "Complete failed",
+        result.success ? "Completed line " + row.lineNumber + "." : result.error || "Complete failed",
         result.success ? "success" : "error"
       );
       if (result.taskStatus) {
         state.groups.forEach((g) => {
-          if (g.taskId === line.groupTaskId) {
+          if (g.taskId === row.groupTaskId) {
             g.taskStatus = result.taskStatus;
             g.taskStatusLabel = result.taskStatusLabel;
           }
@@ -2608,10 +2852,11 @@
         renderPickTaskMeta();
       }
       if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus, result.olpnStatusLabel);
-      if (result.toteId) updatePickToteStatus(pickGroupKey(line), result.toteId, result.toteStatus, result.toteStatusLabel);
+      if (result.toteId) updatePickToteStatus(groupKey, result.toteId, result.toteStatus, result.toteStatusLabel);
       updatePickLineActionButtons();
     } catch (e) {
-      setPickResultCell(line.taskDetailId, e.message || String(e), "error", false);
+      state.pickRowStatus[row.splitId] = { success: false, error: e.message || String(e) };
+      setPickResultCell(row.splitId, e.message || String(e), "error", false);
       setActionStatus(e.message || String(e), "error");
     } finally {
       setBusy(false);
@@ -2621,68 +2866,77 @@
   let allPickLinesPending = [];
 
   function openAllPickLinesModal() {
-    allPickLinesPending = outstandingPickLines();
+    allPickLinesPending = outstandingPickRows();
     if (!allPickLinesPending.length) {
       setActionStatus("No outstanding lines to complete.", "");
       return;
     }
-    if (!allPickLinesPending.every((l) => isPickQtyValid(l.taskDetailId))) {
+    if (!allPickLinesPending.every((r) => isPickQtyValid(r.splitId))) {
       setActionStatus("Enter a Completed Qty for every line before completing all.", "error");
       return;
     }
-    if (!allPickLinesPending.every((l) => isPickReasonValid(l.taskDetailId))) {
+    if (!allPickLinesPending.every((r) => isPickReasonValid(r.splitId))) {
       setActionStatus("Choose a Reason Code for every short-picked line before completing all.", "error");
       return;
     }
-    if (!allPickLinesPending.every((l) => isPickToteValid(l.taskDetailId))) {
+    if (!allPickLinesPending.every((r) => isPickToteValid(r))) {
       setActionStatus("Enter a Tote Id for every tote-destined line before completing all.", "error");
       return;
     }
     el.allLinesList.innerHTML = allPickLinesPending
-      .map((l) => {
-        const qtyInput = getPickQtyInput(l.taskDetailId);
-        const qty = qtyInput ? qtyInput.value : l.plannedQuantity;
-        return `<li>Line ${escapeHtml(l.lineNumber)} — ${escapeHtml(l.itemId)}: ${escapeHtml(qty)} ${escapeHtml(l.uomTypeId)}</li>`;
+      .map((r) => {
+        const qtyInput = getPickQtyInput(r.splitId);
+        const qty = qtyInput ? qtyInput.value : r.quantity;
+        return `<li>Line ${escapeHtml(r.lineNumber)} — ${escapeHtml(r.itemId)}: ${escapeHtml(qty)} ${escapeHtml(r.uomTypeId)}</li>`;
       })
       .join("");
     allLinesModal.show();
   }
 
   /**
-   * Groups pending lines by task before submitting (2026-08-10) — a
+   * Groups pending rows by task before submitting (2026-08-10) — a
    * multi-search batch (several Pick TaskIds/oLPNs typed at once) can
    * span more than one task, and complete_pick_task() commits all the
    * lines of *one* task per call, so this fans out one call per task
    * rather than assuming everything on screen belongs to a single one.
+   *
+   * Results come back from complete_pick_task() in the same order
+   * `lineCompletions` was submitted (a plain sequential loop
+   * server-side — see task_service.complete_pick_task()) — matched
+   * back to each row by array index, not by taskDetailId, since two
+   * split rows in the same batch legitimately share one taskDetailId
+   * (see splitPickRow()) and the backend has no concept of splitId at
+   * all; it only ever sees the real taskDetailId per call.
    */
   async function confirmAllPickLines() {
     allLinesModal.hide();
     const byTask = new Map();
-    allPickLinesPending.forEach((l) => {
-      const key = l.groupTaskId;
+    allPickLinesPending.forEach((r) => {
+      const key = r.groupTaskId;
       if (!byTask.has(key)) byTask.set(key, []);
-      byTask.get(key).push(l);
+      byTask.get(key).push(r);
     });
     const total = allPickLinesPending.length;
     let succeeded = 0;
     const failures = [];
     setBusy(true, "Completing " + total + " line(s)…");
-    for (const [taskId, lines] of byTask.entries()) {
-      const lineCompletions = lines.map((l) => {
-        const qtyInput = getPickQtyInput(l.taskDetailId);
-        const short = isPickShort(l.taskDetailId);
-        const reasonSelect = short ? getPickReasonSelect(l.taskDetailId) : null;
-        const toteInput = l.isToteDestined ? getPickGroupToteInput(pickGroupKey(l)) : null;
+    for (const [taskId, rows] of byTask.entries()) {
+      const lineCompletions = rows.map((r) => {
+        const qtyInput = getPickQtyInput(r.splitId);
+        const short = isPickShort(r.splitId);
+        const reasonSelect = short ? getPickReasonSelect(r.splitId) : null;
+        const groupKey = pickRowGroupKey(r);
+        const toteValue = r.isToteDestined ? getToteGroupState(groupKey).value.trim() : null;
         return {
-          taskDetailId: l.taskDetailId,
-          sourceContainerId: l.sourceContainerId,
-          sourceContainerType: l.sourceContainerTypeId,
-          olpnId: l.olpnId,
-          transactionId: l.groupTaskTransactionId,
+          taskDetailId: r.taskDetailId,
+          sourceContainerId: r.sourceContainerId,
+          sourceContainerType: r.sourceContainerTypeId,
+          olpnId: r.olpnId,
+          transactionId: r.groupTaskTransactionId,
           quantity: qtyInput ? Number(qtyInput.value) : null,
           exceptionMove: short,
           reasonCodeId: reasonSelect ? reasonSelect.value : null,
-          targetContainerId: toteInput ? toteInput.value.trim() : null,
+          targetContainerId: toteValue,
         };
       });
       try {
@@ -2693,15 +2947,15 @@
           taskId,
           lineCompletions,
         });
-        (response.results || []).forEach((r) => {
-          setPickResultCell(r.taskDetailId, pickResultText(r), pickResultKind(r), r.success);
+        (response.results || []).forEach((r, idx) => {
+          const row = rows[idx];
+          if (!row) return;
+          state.pickRowStatus[row.splitId] = r;
+          setPickResultCell(row.splitId, pickResultText(r), pickResultKind(r), r.success);
           if (r.olpnId) updatePickOlpnStatus(r.olpnId, r.olpnStatus, r.olpnStatusLabel);
-          if (r.toteId) {
-            const rLine = getLineByTaskDetailId(r.taskDetailId);
-            if (rLine) updatePickToteStatus(pickGroupKey(rLine), r.toteId, r.toteStatus, r.toteStatusLabel);
-          }
+          if (r.toteId) updatePickToteStatus(pickRowGroupKey(row), r.toteId, r.toteStatus, r.toteStatusLabel);
           if (r.success) succeeded++;
-          else failures.push("Line " + r.taskDetailId + ": " + (r.error || "failed"));
+          else failures.push("Line " + row.taskDetailId + ": " + (r.error || "failed"));
         });
         const g = state.groups.find((gr) => gr.taskId === taskId);
         const last = (response.results || [])[response.results.length - 1];
@@ -2710,7 +2964,7 @@
           g.taskStatusLabel = last.taskStatusLabel;
         }
       } catch (e) {
-        lines.forEach((l) => failures.push("Line " + l.taskDetailId + ": " + (e.message || String(e))));
+        rows.forEach((r) => failures.push("Line " + r.taskDetailId + ": " + (e.message || String(e))));
       }
     }
     renderPickTaskMeta();
@@ -2725,9 +2979,14 @@
   }
 
   el.pickLinesBody.addEventListener("click", (e) => {
+    const splitBtn = e.target.closest(".pick-split-btn");
+    if (splitBtn) {
+      splitPickRow(splitBtn.dataset.splitId);
+      return;
+    }
     const row = e.target.closest("tr.pick-line-row");
     if (!row) return;
-    selectPickLine(row.dataset.taskDetailId);
+    selectPickRow(row.dataset.splitId);
   });
   el.pickLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".pick-qty-input");
@@ -2742,6 +3001,7 @@
     }
     const toteInput = e.target.closest(".tote-id-input");
     if (toteInput) {
+      getToteGroupState(toteInput.dataset.groupKey).value = toteInput.value;
       toteInput.classList.toggle("invalid", !toteInput.value.trim());
       updatePickLineActionButtons();
     }
@@ -2751,6 +3011,63 @@
     if (!select) return;
     select.classList.toggle("invalid", !select.value);
     updatePickLineActionButtons();
+  });
+
+  /**
+   * Drag-and-drop between tote groups (2026-08-10, per explicit
+   * instruction — "drag whatever lines down into the new tote
+   * section"). Native HTML5 DnD, no library: only rows marked
+   * `draggable="true"` in pickLineRowHtml() (not-yet-done,
+   * tote-destined rows — an oLPN row's destination is fixed by the
+   * task data, nothing to drag it to) can be dragged; only a
+   * `tr.pick-tote-header` (including an empty "+ Add Tote" group's own
+   * header, since it renders even with zero rows — see
+   * renderPickGroups()) accepts a drop. Moving a row is just
+   * `state.pickGroupOverride[splitId] = <new group>` followed by a
+   * re-render — the same mechanism splitPickRow() already uses to keep
+   * a freshly split pair in their shared starting group.
+   */
+  el.pickLinesBody.addEventListener("dragstart", (e) => {
+    const row = e.target.closest('tr.pick-line-row[draggable="true"]');
+    if (!row) return;
+    e.dataTransfer.setData("text/plain", row.dataset.splitId);
+    e.dataTransfer.effectAllowed = "move";
+    row.classList.add("dragging");
+  });
+  el.pickLinesBody.addEventListener("dragend", (e) => {
+    const row = e.target.closest("tr.pick-line-row");
+    if (row) row.classList.remove("dragging");
+    el.pickLinesBody
+      .querySelectorAll(".drop-target-hover")
+      .forEach((node) => node.classList.remove("drop-target-hover"));
+  });
+  el.pickLinesBody.addEventListener("dragover", (e) => {
+    const header = e.target.closest("tr.pick-tote-header");
+    if (!header) return;
+    e.preventDefault();
+    header.classList.add("drop-target-hover");
+  });
+  el.pickLinesBody.addEventListener("dragleave", (e) => {
+    const header = e.target.closest("tr.pick-tote-header");
+    if (!header) return;
+    header.classList.remove("drop-target-hover");
+  });
+  el.pickLinesBody.addEventListener("drop", (e) => {
+    const header = e.target.closest("tr.pick-tote-header");
+    if (!header) return;
+    e.preventDefault();
+    header.classList.remove("drop-target-hover");
+    const splitId = e.dataTransfer.getData("text/plain");
+    const groupKey = header.dataset.groupKey;
+    if (!splitId || !groupKey) return;
+    if (isPickRowDone(splitId)) return;
+    state.pickGroupOverride[splitId] = groupKey;
+    renderPickGroups();
+  });
+
+  el.addToteBtn.addEventListener("click", () => {
+    state.extraToteGroups.push("extra:" + Date.now() + ":" + state.extraToteGroups.length);
+    renderPickGroups();
   });
 
   const allLinesModal = window.bootstrap
@@ -2763,7 +3080,7 @@
 
   el.fullLineBtn.addEventListener("click", () => {
     if (state.lastSearchMode === "cycle_count") completeCycleCountLine();
-    else if (state.lastSearchMode === "pick") completePickLineAction();
+    else if (state.lastSearchMode === "pick") completePickRow();
     else completeLine();
   });
   el.allLinesBtn.addEventListener("click", () => {

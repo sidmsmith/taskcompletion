@@ -3123,3 +3123,137 @@ showing all 4 lines correctly closed). Recovered with a page reload;
 not chased further — most likely an artifact of this session's
 scripted rapid-fire clicks racing Bootstrap's modal transition, not a
 functional issue with the completion logic itself.
+
+## Picking: incremental split-picking confirmed live, then built into the UI (2026-08-10, thirteenth session)
+
+**Research first, again, before any UI work** — the user described the
+real mobile RF flow: "Pick 10" → picker enters 3 → system now says
+"Pick 7" → picker enters 5 → 2 remain → picker hits "Short" with a
+reason code, which cancels the remainder and closes the line. Tested
+whether this incremental, multi-commit-per-line model works through
+`commitPickMove()` directly, against a real fresh line (`PICK0273`,
+qty 10):
+
+- **Commit 1**: `quantity=3`, `ExceptionMove:false`,
+  `TargetContainerId="TOTE_SPLIT_A"`. Re-verified: `CompletedQuantity:
+  3.0`, `Quantity: 10.0` (unchanged), `Status: "7000"` (still open).
+- **Commit 2**: `quantity=5` (the *incremental* amount, not a running
+  total), `TargetContainerId="TOTE_SPLIT_B"` — a **different**
+  container than commit 1, same `TaskDetailId`. Re-verified:
+  `CompletedQuantity: 5.0`, `Quantity: 7.0`. **Key finding: `Quantity`
+  itself retroactively dropped from `10.0` to `7.0`** (`10 - 3`, the
+  prior commit's amount) — each commit's own `CompletedQuantity`/
+  `Quantity` pair only ever reflects *that commit's own round*
+  (how much was asked this round vs. how much was given), not a
+  cumulative total against the original plan. Confirmed via real
+  inventory, not just the TaskDetail fields: `TOTE_SPLIT_A` held
+  exactly 3 units, `TOTE_SPLIT_B` exactly 5 — the *physical* split was
+  correct even though no single TaskDetail read showed the full
+  picture.
+- **Commit 3**: `quantity=2` (the true remainder), back into
+  `TOTE_SPLIT_A`. Closed cleanly: `Status: "8000"`, task closed.
+  Final totals: `TOTE_SPLIT_A` 5 units (3 + 2, two separate commits
+  into the same tote), `TOTE_SPLIT_B` 5 units — 10 total, matching the
+  original plan exactly.
+- **New discrepancy found live, while verifying the same mechanism
+  through the built UI**: after two sequential partial commits against
+  one `TaskDetailId`, MAWM's TaskDetail array grows a **new**
+  `TaskDetailId` for the already-completed portion, while the
+  *original* id keeps representing the shrinking remainder. Confirmed
+  on `PICK0845`: after splitting and completing a 3-unit line as 2+1,
+  the task's TaskDetail array showed the original id
+  (`2566a621-...`) holding the *second* commit's numbers
+  (`CompletedQuantity: 1.0`) and a brand-new id
+  (`30e87dd9-...`) holding the *first* commit's numbers
+  (`CompletedQuantity: 2.0`). This didn't break anything — the app
+  always sends the *original, cached* `TaskDetailId` for every commit
+  on a line, never re-fetches a fresh one between partials, and MAWM
+  accepted both commits against that same original id correctly
+  regardless of the record-splitting happening behind the scenes — but
+  it's the real mechanism behind why a partial-picked line's own
+  `TaskDetailId`/`Quantity` can look surprising on a later raw query,
+  worth remembering if this is ever debugged again from raw API output
+  rather than through this app.
+
+**Built on top of the confirmed mechanism, per explicit instruction**
+("I like the sound of Option B but with some more sexiness... drag...
+first splitting a line and then moving it down"):
+- **Row model, not line model** (`app.js`) — `getPickRows()` expands
+  `allLines()` into render rows, one per line by default or one per
+  entry in `state.pickSplits[taskDetailId]` once split. `splitId` (not
+  `taskDetailId`) is the unique key for everything row-scoped from
+  here on (selection, qty/reason inputs, done-tracking, DOM
+  `data-split-id`) — `taskDetailId` is no longer unique once a line's
+  split, though it's still what every commit actually targets.
+  `pickRowGroupKey()` resolves a row's actual group: an explicit
+  `state.pickGroupOverride[splitId]` (set by split or drag) if present,
+  else the natural key (slot, or per-line fallback) from the twelfth
+  session's `pickGroupKey()`.
+- **State moved out of the DOM** (`state.pickRowStatus`,
+  `state.toteGroupState`) — necessary because split/drag/"+ Add Tote"
+  all now re-run `renderPickGroups()` (grouping itself changes), which
+  would otherwise silently wipe already-completed rows and already-
+  typed tote ids on every such action, the way a plain re-render did
+  before this session (renderPickGroups() used to only run once per
+  search).
+- **Split** (`splitPickRow()`) — a small "Split" link under a not-yet-
+  done tote-destined row's qty box (never shown for an oLPN row — its
+  destination is fixed by the task data, nothing to split). Divides
+  the row's *current* quantity ceil/floor in half into two new
+  sibling rows in the *same* group; both independently editable
+  afterward, deliberately not linked/auto-balanced — confirmed live
+  this session that MAWM doesn't require split quantities to sum to
+  any particular total, so there's nothing to enforce client-side.
+  Re-splitting an already-split row works the same way.
+- **Drag-and-drop** (native HTML5 DnD, no library) — only a not-yet-
+  done tote-destined row is `draggable`; only a `tr.pick-tote-header`
+  (including an empty "+ Add Tote" group's own header) accepts a drop.
+  Moving a row is just `state.pickGroupOverride[splitId] = <target
+  group>` + a re-render.
+- **"+ Add Tote"** (`el.addToteBtn`) — pushes a synthetic key onto
+  `state.extraToteGroups` so an empty group (header + textbox, zero
+  rows) exists as a drop target before anything's been dragged into
+  it. Only shown when the current result has at least one tote-
+  destined line.
+- **`complete_pick_task()` results matched back by array index, not
+  taskDetailId** — two split rows sharing one taskDetailId can now
+  legitimately appear in the same "Complete All" batch; the backend
+  loop preserves submission order (confirmed by reading
+  `task_service.complete_pick_task()`), so `response.results[idx]`
+  reliably maps back to `lineCompletions[idx]`'s originating row.
+
+**One real bug found and fixed live-testing this**: `data-default-qty`
+(the "short pick" comparison baseline) was set to the *line's* full
+Planned Qty even for a split row — meaning every split row would
+falsely trigger the short-pick reason-code prompt just because its own
+slice is naturally less than the whole line, 100% of the time, not as
+an edge case. Fixed to compare against the *row's own* starting
+quantity (`row.quantity` — equal to the line's Planned Qty for an
+unsplit row, or the split's own assigned amount for a split part).
+
+**A second real bug found and fixed live-testing this**: a fresh
+search didn't reset `state.extraToteGroups`/`pickSplits`/
+`pickGroupOverride`/`toteGroupState` from the *previous* search — an
+empty "+ Add Tote" group added while testing one task reappeared as a
+phantom extra header on a completely unrelated task searched
+afterward. Fixed by resetting all Pick split/drag/tote state at the
+top of `fetchAndRenderTask()`, unconditionally (not just when the new
+result turns out to be Pick), since nothing about the previous search
+should ever survive a new one.
+
+**Confirmed end-to-end through the real browser UI** (`PICK0845`, 3
+lines, no slots, real quantities 3/2/2): split line 1 (qty 3) into two
+rows (2/1, confirmed via each row's own `data-split-id` and quantity);
+clicked "+ Add Tote" to create an empty 4th group; dragged one split
+part into it via simulated native `DragEvent`s (`dragstart`→
+`dragover`→`drop`, a real `DataTransfer`, not a shortcut); filled in
+all 4 tote ids; ran "Complete All". Result: 3 of 4 rows reported
+success immediately, 1 showed the known transient re-verify false
+negative (see the eleventh-session note on this) — independently
+re-verified via a fresh `search_task()`/`search_container_inventory()`
+query that all 4 real commits succeeded and the task closed
+(`Status: "8000"`). Final real inventory per tote: 2 units (the
+split line's first half), 1 unit (its second half, the one dragged to
+the new group), 2 units (line 2, untouched), 2 units (line 3,
+untouched) — 7 total, matching the task's original 3+2+2 exactly,
+correctly spread across all 4 real totes.
