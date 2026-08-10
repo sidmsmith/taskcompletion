@@ -1,0 +1,34 @@
+[
+  {
+    "Messages": null,
+    "DisplayLocation": "A1AC0401",
+    "LocationBarcode": "A1AC0401",
+    "LocationId": "A1AC0401",
+    "Items": [
+      {
+        "LocationId": "A1AC0401",
+        "ItemId": "5000221",
+        "ItemDescription": "Floral Print Dress",
+        "OnHandSum": 2,
+        "ToBeFilledSum": 2,
+        "AllocatedSum": 0
+      }
+    ]
+  },
+  {
+    "Messages": null,
+    "DisplayLocation": "A1AC0405",
+    "LocationBarcode": "A1AC0405",
+    "LocationId": "A1AC0405",
+    "Items": [
+      {
+        "LocationId": "A1AC0405",
+        "ItemId": "3000301",
+        "ItemDescription": "Nautical Rope Belt",
+        "OnHandSum": 493,
+        "ToBeFilledSum": 0,
+        "AllocatedSum": 3
+      }
+    ]
+  }
+]

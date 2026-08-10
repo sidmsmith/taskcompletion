@@ -15,6 +15,61 @@ JasperReports version, and the JRXML file format itself. The notes below
 exist so the next report (or the next change to this one) doesn't have to
 rediscover all of this from scratch.
 
+## Current status (paused 2026-08-10)
+
+**The JRXML itself is proven correct** — extensively verified locally
+against the real JasperReports 6.4.0 engine (see
+`local-640-harness/README.md`), including reproducing the exact
+"compiles and deploys fine, but the PDF has no data" symptom on demand.
+**The open question is no longer about the report definition — it's
+about what MAWM's runtime actually hands the report**, specifically
+whether `REPORT_DATA_SOURCE` at generation time is the full envelope
+(`{"Data": [...]}`) or the bare `Data` array (`[...]`) by itself. Each
+shape needs a different `<queryString>` (`Data.*` vs `*` respectively) —
+both work correctly when matched to the right shape, and both produce
+silent, error-free, zero-data output when mismatched. This can't be
+resolved by more local testing or more JRXML edits; it requires either
+observing MAWM's actual runtime payload directly, or exhausting the
+handful of untested field-mapping key names below.
+
+**Current file state**: `cyclecountsheet.jrxml` has
+`<queryString language="jsonql"><![CDATA[Data.*]]></queryString>` (the
+envelope-shaped assumption) as of the last commit. This exact query
+string was already tested once before under different upstream WMS
+arguments and failed; it was re-tried after those arguments changed,
+per explicit instruction, with the honest expectation ("10% chance") that
+it might not be the fix either. **If it comes back blank again**, the
+next thing to actually try is the bare-array assumption
+(`<![CDATA[*]]>`) — already proven correct for that shape locally, and
+not yet tested against production under the *current* WMS argument
+configuration (only under the old one, where it also came back blank —
+see the "JsonQL vs plain JSON" section's full timeline below for exactly
+which combination was tested when).
+
+**A pattern worth being suspicious of going forward**: several rounds in
+this investigation involved Glean proposing a JRXML change, it failing in
+production, and a later round proposing to revert to a combination
+already tried and already failed — without new evidence that anything
+about the runtime environment had changed. Two of those were caught and
+pushed back on (see the git log for `Jasper/cyclecountsheet.jrxml` for the
+exact sequence). Before applying the next suggested query-string flip,
+check `git log --oneline -p -- Jasper/cyclecountsheet.jrxml` (or ask
+Claude to) to confirm it's not a repeat of something already
+production-tested under the same conditions.
+
+**If local testing genuinely runs out of runway** (i.e. neither `Data.*`
+nor `*` works against production even though both are proven correct for
+their respective JSON shapes locally), the field-mapping key names
+themselves are the next thing to question — they were taken from a single
+captured sample payload and assumed to be stable, but MAWM's real
+`Items[]` objects carry dozens of fields (see the "real MAWM payload
+shape" section below); if the real generation-time payload uses
+different field names or a different nesting than the captured sample,
+that would produce the exact same silent-blank-output symptom as a root
+query mismatch, and neither this report's git history nor the local
+harness has ruled that out — it's just less likely given the sample was
+described as a genuine capture.
+
 ## Files
 
 - **`location_inventory_report.jrxml`** — the **Studio-editable** copy.
@@ -39,6 +94,14 @@ rediscover all of this from scratch.
 - **`archive/location_inventory_report_COMPACT_FORMAT_BACKUP.jrxml`** — a
   snapshot of the report in the newer "compact" JRXML format, kept from
   before the classic-format conversion, in case it's ever useful again.
+- **`local-640-harness/`** — a real, working local copy of JasperReports
+  6.4.0 (MAWM's actual version, downloaded from Maven Central — not
+  Studio's bundled 7.0.6) that can compile/fill this report from the
+  command line and validate query/field-mapping changes in seconds,
+  instead of burning a WMS deployment round-trip per hypothesis. Run
+  `local-640-harness/setup.sh` once, then see its own `README.md` for
+  usage — including a critical, easy-to-miss gotcha about which
+  `fillReport()` overload actually reflects what MAWM does at runtime.
 
 ## The core problem: two JasperReports versions, two file formats
 
