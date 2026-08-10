@@ -2708,12 +2708,18 @@ configurations:
 - `PICK0184`, plan `"Hybrid Tote oLPN Pick Cart 3 Slots"` → pre-labeled
   strings (`"Slot 1"`, `"Slot 2"`, `"Slot 3"`) — **and** two of its 4
   oLPNs both landed on `"Slot 1"`, so the 1-oLPN-per-slot mapping
-  confirmed on `PICK0637` is not universal; also 3 of its 4 lines had
-  `Quantity: 0.0` and their destination oLPNs didn't exist yet as
-  queryable `search_olpn()` records (`None` returned) — this task
-  looked like degenerate/placeholder demo data rather than a real
-  cart-picking scenario, so it wasn't used for the full completion
-  test.
+  confirmed on `PICK0637` is not universal. **Correction of an earlier
+  wrong note in this file**: this task's `OlpnId`-not-found and
+  `Quantity: 0.0` lines were first (wrongly) written off here as
+  "degenerate/placeholder demo data." They're not — see "Picking:
+  pick vs. pack, hybrid carts, and totes/iLPNs" below. Every one of
+  this task's 4 lines actually has `PlannedContainerTypeId: "TOTE"`
+  (real tote ids: `TOTE0004`, `TOTE0002`, `TOTE0004` again,
+  `TOTE0003`) — a genuine tote-destined hybrid-cart line, which is
+  exactly why `search_olpn()` found nothing: there's no real oLPN to
+  find yet for a line that's headed to a tote, not an oLPN. The
+  `Quantity: 0.0` on 3 of the 4 lines remains unexplained and doesn't
+  appear to be caused by the tote/oLPN distinction itself.
 - `PICKPICK0008` → terse lowercase form (`"slot1"`, `"slot2"`), clean
   data (real quantities, both oLPNs pre-existing), used for the actual
   end-to-end completion test below.
@@ -2743,3 +2749,146 @@ untouched quantities on a later re-query. Convenient for testing
 (never permanently runs out of fresh tasks), but means task state
 observed in this file may not persist indefinitely in the live
 environment.
+
+## Picking: pick vs. pack, hybrid carts, and totes/iLPNs (2026-08-10, twelfth session)
+
+**Domain background, explained by the user, for whoever reads this
+next with no memory of this conversation.** Picking and Packing are
+two distinct WMS operations, not one. Grocery-store analogy: Picking
+is walking the shelves and putting items in your cart; Packing is
+taking items out of the cart and putting them into their final
+shipping container — a "bag," which in MAWM terms is an oLPN. The two
+can happen as one combined step or as two separate steps done by
+different people at different times/stations.
+
+**What this app's Picking feature has built so far is the *combined*
+case.** A pick cart with oLPNs already sitting in its slots — the
+grocery cart already has bags in it. The moment an item is picked, it
+also gets packed: this is exactly why `commitPickMove()` flips the
+oLPN straight to `"7200"` (Packed) as part of the same call, with no
+separate packing step anywhere in this app. Confirmed live and
+documented above for both plain `PICK_INTO_OLPN` tasks and
+`PICK_INTO_CART` tasks whose slots are oLPN-destined.
+
+**Why some pick tasks/lines have no usable oLPN yet.** Some tasks (or
+some *lines* within a hybrid cart task, see below) are picked into a
+**tote** instead of an oLPN — the equivalent of picking items into the
+cart itself and handing the cart off to someone else, who packs it out
+into oLPNs later, at a separate station, through a **separate packing
+app this project has not built yet**. A tote in MAWM terms is an
+**iLPN**, not an oLPN — a different container type with different
+downstream handling. This is exactly why `search_olpn()` returned
+`None` for `PICK0184`'s lines (see the correction above): those lines
+are tote-destined, so there's no oLPN to find — not missing data, not
+a demo-environment glitch.
+
+**A "hybrid" cart mixes both kinds of slots in one task.** Some slots
+are oLPN-destined (packed immediately when picked — in this app's
+supported scope today) and some are tote-destined (picked now, packed
+later by someone else, through the not-yet-built packing app — not
+really an "oLPN completion" event at all). `PICK0184`'s cart plan is
+literally named `"Hybrid Tote oLPN Pick Cart 3 Slots"`; in the one
+instance pulled this session all 4 of its lines happened to be
+tote-destined, so it wasn't actually a mixed example in practice, just
+a cart *plan* capable of being one.
+
+**The concrete per-line signal for "this slot is a tote, not an
+oLPN"**: `TaskDetail.PlannedContainerTypeId` — confirmed live as
+`"TOTE"` on every one of `PICK0184`'s lines, vs. `"OLPN"` on
+`PICK0637`'s lines (a pure oLPN cart) and simply absent/`None` on a
+plain non-cart `PICK_INTO_OLPN` task. **Not yet used by this app's
+classifier or rendering logic** — `_classify_pick_task()` only checks
+`TaskExecutionMode` and `SourceContainerTypeId` today, so a hybrid
+cart with tote-destined lines currently gets admitted and rendered
+identically to a pure-oLPN cart, with nothing distinguishing "this
+slot really will be Packed on commit" from "this slot won't be." Known
+gap, not yet fixed — flagged here rather than silently missed, and not
+yet actioned since the user hasn't asked for the fix, only for
+awareness.
+
+**Totes are not pre-assigned — a real iLPN gets established at pick
+time, not planned in advance.** Confirmed live: even on an untouched
+`PICK0184` line, `PlannedContainerId` (e.g. `"TOTE0004"`) is populated
+but `TargetContainerId`, `TargetContainerTypeId`, and
+`WorkingContainerId` are all still `None`. `PlannedContainerId` is
+wave-planning metadata/a suggested label, not a real container — this
+matches the user's description of how most real WM workflows actually
+behave: the *system prompts the picker for a tote id (iLPN)* during
+picking, and inventory moves from the source location into whatever
+iLPN gets specified/scanned at that moment, not a pre-decided one.
+
+**Working theory for the eventual tote-picking payload — not yet
+tested live.** The same `InventoryMove` shape `commitPickMove()`
+already uses for oLPN carts has `TargetContainerId`/
+`TargetContainerTypeId` sitting right next to `OlpnId`, both currently
+unused (always sent/observed empty). The working guess is that a
+tote-destined commit should populate `TargetContainerId`/
+`TargetContainerTypeId: "ILPN"` with the real tote id, the same way
+`OlpnId` gets populated for an oLPN-destined commit — but this is
+inference from the payload shape, not confirmed. Genuinely open
+questions, matching what the user said they don't know either:
+whether MAWM auto-creates a new iLPN if that field is left blank, or
+requires the iLPN to already exist (this app's Cycle Count/Putaway
+features already have separate "create iLPN" calls elsewhere in the
+codebase, if MAWM turns out to need one called first). **Eventual UI
+plan** (not yet built): a textbox for the user to key in a tote number
+(iLPN), passed through to the completion API for tote-destined lines —
+directly analogous to how oLPN ids already flow through today.
+
+**Reference thread, also relevant**: the real mobile RF app's captured
+state machine (`PICK1907.har`, documented earlier in this file) ends
+its oLPN flow with `OutboundPutaway/AcceptLocation` — "the location
+scan at the end." A tote flow presumably has an analogous-but-different
+step in that same state machine (something like "scan/enter tote"),
+which hasn't been investigated — that HAR capture was only for an
+oLPN-destined task, not a tote-destined one.
+
+## Picking: outbound location — MAWM determines it automatically, no scan needed (2026-08-10, twelfth session)
+
+The user's question: in a real mobile environment, MAWM calls
+"Outbound Putaway" at the end of a picking task, directing the picker
+to an outbound location per container (e.g. one tote to
+`PACKSTATION1`, another to `PACKSTATION2`, an oLPN straight to
+`SHIPDOCK1` since it's already packed). This app will never prompt a
+user to scan a destination location — not a mobile device, no reason
+to. The open question was whether that location gets decided
+somewhere even without the scan, since it could eventually be worth
+surfacing (e.g. in the status field) later.
+
+**Confirmed live, read-only, no new commit needed** (checked against
+an already-completed `PICKPICK0008` line from earlier this session):
+the **oLPN's own record** (`search_olpn()`, not `TaskDetail`) already
+carries a real outbound/destination location after a plain REST-only
+`commitPickMove()` call, with **no location scan involved anywhere in
+this app's flow**:
+- `DestinationLocationId: "CONS-OB-10-2--"` — reads like a real
+  outbound consolidation/staging location code (Consolidation-
+  Outbound, lane 10, slot 2)
+- `DestinationFacilityId`, `DestinationAddress` — the real downstream
+  shipping destination
+- `PackedDateTime`, `PackerId`, `PickLocationId` — a clean audit trail
+
+So MAWM's routing/slotting engine appears to decide the outbound
+location server-side as part of the commit itself — the mobile app's
+`OutboundPutaway/AcceptLocation` step is most likely a **confirmation**
+scan (the picker physically walks there and scans to prove compliance)
+rather than what actually makes the decision. This app's simpler
+REST-only path reaches the same underlying decision without needing
+that confirmation step at all, consistent with the earlier finding
+that `commitPickMove` reaches the same `InventoryMove`/
+`TaskDetailEaches` data model the mobile workflow uses, just through a
+more direct door.
+
+**Checked and came up empty, worth remembering**: the *TaskDetail*
+record itself shows no outbound-location fields populated even after
+full completion — `TargetLocationId`, `OBSortLocationId`,
+`DestinationZoneId` all stayed `None`. If this is ever surfaced in the
+UI, `OlpnDetail.DestinationLocationId` (via `search_olpn()`, already
+called once per oLPN today for status) is the right field to read, not
+anything on `TaskDetail`.
+
+**Explicitly deferred, per direct instruction** ("let's hold off on
+that for now"): not wired into the UI or backend response shape yet —
+this section exists purely so a future session (or this one, resumed
+cold) knows the data already exists and where it lives, without
+needing to rediscover it.
