@@ -48,7 +48,7 @@
         <defaultValueExpression><![CDATA["Cycle Count Sheet"]]></defaultValueExpression>
     </parameter>
 
-    <queryString language="jsonql"><![CDATA[*]]></queryString>
+    <queryString language="jsonql"><![CDATA[Data.*]]></queryString>
 
     <field name="LocationId" class="java.lang.String">
         <property name="net.sf.jasperreports.jsonql.field.expression" value="LocationId"/>
