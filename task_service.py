@@ -358,6 +358,12 @@ def _normalize_task_lines(
             ),
             "itemId": item_id,
             "description": str(item.get("Description") or ""),
+            # Same defensive casing fallback receivingworkbench's
+            # rw_service.py uses (2026-08-10) — item-master's own
+            # casing for this field isn't 100% consistent.
+            "itemImageUrl": str(
+                item.get("ImageUrl") or item.get("imageUrl") or item.get("ImageURL") or ""
+            ),
             "fromLocationId": str(_first(line, "SourceLocationId", "FromLocationId") or ""),
             "toLocationId": str(_first(line, "TargetLocationId", "ToLocationId") or ""),
             "lpnId": lpn_id,
@@ -820,6 +826,7 @@ def resolve_search(
     mixed_items = None
     uom_label = ""
     factor = Decimal("1")
+    item_image_url = ""
     if mixed:
         # 2026-08-08, per explicit instruction: "MIXED" now shows in the
         # Item column (blank Description), not the other way around.
@@ -847,6 +854,9 @@ def resolve_search(
                 {
                     "itemId": row_item_id,
                     "description": str(row_item.get("Description") or ""),
+                    "itemImageUrl": str(
+                        row_item.get("ImageUrl") or row_item.get("imageUrl") or row_item.get("ImageURL") or ""
+                    ),
                     "quantity": _num(_dec(r.get("OnHand")) / item_factor),
                     "uomId": item_uom_label,
                     "uomFactor": _num(item_factor),
@@ -856,11 +866,13 @@ def resolve_search(
         item_id = str(inv_rows[0].get("ItemId") or "")
         item = items.get(item_id) or {}
         description = str(item.get("Description") or "")
+        item_image_url = str(item.get("ImageUrl") or item.get("imageUrl") or item.get("ImageURL") or "")
         factor, uom_label = _package_conversion_factor(item, str(item.get("DisplayUomId") or ""))
         qty = _dec(inv_rows[0].get("OnHand")) / factor
     else:
         item_id = ""
         description = ""
+        item_image_url = ""
         qty = Decimal("0")
 
     # A consumed LPN's own inventory/location come back empty — there's
@@ -883,6 +895,9 @@ def resolve_search(
             if hist_item is None:
                 hist_item = search_items([hist_item_id], token, org, location=dest).get(hist_item_id) or {}
             description = str(hist_item.get("Description") or "")
+            item_image_url = str(
+                hist_item.get("ImageUrl") or hist_item.get("imageUrl") or hist_item.get("ImageURL") or ""
+            )
             if history.get("quantity") is not None:
                 factor, uom_label = _package_conversion_factor(
                     hist_item, str(hist_item.get("DisplayUomId") or "")
@@ -894,6 +909,7 @@ def resolve_search(
         "taskDetailId": f"container:{search_value}",
         "itemId": item_id,
         "description": description,
+        "itemImageUrl": item_image_url,
         "fromLocationId": ilpn_fields["displayLocationId"],
         "toLocationId": "",
         "lpnId": search_value,
@@ -2269,6 +2285,9 @@ def resolve_cycle_count_location(
                     "locationId": location_id,
                     "itemId": item_id,
                     "description": str(item.get("Description") or ""),
+                    "itemImageUrl": str(
+                        item.get("ImageUrl") or item.get("imageUrl") or item.get("ImageURL") or ""
+                    ),
                     "quantity": None,
                     "locationLocked": locked,
                 }

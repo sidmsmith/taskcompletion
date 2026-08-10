@@ -20,7 +20,15 @@
     // cycle-count table/lastSearchMode value ("cycle_count"), but reload
     // needs to know which endpoint to hit again — see reloadCurrentSearch().
     lastSearchIsTaskedCycleCount: false,
-    selectedTaskDetailId: null, // taskDetailId is globally unique across every group, see resolve_search_multi()'s docstring
+    // Putaway's own multi-select (2026-08-10) — a Set of taskDetailIds,
+    // each globally unique across every group per
+    // resolve_search_multi()'s docstring. Plain click toggles
+    // membership (see selectLine()); 0 or 1 selected behaves exactly
+    // as the old single-select model did (immediate "Complete Line",
+    // no confirm modal), 2+ relabels the button "Complete Lines" and
+    // reuses the same confirm modal "Complete All" already shows,
+    // scoped to just the selection (see openSelectedLinesModal()).
+    selectedTaskDetailIds: new Set(),
     storageLocations: null, // Set of valid location strings once preloaded, see preloadStorageLocations()
     adjustmentReasonCodes: null, // [{key,value}] once preloaded, see preloadAdjustmentReasonCodes()
     pickReasonCodes: null, // [{key,value}] once preloaded, see preloadPickReasonCodes()
@@ -40,12 +48,15 @@
     // line" for cycle count really means "select a location."
     selectedCycleCountGroupKey: null,
     // Pick row selection is tracked separately from
-    // state.selectedTaskDetailId (2026-08-10, thirteenth session) — a
+    // state.selectedTaskDetailIds (2026-08-10, thirteenth session) — a
     // split line (see pickSplits below) means one taskDetailId can now
     // render as more than one row, so taskDetailId alone is no longer
     // a unique row identifier the way resolve_search_multi() documents
-    // for the rest of this file. See getPickRows()'s `splitId`.
-    selectedPickSplitId: null,
+    // for the rest of this file. See getPickRows()'s `splitId`. A Set,
+    // not a single value (2026-08-10, multi-select) — same toggle/
+    // relabel/reuse-the-Complete-All-modal model as Putaway's own
+    // selectedTaskDetailIds, see that field's docstring.
+    selectedPickSplitIds: new Set(),
     // taskDetailId -> [{splitId, quantity}, ...] (2026-08-10) — only
     // present once a line has been explicitly split via splitPickRow();
     // absent means "render as one row covering the full line," the
@@ -188,6 +199,7 @@
     pickLinesBody: document.getElementById("pickLinesBody"),
     addToteBtn: document.getElementById("addToteBtn"),
     fullLineBtn: document.getElementById("fullLineBtn"),
+    fullLineBtnLabel: document.getElementById("fullLineBtnLabel"),
     allLinesBtn: document.getElementById("allLinesBtn"),
     actionStatus: document.getElementById("actionStatus"),
     allLinesList: document.getElementById("allLinesList"),
@@ -260,6 +272,18 @@
     const count = Number(n) || 0;
     const word = count === 1 ? singular : plural || singular + "s";
     return count + " " + word;
+  }
+
+  /**
+   * Shared between Putaway and Pick (2026-08-10, multi-select — Cycle
+   * Count keeps its own single-selection-by-location-group model,
+   * unchanged). "Complete Line" relabels to "Complete Lines" once 2+
+   * rows are toggled into the selection; back to singular at 0 or 1.
+   */
+  function setFullLineBtnLabel(selectedCount) {
+    if (el.fullLineBtnLabel) {
+      el.fullLineBtnLabel.textContent = selectedCount >= 2 ? "Complete Lines" : "Complete Line";
+    }
   }
 
   function escapeHtml(s) {
@@ -498,7 +522,12 @@
           <td></td>
           <td></td>
           <td class="col-group"></td>
-          <td>${escapeHtml(item.itemId)}</td>
+          <td>
+            <span class="item-cell">
+              ${itemImageCellHtml(item.itemImageUrl)}
+              <span>${escapeHtml(item.itemId)}</span>
+            </span>
+          </td>
           <td>${escapeHtml(item.description)}</td>
           <td></td>
           <td></td>
@@ -540,7 +569,12 @@
           <td>${escapeHtml(line.lineNumber)}</td>
           ${lpnCellHtml(line)}
           ${groupCellHtml(line)}
-          <td>${escapeHtml(line.itemId)}</td>
+          <td>
+            <span class="item-cell">
+              ${itemImageCellHtml(line.itemImageUrl)}
+              <span>${escapeHtml(line.itemId)}</span>
+            </span>
+          </td>
           <td>${escapeHtml(line.description)}</td>
           <td>${escapeHtml(line.fromLocationId)}</td>
           ${toLocationCellHtml(line)}
@@ -568,7 +602,7 @@
   }
 
   function renderGroups() {
-    state.selectedTaskDetailId = null;
+    state.selectedTaskDetailIds.clear();
     el.cycleCountLinesTable.style.display = "none";
     el.pickLinesTable.style.display = "none";
     el.linesTable.style.display = "";
@@ -928,23 +962,35 @@
     );
   }
 
+  function isLineReadyToComplete(line) {
+    return (
+      !!line &&
+      !isConsumedLine(line) &&
+      isLocationValid(line.taskDetailId) &&
+      isQtyValid(line) &&
+      isReasonValid(line)
+    );
+  }
+
   function updateLineActionButtons() {
-    const selectedLine = getSelectedLine();
-    const hasSelection = !!selectedLine;
-    const selectedValid =
-      hasSelection &&
-      !isConsumedLine(selectedLine) &&
-      isLocationValid(selectedLine.taskDetailId) &&
-      isQtyValid(selectedLine) &&
-      isReasonValid(selectedLine);
-    el.fullLineBtn.disabled = !hasSelection || !selectedValid;
+    const selectedLines = getSelectedLines();
+    setFullLineBtnLabel(selectedLines.length);
+    el.fullLineBtn.disabled = !selectedLines.length || !selectedLines.every(isLineReadyToComplete);
     el.allLinesBtn.disabled = !allOutstandingLinesValid();
   }
 
+  /**
+   * Plain click toggles membership (2026-08-10, multi-select) — no
+   * modifier key needed. Clicking an already-selected line deselects
+   * just that one; clicking a new one adds to whatever's already
+   * selected, rather than replacing it the way single-select used to.
+   */
   function selectLine(taskDetailId) {
-    state.selectedTaskDetailId = taskDetailId;
+    const id = String(taskDetailId);
+    if (state.selectedTaskDetailIds.has(id)) state.selectedTaskDetailIds.delete(id);
+    else state.selectedTaskDetailIds.add(id);
     el.linesBody.querySelectorAll("tr.line-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
+      row.classList.toggle("selected", state.selectedTaskDetailIds.has(row.dataset.taskDetailId));
     });
     updateLineActionButtons();
   }
@@ -958,8 +1004,8 @@
   // reason code, no remaining-quantity concept, and no confirm-warning
   // modal (a quantity-mismatch warning is auto-overridden server-side —
   // see task_service.complete_cycle_count_line()). Reuses
-  // state.groups/allLines()/state.selectedTaskDetailId/
-  // getLineByTaskDetailId() as-is — a taskDetailId is unique regardless
+  // state.groups/allLines()/getLineByTaskDetailId() as-is — a
+  // taskDetailId is unique regardless
   // of mode, and the two modes are never loaded at the same time (see
   // classifySearchInput()).
   // ---------------------------------------------------------------------
@@ -998,13 +1044,16 @@
           <td>${isSubRow ? "" : escapeHtml(line.lineNumber)}</td>
           <td>${isSubRow ? "" : escapeHtml(line.locationId) + cycleCountLockIconHtml(line.taskDetailId, line.locationLocked)}</td>
           <td>
-            <input
-              type="text"
-              class="form-control cc-item-input"
-              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
-              value="${escapeAttr(line.itemId)}"
-              autocomplete="off"
-            />
+            <span class="item-cell">
+              ${itemImageCellHtml(line.itemImageUrl)}
+              <input
+                type="text"
+                class="form-control cc-item-input"
+                data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+                value="${escapeAttr(line.itemId)}"
+                autocomplete="off"
+              />
+            </span>
           </td>
           <td><div class="col-desc-narrow" title="${escapeAttr(line.description)}">${escapeHtml(line.description)}</div></td>
           <td class="col-qty-wide">
@@ -1734,9 +1783,20 @@
     }
   }
 
+  function getSelectedLines() {
+    return Array.from(state.selectedTaskDetailIds)
+      .map((id) => getLineByTaskDetailId(id))
+      .filter(Boolean);
+  }
+
+  /** The single selected line, or null when 0 or 2+ are selected (see
+   * getSelectedLines()) — completeLine() only ever gets called for the
+   * 0-or-1 case, the 2+ case routes to openSelectedLinesModal()
+   * instead, so returning null here for 2+ is a safe, unreachable-in-
+   * practice fallback rather than a real behavior. */
   function getSelectedLine() {
-    if (state.selectedTaskDetailId === null) return null;
-    return getLineByTaskDetailId(state.selectedTaskDetailId);
+    const lines = getSelectedLines();
+    return lines.length === 1 ? lines[0] : null;
   }
 
   function remainingQty(line) {
@@ -1959,19 +2019,9 @@
 
   let allLinesPending = [];
 
-  /**
-   * Spans every group on screen (2026-08-08, per explicit instruction —
-   * "Complete All" means everything currently visible, not just one
-   * task/container).
-   */
-  function openAllLinesModal() {
+  function renderAllLinesModalList(pending) {
     const multiGroup = state.groups.length > 1;
-    allLinesPending = allLines().filter((l) => remainingQty(l) > 0);
-    if (!allLinesPending.length) {
-      setActionStatus("No outstanding lines to complete.", "");
-      return;
-    }
-    el.allLinesList.innerHTML = allLinesPending
+    el.allLinesList.innerHTML = pending
       .map((l) => {
         const groupPrefix = multiGroup
           ? (l.groupMode === "no_task" ? "Container " + l.groupContainerId : "Task " + l.groupTaskId) + " — "
@@ -1982,6 +2032,40 @@
         );
       })
       .join("");
+  }
+
+  /**
+   * Spans every group on screen (2026-08-08, per explicit instruction —
+   * "Complete All" means everything currently visible, not just one
+   * task/container).
+   */
+  function openAllLinesModal() {
+    allLinesPending = allLines().filter((l) => remainingQty(l) > 0);
+    if (!allLinesPending.length) {
+      setActionStatus("No outstanding lines to complete.", "");
+      return;
+    }
+    renderAllLinesModalList(allLinesPending);
+    allLinesModal.show();
+  }
+
+  /**
+   * Multi-select's "Complete Lines" (2026-08-10) — same modal, same
+   * confirmAllLines() submission loop as "Complete All", just scoped
+   * to the lines the user actually toggled on instead of every
+   * outstanding line. Selection itself isn't explicitly cleared here —
+   * confirmAllLines() already ends with reloadCurrentSearch(), a full
+   * re-fetch/re-render that resets state.selectedTaskDetailIds as a
+   * side effect (see renderGroups()), the same way it already reset
+   * the old single-select field before this feature existed.
+   */
+  function openSelectedLinesModal() {
+    allLinesPending = getSelectedLines().filter((l) => remainingQty(l) > 0);
+    if (!allLinesPending.length) {
+      setActionStatus("No outstanding lines to complete.", "");
+      return;
+    }
+    renderAllLinesModalList(allLinesPending);
     allLinesModal.show();
   }
 
@@ -2156,9 +2240,10 @@
   // (confirmed live: completing one doesn't require the others to be
   // addressed first, unlike Cycle Count's atomic multi-item locations),
   // so selection/completion is per-LINE like Putaway, not per-GROUP
-  // like Cycle Count — reuses state.selectedTaskDetailId/
-  // getLineByTaskDetailId() (already documented as globally unique
-  // across every group) rather than a new state field.
+  // like Cycle Count — see state.selectedPickSplitIds's own docstring
+  // for why Pick ended up with its own dedicated field instead of
+  // reusing Putaway's state.selectedTaskDetailIds directly (a split
+  // line's own splitId isn't the same thing as a taskDetailId).
   //
   // Locked down server-side (task_service._classify_pick_task()) to
   // `TaskExecutionMode: "PICK_INTO_OLPN"` tasks with every line sourced
@@ -2642,7 +2727,7 @@
    * completed rows and already-typed tote ids.
    */
   function renderPickGroups() {
-    state.selectedPickSplitId = null;
+    state.selectedPickSplitIds.clear();
     el.linesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "none";
     el.pickLinesTable.style.display = "";
@@ -2778,12 +2863,32 @@
     return gs.locked || gs.validated === true;
   }
 
+  /** Plain click toggles membership (2026-08-10, multi-select) — same
+   * model as Putaway's selectLine(), see its docstring. */
   function selectPickRow(splitId) {
-    state.selectedPickSplitId = splitId;
+    const id = String(splitId);
+    if (state.selectedPickSplitIds.has(id)) state.selectedPickSplitIds.delete(id);
+    else state.selectedPickSplitIds.add(id);
     el.pickLinesBody.querySelectorAll("tr.pick-line-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.splitId === String(splitId));
+      row.classList.toggle("selected", state.selectedPickSplitIds.has(row.dataset.splitId));
     });
     updatePickLineActionButtons();
+  }
+
+  function getSelectedPickRows() {
+    return Array.from(state.selectedPickSplitIds)
+      .map((id) => getPickRowBySplitId(id))
+      .filter(Boolean);
+  }
+
+  function isPickRowReadyToComplete(row) {
+    return (
+      !!row &&
+      !isPickRowDone(row.splitId) &&
+      isPickQtyValid(row.splitId) &&
+      isPickReasonValid(row.splitId) &&
+      isPickToteValid(row)
+    );
   }
 
   function outstandingPickRows() {
@@ -2791,16 +2896,9 @@
   }
 
   function updatePickLineActionButtons() {
-    const row = state.selectedPickSplitId ? getPickRowBySplitId(state.selectedPickSplitId) : null;
-    const hasSelection = !!row;
-    const selectedDone = hasSelection && isPickRowDone(row.splitId);
-    const selectedValid =
-      hasSelection &&
-      !selectedDone &&
-      isPickQtyValid(row.splitId) &&
-      isPickReasonValid(row.splitId) &&
-      isPickToteValid(row);
-    el.fullLineBtn.disabled = !hasSelection || !selectedValid;
+    const selectedRows = getSelectedPickRows();
+    setFullLineBtnLabel(selectedRows.length);
+    el.fullLineBtn.disabled = !selectedRows.length || !selectedRows.every(isPickRowReadyToComplete);
     const outstanding = outstandingPickRows();
     el.allLinesBtn.disabled =
       !outstanding.length ||
@@ -2881,8 +2979,10 @@
   }
 
   /**
-   * Commits one row (2026-08-10) — the selected splitId, per
-   * state.selectedPickSplitId. The backend commit always targets the
+   * Commits one row (2026-08-10) — only ever called for the 0-or-1-
+   * selected case; 2+ routes to openSelectedPickLinesModal() instead
+   * (same split as Putaway's completeLine()/openSelectedLinesModal()).
+   * The backend commit always targets the
    * row's real, shared taskDetailId (a split row's own splitId is a
    * frontend-only concept, never sent) with just this row's own
    * quantity and, for a tote-destined row, this row's *group's* tote
@@ -2894,7 +2994,8 @@
    * capability, just a new frontend way of driving an already-real one.
    */
   async function completePickRow() {
-    const row = state.selectedPickSplitId ? getPickRowBySplitId(state.selectedPickSplitId) : null;
+    const selectedRows = getSelectedPickRows();
+    const row = selectedRows.length === 1 ? selectedRows[0] : null;
     if (!row) return;
     if (isPickRowDone(row.splitId)) return;
     const qtyInput = getPickQtyInput(row.splitId);
@@ -2949,22 +3050,26 @@
 
   let allPickLinesPending = [];
 
-  function openAllPickLinesModal() {
-    allPickLinesPending = outstandingPickRows();
+  /** Shared by "Complete All" and multi-select's "Complete Lines"
+   * (2026-08-10) — `candidates` is either every outstanding row or
+   * just the selected ones; everything else (validation, the modal
+   * list, showing it) is identical either way. */
+  function preparePickLinesModal(candidates) {
+    allPickLinesPending = candidates;
     if (!allPickLinesPending.length) {
       setActionStatus("No outstanding lines to complete.", "");
       return;
     }
     if (!allPickLinesPending.every((r) => isPickQtyValid(r.splitId))) {
-      setActionStatus("Enter a Completed Qty for every line before completing all.", "error");
+      setActionStatus("Enter a Completed Qty for every line before completing.", "error");
       return;
     }
     if (!allPickLinesPending.every((r) => isPickReasonValid(r.splitId))) {
-      setActionStatus("Choose a Reason Code for every short-picked line before completing all.", "error");
+      setActionStatus("Choose a Reason Code for every short-picked line before completing.", "error");
       return;
     }
     if (!allPickLinesPending.every((r) => isPickToteValid(r))) {
-      setActionStatus("Enter and confirm a valid Tote Id for every tote-destined line before completing all.", "error");
+      setActionStatus("Enter and confirm a valid Tote Id for every tote-destined line before completing.", "error");
       return;
     }
     el.allLinesList.innerHTML = allPickLinesPending
@@ -2975,6 +3080,18 @@
       })
       .join("");
     allLinesModal.show();
+  }
+
+  function openAllPickLinesModal() {
+    preparePickLinesModal(outstandingPickRows());
+  }
+
+  /** Multi-select's "Complete Lines" for Pick (2026-08-10) — see
+   * Putaway's openSelectedLinesModal() for the equivalent; selection
+   * clearing likewise happens for free via renderPickGroups()'s own
+   * reset, reached through confirmAllPickLines()'s existing reload. */
+  function openSelectedPickLinesModal() {
+    preparePickLinesModal(getSelectedPickRows().filter((r) => !isPickRowDone(r.splitId)));
   }
 
   /**
@@ -3052,6 +3169,15 @@
       }
     }
     renderPickTaskMeta();
+    // Unlike Putaway, this doesn't end with a full reload/re-render
+    // (would lose split/drag/tote-in-progress state on other rows —
+    // see renderPickGroups()'s own docstring), so selection has to be
+    // cleared explicitly here rather than getting it for free the way
+    // Putaway's reloadCurrentSearch() does (2026-08-10, multi-select).
+    state.selectedPickSplitIds.clear();
+    el.pickLinesBody.querySelectorAll("tr.pick-line-row.selected").forEach((row) => {
+      row.classList.remove("selected");
+    });
     updatePickLineActionButtons();
     setBusy(false);
     setActionStatus(
@@ -3263,9 +3389,15 @@
   const reasonCodeModal = window.bootstrap ? new window.bootstrap.Modal(reasonCodeModalEl) : null;
 
   el.fullLineBtn.addEventListener("click", () => {
-    if (state.lastSearchMode === "cycle_count") completeCycleCountLine();
-    else if (state.lastSearchMode === "pick") completePickRow();
-    else completeLine();
+    if (state.lastSearchMode === "cycle_count") {
+      completeCycleCountLine();
+    } else if (state.lastSearchMode === "pick") {
+      if (state.selectedPickSplitIds.size >= 2) openSelectedPickLinesModal();
+      else completePickRow();
+    } else {
+      if (state.selectedTaskDetailIds.size >= 2) openSelectedLinesModal();
+      else completeLine();
+    }
   });
   el.allLinesBtn.addEventListener("click", () => {
     if (state.lastSearchMode === "cycle_count") openAllCycleCountLinesModal();
@@ -3332,6 +3464,14 @@
   }
 
   api("app_opened", {}).catch(() => {});
+
+  // Item image hover preview (2026-08-10) — bound once, on the shared
+  // container all three tables (Putaway/Cycle Count/Pick) live inside,
+  // rather than once per table; bindItemImagePreview() itself no-ops
+  // on a second call against the same container (see its own
+  // dataset.itemImagePreviewBound guard), so this is safe even if
+  // called again later.
+  if (window.bindItemImagePreview) window.bindItemImagePreview(el.resultsScreen);
 
   // URL boot: Organization/org auto-authenticates (Task deep-link is applied
   // inside authenticate() once auth completes, see applyUrlTaskBoot()).

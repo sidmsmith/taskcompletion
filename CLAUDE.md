@@ -3399,3 +3399,135 @@ synthetic `error` event dispatch on the `<img>` (a real broken-URL
 test didn't reliably trigger the browser's native `error` event within
 a short test window in this environment, so the fallback logic itself
 was verified this way instead).
+
+## Item thumbnails + hover on Putaway/Cycle Count, and multi-select on Putaway/Pick (2026-08-10, thirteenth session — resumed via a scheduled CronCreate job after usage reset)
+
+**Item thumbnails extended app-wide, per explicit instruction** ("add
+the image logic to all of the screens as part of the next update").
+`itemImageUrl` now flows into Putaway's `_normalize_task_lines()`
+(the main Task-mode line builder), Cycle Count's
+`resolve_cycle_count_location()`, and — for completeness —
+`resolve_search()`'s no-task/MIXED-container branch (both the single-
+item and mixed_items[] cases, plus the consumed-iLPN history
+fallback), all using the same `ImageUrl`/`imageUrl`/`ImageURL`
+defensive casing fallback already established for Pick. Frontend reuse
+was direct — `itemImageCellHtml()` (declared in the Pick section)
+is callable from `renderLineRow()`/`cycleCountLineRowHtml()` even
+though they're defined earlier in the file, since everything shares
+one enclosing IIFE (plain function-declaration hoisting, no code
+motion needed). One real layout wrinkle: Cycle Count's Item cell is an
+*editable text input*, not a plain label — the shared `.cc-item-input`
+rule's `width:100%` fought `.item-cell`'s flex sizing once a thumbnail
+sat next to it; fixed with a scoped `.item-cell .cc-item-input`
+override (`width:auto; flex:1 1 auto`) that leaves the base rule
+untouched for cc-item-input's other (non-thumbnail) uses.
+
+**Hover-to-zoom preview ported verbatim from receivingworkbench**
+(`public/item-image-preview.js`, `bindItemImagePreview()`) and bound
+**once**, generically, on `el.resultsScreen` — the shared container all
+three tables (Putaway/Cycle Count/Pick) live inside — rather than once
+per table, so it automatically covers all three (and any future
+table) without needing a separate binding call per screen. Confirmed
+live via a simulated `mouseenter` dispatch: the floating preview
+element appears, unhidden, with the correct full-size image URL.
+
+**Multi-select line completion — Putaway and Pick, per explicit
+instruction** ("should we allow multiple line selection?... Complete
+Line text changes to Complete Lines"). Cycle Count deliberately
+untouched — it already selects by *location group* (atomic multi-item
+completion), a different granularity than per-line selection, treated
+as a separate future consideration rather than folded in here.
+
+- **Selection model**: `state.selectedTaskDetailIds`/
+  `state.selectedPickSplitIds` — both changed from a single nullable
+  value to a `Set`. Plain click **toggles** membership (no modifier
+  key) — click line 1 selects it, click line 2 adds it, clicking an
+  already-selected line deselects just that one. This replaces the old
+  single-select-replace behavior entirely, per explicit instruction,
+  not just when 2+ end up selected.
+- **`el.fullLineBtnLabel`** (a `<span>` now wrapping the button's text,
+  `index.html`) — `setFullLineBtnLabel(count)` is the one shared
+  helper both `updateLineActionButtons()` (Putaway) and
+  `updatePickLineActionButtons()` (Pick) call: "Complete Line" at 0 or
+  1 selected, "Complete Lines" at 2+.
+- **0–1 selected**: unchanged existing behavior — `completeLine()`/
+  `completePickRow()` fire immediately, no confirmation modal.
+- **2+ selected**: routes to `openSelectedLinesModal()`/
+  `openSelectedPickLinesModal()` instead — **reuses the exact same
+  confirmation modal "Complete All" already shows** (same
+  `#allLinesModal`, same list markup), just scoped to the selected
+  subset. Extracted the shared list-rendering (`renderAllLinesModalList()`
+  for Putaway, `preparePickLinesModal()` for Pick, which also folds in
+  Pick's existing qty/reason/tote validation checks) so "Complete All"
+  and the new selection-scoped variant share one code path rather than
+  duplicating the modal-building logic — `confirmAllLines()`/
+  `confirmAllPickLines()` themselves needed **no changes at all**, since
+  they just operate on whatever's sitting in the existing
+  `allLinesPending`/`allPickLinesPending` module variable regardless of
+  how it was populated.
+- **Selection clears after a multi-line action, per explicit
+  instruction** — but the *mechanism* differs by mode, confirmed live
+  by reading each path rather than assuming symmetry: Putaway's
+  `confirmAllLines()` already ended with a full `reloadCurrentSearch()`
+  (a real re-fetch/re-render) even before this feature existed, and
+  `renderGroups()` already reset the selection field at the top — so
+  clearing happens "for free," no new code needed there. Pick's
+  `confirmAllPickLines()` deliberately does **not** do a full reload
+  (would lose other rows' in-progress split/drag/tote state — see
+  `renderPickGroups()`'s own docstring), so it needed an *explicit*
+  `state.selectedPickSplitIds.clear()` added at the end, with a direct
+  DOM class removal alongside it since no re-render was going to do it
+  automatically.
+- **`getSelectedLine()`/`getSelectedLines()`** (Putaway) and the
+  Pick-side equivalents — `getSelectedLine()` now returns the single
+  line only when exactly one is selected (`null` for 0 or 2+, since
+  the 2+ case is routed to the modal path instead and never calls it) —
+  kept as a thin wrapper over the new plural `getSelectedLines()`
+  rather than rewriting every call site that only ever cared about the
+  singular case.
+
+**Confirmed end-to-end through the real browser UI, both modes, and
+one genuine (pre-existing, not introduced by this feature) partial-
+failure case surfaced along the way:**
+- **Putaway** (`IBPWIBPT0032`, 3 lines): selected lines 1+2 (toggle
+  confirmed: click 1, click 2 → both selected + "Complete Lines";
+  click 1 again → back to 1 selected + "Complete Line"), re-selected
+  both, confirmed via the modal (correctly listed only lines 1+2, not
+  line 3), submitted. Result: **"Completed 1 of 2 lines"** — line 2
+  failed with `"Task Management returned a different line (...) than
+  the one selected (...) — not completing it"`. This is an existing
+  safety check in `completeLineWithWarningHandling()`'s fetch-then-
+  commit flow (Putaway's own "fetch next move" step can return a
+  different TaskDetail than requested — a real MAWM task-detail-
+  ordering quirk, not something this session's changes caused),
+  exercised for the first time via the multi-select path and confirmed
+  to behave exactly as it should: independently re-verified via a
+  fresh `search_task()` that line 1 genuinely closed
+  (`CompletedQuantity: 5.0/5.0`, `Status: "8000"`) while line 2
+  genuinely did not (`CompletedQuantity: 0.0/10.0`, `Status: "1000"`,
+  completely untouched) — no partial/corrupted commit, the safety
+  check did exactly its job, and the partial-failure reporting +
+  selection-clearing both worked correctly around it.
+- **Pick** (`PICK0593`, 2 lines, plain oLPN, no totes/splits involved):
+  selected both, confirmed via the modal, submitted — both completed
+  cleanly this time, task auto-closed. Independently re-verified:
+  both `TaskDetail` rows `Status: "8000"`, quantities matching exactly.
+- **Thumbnails**: confirmed live on a real Putaway task
+  (`IBPWIBPT0032`) — 3 distinct real Cloudinary image URLs rendered
+  correctly (verified via `img.src` directly, not just visually, since
+  the small 2rem thumbnails are hard to judge from a screenshot at
+  reduced resolution).
+- **Add Tote button alignment**: `margin-top: 1.55rem` (tuned against
+  a live zoomed screenshot on `PICK0732`, not computed blind) reads as
+  correctly centered on the Complete Line/Complete All icon circles,
+  not the icon+label column's full height.
+
+**Browser automation note, not a real app bug, seen again this
+session**: a couple of `screenshot`/`zoom` calls returned a garbled/
+tiled render (the same page content repeated in a grid) or a CDP
+timeout — recovered by retrying the same call or navigating fresh.
+Consistent with this session's already-documented browser-automation
+flakiness; DOM-level checks (`querySelector`, reading `.className`/
+`.textContent`/element properties directly) were used as the primary
+verification method throughout this round specifically because of it,
+with screenshots only for a final visual sanity check.
