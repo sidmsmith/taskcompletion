@@ -2111,6 +2111,47 @@
         </tr>`;
   }
 
+  /**
+   * A full-width divider row shown once per distinct oLPN before its
+   * own lines (2026-08-10, per explicit instruction — a single
+   * PICK_INTO_OLPN task can span multiple distinct oLPNs, confirmed
+   * live this session with real examples, not just a hypothetical
+   * pick-cart concern). No confirmed oLPN status-code label mapping
+   * exists yet (see task_service._resolve_pick_task()'s docstring) —
+   * statusBadgeHtml(null, status) shows the raw code in a badge rather
+   * than guessing at a translation.
+   */
+  function pickOlpnHeaderRowHtml(olpnId, status) {
+    return `
+        <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(olpnId)}">
+          <td colspan="8">
+            <strong>oLPN</strong> ${escapeHtml(olpnId)}
+            <span class="pick-olpn-status">${status ? statusBadgeHtml(null, status) : ""}</span>
+          </td>
+        </tr>`;
+  }
+
+  /**
+   * Refreshes one oLPN's status badge in place after a completion
+   * (2026-08-10) — confirmed live an oLPN's own status can change the
+   * moment a line commits (e.g. "1000" -> "7200"), same reasoning as
+   * the task-status live-update fix earlier this session. Updates both
+   * the DOM (no full re-render needed) and state.groups so a later
+   * reload/re-render still has the right value.
+   */
+  function updatePickOlpnStatus(olpnId, status) {
+    if (!olpnId) return;
+    state.groups.forEach((g) => {
+      if (g.olpnStatuses && g.olpnStatuses[olpnId] !== undefined) {
+        g.olpnStatuses[olpnId] = { status };
+      }
+    });
+    const header = el.pickLinesBody.querySelector(
+      'tr.pick-olpn-header[data-olpn-id="' + CSS.escape(String(olpnId)) + '"] .pick-olpn-status'
+    );
+    if (header) header.innerHTML = status ? statusBadgeHtml(null, status) : "";
+  }
+
   function renderPickTaskMeta() {
     const groups = state.groups;
     if (groups.length === 1) {
@@ -2127,13 +2168,42 @@
     }
   }
 
+  /**
+   * Grouped by oLPN, not one flat line list (2026-08-10, per explicit
+   * instruction) — each distinct oLPN gets its own header row (id +
+   * status) followed by just its own lines, so a multi-oLPN task (or,
+   * later, a pick-cart task with many more) reads as separate sections
+   * rather than one undifferentiated table. Line ordering within each
+   * oLPN follows the order lines already came back in (task-detail
+   * sequence), not re-sorted.
+   */
   function renderPickGroups() {
     state.selectedTaskDetailId = null;
     el.linesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "none";
     el.pickLinesTable.style.display = "";
     renderPickTaskMeta();
-    el.pickLinesBody.innerHTML = allLines().map((line) => pickLineRowHtml(line)).join("");
+
+    const olpnKeys = [];
+    const byOlpn = new Map();
+    allLines().forEach((line) => {
+      const key = line.olpnId || "";
+      if (!byOlpn.has(key)) {
+        byOlpn.set(key, []);
+        olpnKeys.push(key);
+      }
+      byOlpn.get(key).push(line);
+    });
+    el.pickLinesBody.innerHTML = olpnKeys
+      .map((olpnId) => {
+        const groupLines = byOlpn.get(olpnId);
+        const owningGroup = state.groups.find((g) => g.taskId === groupLines[0].groupTaskId);
+        const status =
+          owningGroup && owningGroup.olpnStatuses ? (owningGroup.olpnStatuses[olpnId] || {}).status : "";
+        const header = olpnId ? pickOlpnHeaderRowHtml(olpnId, status) : "";
+        return header + groupLines.map((line) => pickLineRowHtml(line)).join("");
+      })
+      .join("");
     updatePickLineActionButtons();
   }
 
@@ -2239,6 +2309,7 @@
         });
         renderPickTaskMeta();
       }
+      if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus);
       updatePickLineActionButtons();
     } catch (e) {
       setPickResultCell(line.taskDetailId, e.message || String(e), "error", false);
@@ -2264,7 +2335,7 @@
       .map((l) => {
         const qtyInput = getPickQtyInput(l.taskDetailId);
         const qty = qtyInput ? qtyInput.value : l.plannedQuantity;
-        return `<li>Line ${escapeHtml(l.lineNumber)} — ${escapeHtml(l.itemId)}: ${escapeHtml(qty)}</li>`;
+        return `<li>Line ${escapeHtml(l.lineNumber)} — ${escapeHtml(l.itemId)}: ${escapeHtml(qty)} ${escapeHtml(l.uomTypeId)}</li>`;
       })
       .join("");
     allLinesModal.show();
@@ -2311,6 +2382,7 @@
         });
         (response.results || []).forEach((r) => {
           setPickResultCell(r.taskDetailId, pickResultText(r), pickResultKind(r), r.success);
+          if (r.olpnId) updatePickOlpnStatus(r.olpnId, r.olpnStatus);
           if (r.success) succeeded++;
           else failures.push("Line " + r.taskDetailId + ": " + (r.error || "failed"));
         });

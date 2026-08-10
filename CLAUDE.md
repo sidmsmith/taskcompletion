@@ -2440,3 +2440,58 @@ Putaway. Worth revisiting **only** if the iLPN/full-container
 `PPK::0513` mystery above is still unresolved and everything else is
 exhausted — a completely different code path might not hit the same
 bug — but not pursued now.
+
+## Picking: grouped by oLPN, live oLPN status (2026-08-10, eleventh session)
+
+Real example (`PICK1907`, from the mobile HAR capture) confirmed a
+`PICK_INTO_OLPN` task can span **multiple distinct oLPNs across its
+own lines** — not just a `PICK_INTO_CART` concern as first assumed.
+Per explicit instruction, the Pick table now groups lines by oLPN
+instead of showing one flat list — a full-width divider row (oLPN id +
+status badge) precedes each oLPN's own lines, mirroring Cycle Count's
+existing MIXED-row pattern (one table, grouped rows) rather than
+building genuinely separate `<table>` elements. Confirmed live:
+`PICK0295` (4 lines, 4 distinct oLPNs) correctly rendered as 4
+separate one-line groups.
+
+**No confirmed oLPN status-code label mapping exists** (unlike
+Task/iLPN, which both already have one) — the badge shows the raw
+code (e.g. `"1000"` before picking, `"7200"` once fully picked,
+confirmed live) rather than guessing at a translation.
+
+**Live status bug found and fixed the same session**: the oLPN status
+badge only reflected its value at search time — after completing a
+line, the real oLPN status changes (confirmed live, `"1000"` →
+`"7200"`) but the badge stayed stale until a manual reload, same class
+of bug as the task-status live-update fix from the tenth session.
+Fixed: `complete_pick_line()` now also re-fetches the completed line's
+own oLPN status (`search_olpn()`, best-effort — a lookup failure
+doesn't fail the completion result) and returns it as `olpnId`/
+`olpnStatus`; the frontend's new `updatePickOlpnStatus()` applies it
+in place to both the DOM badge and `state.groups[...].olpnStatuses`,
+called from both `completePickLineAction()` and `confirmAllPickLines()`
+(the latter via each line result in `complete_pick_task()`'s own
+`results` array, which already threads through `complete_pick_line()`
+per line).
+
+**Debugging note for future reference**: the first live test of this
+fix appeared to fail (badge stayed frozen) — turned out to be a stale
+browser tab still running the previous `app.js` from before the fix
+was saved to disk (static files don't hot-reload an already-open
+tab). A full page reload before retesting resolved it; not a real bug
+in the fix itself. Worth remembering next time a live-tested frontend
+change appears not to take effect.
+
+**Complete All modal now shows UOM**, per explicit instruction — was
+previously just `Line N — item: qty`, now `Line N — item: qty UOM`
+(e.g. `"Line 1 — 4000052: 8 PACK"`), confirmed live.
+
+**Also confirmed live, incidentally, while testing**: a genuine
+business-rule exception — attempting to pick more than the real
+on-hand at the source location correctly surfaced MAWM's own real
+error ("Pick will drive the inventory to negative") through this
+app's existing error-handling path, rather than crashing or showing a
+misleading success. Not a new code path — just confirms the
+already-built error surfacing works correctly for a real exception,
+even though exceptions are still explicitly out of scope for this
+feature's happy-path v1.

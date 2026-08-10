@@ -635,6 +635,22 @@ def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest:
     lines = _normalize_pick_lines(raw_task, items)
     olpn_ids = sorted({l["olpnId"] for l in lines if l["olpnId"]})
 
+    # A single PICK_INTO_OLPN task can span multiple distinct oLPNs
+    # (confirmed live this session, PICK1907/PICK0295 — not just a
+    # PICK_INTO_CART thing), so the frontend groups lines by oLPN and
+    # shows each one's own status — fetched here, one search_olpn()
+    # call per distinct oLPN (typically 1-4 per task, so looping is
+    # fine). No confirmed status-code label mapping exists for oLPNs
+    # yet (unlike Task/iLPN, which both have one) — raw code only,
+    # rather than guessing at a translation.
+    olpn_statuses: Dict[str, Dict[str, Any]] = {}
+    for olpn_id in olpn_ids:
+        try:
+            olpn = search_olpn(olpn_id, token, org, location=dest)
+        except Exception:  # noqa: BLE001
+            olpn = None
+        olpn_statuses[olpn_id] = {"status": str((olpn or {}).get("Status") or "")}
+
     return {
         "success": True,
         "mode": "pick",
@@ -646,6 +662,7 @@ def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest:
         "taskStatusLabel": task_status_description(_first(raw_task, "Status")),
         "taskTransactionId": str(_first(raw_task, "TransactionId") or ""),
         "olpnIds": olpn_ids,
+        "olpnStatuses": olpn_statuses,
         "lineCount": len(lines),
         "lines": lines,
     }
@@ -2659,6 +2676,22 @@ def complete_pick_line(
     completed_qty = _dec(line.get("CompletedQuantity") or 0)
     planned_qty = _dec(line.get("Quantity") or 0)
     line_status = str(line.get("Status") or "")
+
+    # The oLPN's own status can also change the moment a line commits
+    # (confirmed live, 2026-08-10: an oLPN went from "1000" to "7200"
+    # once its one line was picked) — the frontend's group header shows
+    # this per oLPN (see _resolve_pick_task()'s olpnStatuses), so it
+    # needs a fresh read here too, the same reasoning as taskStatus
+    # above. Best-effort — a lookup failure shouldn't fail the whole
+    # completion result.
+    olpn_status = ""
+    if olpn_id:
+        try:
+            olpn = search_olpn(olpn_id, token, org, location=dest)
+        except Exception:  # noqa: BLE001
+            olpn = None
+        olpn_status = str((olpn or {}).get("Status") or "")
+
     return {
         "success": line_status == "8000",
         "taskId": task_id,
@@ -2669,6 +2702,8 @@ def complete_pick_line(
         "error": None if line_status == "8000" else f"Line not completed (status: {line_status})",
         "taskStatus": str(task.get("Status") or "") if task else "",
         "taskStatusLabel": task_status_description(task.get("Status")) if task else "",
+        "olpnId": olpn_id,
+        "olpnStatus": olpn_status,
     }
 
 
