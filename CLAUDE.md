@@ -3308,3 +3308,94 @@ hint states (mixed input, cycle count, plain task) are unchanged, just
 still there once something's actually typed. `loadTaskBtn`'s label
 changed from "Load Task" to "Confirm," including the 3 other places in
 `matchHint`'s own text that named the button by its old label.
+
+## Picking: live tote validation, split icon, item thumbnails (2026-08-10, thirteenth session)
+
+**Tote validation, per explicit instruction** ("we should probably add
+a tote validation routine to ensure that someone enters a valid tote
+number"). Two real, distinct checks, confirmed live before any UI
+work:
+
+- **A user-supplied real API**:
+  `GET {host}/dmui-facade/api/dmui-facade/dmmobile-facade/services/rest/workflow/validateBarcode?barcodeTypes=Tote&scannedValue=...`
+  — `mawm_client.validate_barcode()`. Confirmed live the response
+  shape is genuinely ambiguous by HTTP status alone: **every** case
+  returns `200` — a valid barcode's body is a bare `{}` (not an empty
+  string, an empty JSON object), an invalid one carries
+  `messages.Message[].Type == "ERROR"` (e.g. `Code: "90001"`,
+  `Description: "Invalid Barcode"`). Only the body shape distinguishes
+  them.
+- **Confirmed live the format check is lenient on characters, strict
+  on length** — `"!!bad##"` (7 chars) passed, a single character
+  (`"A"`) and empty string both failed. Not a rule this app invented
+  or needs to second-guess; `validate_barcode()` just passes MAWM's
+  own verdict through.
+- **Reuse check comes first**: `task_service.validate_pick_tote_id()`
+  calls the already-existing `search_ilpn_current_location()` before
+  ever calling `validate_barcode()` — if the id already exists as a
+  real iLPN, its own `Status` decides reusability
+  (`mawm_client.ILPN_REUSABLE_STATUSES = {"9000", "10000", "11000"}`
+  — Consumed/Lost/Canceled, per explicit instruction: "they would need
+  to be in Consumed or above status"); anything less
+  (Allocated/Partially Allocated/etc.) means it's actively holding
+  someone else's real inventory right now and is rejected. Confirmed
+  live against a real in-use tote from earlier testing
+  (`TOTE0700001`, status Allocated) → correctly rejected with
+  `"Tote TOTE0700001 is already in use (status: Allocated)"`; a
+  brand-new id → confirmed valid via the barcode check; an existing
+  reusable one is not yet live-tested (none of this session's test
+  totes have ever reached Consumed) — the code path is exercised by
+  the reuse-check branch's logic and the two other branches, but that
+  exact status transition hasn't been observed firsthand yet.
+
+**Frontend**: `/api/validate_pick_tote` → `scheduleToteValidation()`
+— 1s debounce per tote group (own timer per groupKey, same pattern as
+Putaway's existing `validateLocation()`), red text/border while
+invalid or unconfirmed, a `"Checking…"` state while the request is in
+flight, normal styling only once `validated === true`. **Complete
+Line/Complete All are now gated on confirmed-valid, not just a
+non-empty box** (`isPickToteValid()` tightened) — the whole point of
+adding this was to stop a bad tote id from ever reaching a commit, not
+just to show a red hint. A locked group (already committed at least
+once) is always treated as valid regardless of `validated`, since it
+already proved itself via a real commit — never re-validated.
+Confirmed live: typing `"A"` → red + "Invalid Barcode" + buttons
+disabled; a fresh id → confirmed valid + buttons enabled; the known
+in-use tote → red + the real "already in use" message. Completed a
+full task end-to-end afterward with a confirmed-valid tote —
+independently re-verified against the backend, all 3 lines closed,
+inventory landed correctly in the new tote.
+
+**Split icon swapped**, per direct feedback the previous one
+(`fa-code-branch`) "looks like a USB symbol." Replaced with a small
+custom inline SVG (`PICK_SPLIT_ICON_SVG`) — up arrow / bar / down
+arrow, `fill="currentColor"` so it follows the button's own color —
+rather than hunting for an exact FontAwesome match to the reference
+image the user provided.
+
+**Item thumbnails, Picking only for now** (per explicit instruction —
+"most likely will add it to our other screens as well"), mirroring
+receivingworkbench's own pattern exactly: `mawm_client.search_items()`
+Template gained `ImageUrl`; `task_service._normalize_pick_lines()`
+exposes `itemImageUrl` with the same defensive
+`ImageUrl`/`imageUrl`/`ImageURL` casing fallback that project's
+`rw_service.py` uses (the casing isn't 100% consistent across
+responses); `app.js` `itemImageCellHtml()` and the `.item-cell`/
+`.item-image-wrap`/`.item-image-thumb`/`.item-image-wrap--empty`
+markup/CSS are near-identical ports. One deliberate improvement over
+the source: a broken/unreachable (non-empty but failing) `imageUrl`
+now falls back to the same empty-state look instead of the browser's
+default broken-image icon, via a capture-phase `error` listener on
+`el.pickLinesBody` (`error` doesn't bubble on `<img>`, so this is the
+one delegated listener in this section that isn't on the bubble
+phase) — receivingworkbench's own version doesn't have this fallback.
+Not ported: receivingworkbench's hover-to-zoom preview
+(`item-image-preview.js`) — out of scope for this pass, flagged as a
+nice-to-have if wanted later. Confirmed live against `PICK0679`: all 3
+items rendered real thumbnails (a maroon polo, a soft-wash shirt, a
+red rugby shirt) — the `--empty` "—" fallback wasn't exercised by this
+particular task's items, but was confirmed separately via a direct
+synthetic `error` event dispatch on the `<img>` (a real broken-URL
+test didn't reliably trigger the browser's native `error` event within
+a short test window in this environment, so the fallback logic itself
+was verified this way instead).

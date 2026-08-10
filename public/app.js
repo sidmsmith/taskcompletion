@@ -2217,6 +2217,49 @@
    * destination is already fixed by the task data, nothing to split or
    * move.
    */
+
+  // Custom inline SVG, not a FontAwesome icon (2026-08-10) — the
+  // previous fa-code-branch read as a USB symbol at this size, per
+  // explicit feedback. Up arrow / bar / down arrow, echoing the
+  // reference image the user provided — "one line, splitting apart in
+  // two directions." `fill="currentColor"` so it follows
+  // .pick-split-btn's own `color` (hover/etc. all work for free).
+  const PICK_SPLIT_ICON_SVG =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">' +
+    '<polygon points="12,1 17,7 7,7" />' +
+    '<rect x="10" y="6" width="4" height="4" />' +
+    '<rect x="6" y="11" width="12" height="2" rx="1" />' +
+    '<rect x="10" y="14" width="4" height="4" />' +
+    '<polygon points="12,23 7,17 17,17" />' +
+    "</svg>";
+
+  /**
+   * Item thumbnail (2026-08-10) — same `.item-image-wrap`/
+   * `.item-image-thumb`/`.item-image-wrap--empty` markup and CSS as
+   * receivingworkbench's own `itemImageCellHtml()`, so this reads
+   * identically if both apps are ever open side by side. Picking-only
+   * for now per explicit instruction ("we can do this now for picking
+   * only but most likely will add it to our other screens as well") —
+   * Putaway/Cycle Count don't call this yet. Unlike
+   * receivingworkbench's version, a broken/unreachable `imageUrl`
+   * (non-empty but the image itself 404s) falls back to the same
+   * empty-state look instead of the browser's default broken-image
+   * icon — see the delegated `error`-event listener (capture phase,
+   * since `error` doesn't bubble) near the bottom of this section.
+   */
+  function itemImageCellHtml(imageUrl) {
+    if (imageUrl) {
+      return (
+        '<span class="item-image-wrap item-image-wrap--inline" data-image-url="' +
+        escapeAttr(imageUrl) +
+        '"><img class="item-image-thumb" src="' +
+        escapeAttr(imageUrl) +
+        '" alt="" loading="lazy" /></span>'
+      );
+    }
+    return '<span class="item-image-wrap item-image-wrap--empty">—</span>';
+  }
+
   function pickLineRowHtml(row) {
     const isDone = isPickRowDone(row.splitId);
     const tracked = state.pickRowStatus[row.splitId];
@@ -2226,7 +2269,12 @@
         <tr class="pick-line-row line-row" data-split-id="${escapeAttr(row.splitId)}" data-task-detail-id="${escapeAttr(row.taskDetailId)}" ${canSplitOrDrag ? 'draggable="true"' : ""}>
           <td class="col-line">${escapeHtml(row.lineNumber)}</td>
           <td class="col-loc">${escapeHtml(row.sourceLocationId)}</td>
-          <td class="col-item">${escapeHtml(row.itemId)}</td>
+          <td class="col-item">
+            <span class="item-cell">
+              ${itemImageCellHtml(row.itemImageUrl)}
+              <span>${escapeHtml(row.itemId)}</span>
+            </span>
+          </td>
           <td><div class="col-desc-narrow" title="${escapeAttr(row.description)}">${escapeHtml(row.description)}</div></td>
           <td class="col-qty-wide">${escapeHtml(row.plannedQuantity)}</td>
           <td class="col-uom">${escapeHtml(row.uomTypeId)}</td>
@@ -2242,7 +2290,7 @@
             />
           </td>
           <td class="col-split">
-            ${canSplitOrDrag ? `<button type="button" class="pick-split-btn" data-split-id="${escapeAttr(row.splitId)}" title="Split this line across totes"><i class="fas fa-code-branch"></i></button>` : ""}
+            ${canSplitOrDrag ? `<button type="button" class="pick-split-btn" data-split-id="${escapeAttr(row.splitId)}" title="Split this line across totes">${PICK_SPLIT_ICON_SVG}</button>` : ""}
           </td>
           <td class="col-reason">
             <select class="form-select reason-code-select invalid" data-split-id="${escapeAttr(row.splitId)}">
@@ -2372,7 +2420,20 @@
    * in-place (e.g. `getToteGroupState(key).value = "..."`). */
   function getToteGroupState(groupKey) {
     if (!state.toteGroupState[groupKey]) {
-      state.toteGroupState[groupKey] = { value: "", locked: false, status: "", statusLabel: "" };
+      state.toteGroupState[groupKey] = {
+        value: "",
+        locked: false,
+        status: "",
+        statusLabel: "",
+        // Live validation (2026-08-10) — see scheduleToteValidation().
+        // `validated` is `null` (unknown/not yet checked) until a real
+        // check resolves; `true`/`false` after. Resets to `null`
+        // whenever the value changes, so a stale confirmation from a
+        // previous value can never be mistaken for the current one.
+        validated: null,
+        validating: false,
+        validationMessage: "",
+      };
     }
     return state.toteGroupState[groupKey];
   }
@@ -2429,18 +2490,25 @@
     const slotLabel = pickOlpnSlotLabel(info.slotId);
     if (info.kind === "tote") {
       const hasValue = !!(info.value && info.value.trim());
+      // Not locked yet: invalid until a real check confirms it (empty,
+      // still checking, or confirmed bad all render red — only
+      // `validated === true` clears it). Locked (already committed):
+      // always fine, it already proved itself via a real commit.
+      const isInvalid = !info.locked && (!hasValue || info.validated !== true);
+      const message = info.locked ? "" : info.validating ? "Checking…" : info.validationMessage || "";
       return `
         <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="10">
             <strong>TOTE</strong>
             <input
               type="text"
-              class="form-control tote-id-input${hasValue ? "" : " invalid"}"
+              class="form-control tote-id-input${isInvalid ? " invalid" : ""}${info.validating ? " checking" : ""}"
               data-group-key="${escapeAttr(groupKey)}"
               placeholder="Enter tote id"
               value="${escapeAttr(info.value || "")}"
               ${info.locked ? "disabled" : ""}
             />
+            <span class="tote-validation-msg">${escapeHtml(message)}</span>
             ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
             <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
@@ -2499,9 +2567,13 @@
    */
   function updatePickToteStatus(groupKey, toteId, status, statusLabel) {
     if (!groupKey) return;
+    clearTimeout(toteValidateTimers[groupKey]);
     const gs = getToteGroupState(groupKey);
     gs.value = toteId || gs.value;
     gs.locked = true;
+    gs.validated = true;
+    gs.validating = false;
+    gs.validationMessage = "";
     gs.status = status;
     gs.statusLabel = statusLabel;
     const header = el.pickLinesBody.querySelector(
@@ -2691,14 +2763,19 @@
     return !!(select && select.value);
   }
 
-  /** A tote-destined row requires its group's TOTE textbox to be
-   * filled in before it can complete (2026-08-10) — an oLPN-destined
-   * row always passes, since its container id is already known. Takes
-   * a row (not just a splitId) since it needs pickRowGroupKey(), which
-   * needs the row's own isToteDestined/plannedSlotId/olpnId fields. */
+  /** A tote-destined row requires its group's TOTE textbox to hold a
+   * *confirmed-valid* tote id before it can complete (2026-08-10,
+   * tightened from "just non-empty" once live validation was added —
+   * see scheduleToteValidation()) — an oLPN-destined row always
+   * passes, since its container id is already known. A locked group
+   * (already committed at least once) is always fine regardless of
+   * `validated`, since it already proved itself via a real commit.
+   * Takes a row (not just a splitId) since it needs pickRowGroupKey(),
+   * which needs the row's own isToteDestined/plannedSlotId/olpnId. */
   function isPickToteValid(row) {
     if (!row || !row.isToteDestined) return true;
-    return !!getToteGroupState(pickRowGroupKey(row)).value.trim();
+    const gs = getToteGroupState(pickRowGroupKey(row));
+    return gs.locked || gs.validated === true;
   }
 
   function selectPickRow(splitId) {
@@ -2887,7 +2964,7 @@
       return;
     }
     if (!allPickLinesPending.every((r) => isPickToteValid(r))) {
-      setActionStatus("Enter a Tote Id for every tote-destined line before completing all.", "error");
+      setActionStatus("Enter and confirm a valid Tote Id for every tote-destined line before completing all.", "error");
       return;
     }
     el.allLinesList.innerHTML = allPickLinesPending
@@ -2985,6 +3062,107 @@
     );
   }
 
+  /**
+   * Live tote validation (2026-08-10, per explicit instruction —
+   * "we should probably add a tote validation routine to ensure that
+   * someone enters a valid tote number"). Debounced 1s per group (own
+   * timer per groupKey, same pattern as validateLocation()'s
+   * per-input WeakMap, just keyed by string instead of element) so
+   * typing doesn't fire a real API call per keystroke. Two real checks
+   * happen server-side — see task_service.validate_pick_tote_id():
+   * does this id already exist as a real iLPN (only reusable once
+   * Consumed or "above"), or if not, is it at least a valid barcode
+   * format. Complete Line/Complete All are gated on
+   * `validated === true` (see isPickToteValid()), not just a
+   * non-empty value.
+   */
+  const toteValidateTimers = {};
+
+  function scheduleToteValidation(groupKey) {
+    clearTimeout(toteValidateTimers[groupKey]);
+    const gs = getToteGroupState(groupKey);
+    gs.validated = null;
+    gs.validationMessage = "";
+    if (!gs.value.trim()) {
+      gs.validating = false;
+      renderToteValidationState(groupKey);
+      updatePickLineActionButtons();
+      return;
+    }
+    gs.validating = true;
+    renderToteValidationState(groupKey);
+    toteValidateTimers[groupKey] = setTimeout(() => runToteValidation(groupKey), 1000);
+  }
+
+  async function runToteValidation(groupKey) {
+    const gs = getToteGroupState(groupKey);
+    const value = gs.value.trim();
+    if (!value) {
+      gs.validating = false;
+      renderToteValidationState(groupKey);
+      return;
+    }
+    try {
+      const result = await api("validate_pick_tote", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+        toteId: value,
+      });
+      // A later keystroke may have already superseded this response —
+      // don't let a stale check confirm/reject the wrong value.
+      if (getToteGroupState(groupKey).value.trim() !== value) return;
+      gs.validated = !!result.valid;
+      gs.validationMessage = result.valid ? "" : result.error || "Invalid tote";
+    } catch (e) {
+      if (getToteGroupState(groupKey).value.trim() !== value) return;
+      gs.validated = false;
+      gs.validationMessage = e.message || String(e);
+    }
+    gs.validating = false;
+    renderToteValidationState(groupKey);
+    updatePickLineActionButtons();
+  }
+
+  function renderToteValidationState(groupKey) {
+    const header = el.pickLinesBody.querySelector(
+      'tr.pick-tote-header[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
+    );
+    if (!header) return;
+    const gs = getToteGroupState(groupKey);
+    const input = header.querySelector(".tote-id-input");
+    if (input) {
+      const isInvalid = !gs.locked && (!gs.value.trim() || gs.validated !== true);
+      input.classList.toggle("invalid", isInvalid);
+      input.classList.toggle("checking", gs.validating);
+    }
+    let msg = header.querySelector(".tote-validation-msg");
+    if (!msg) {
+      msg = document.createElement("span");
+      msg.className = "tote-validation-msg";
+      header.querySelector("td").appendChild(msg);
+    }
+    msg.textContent = gs.locked ? "" : gs.validating ? "Checking…" : gs.validationMessage || "";
+  }
+
+  // `error` doesn't bubble on <img>, so this listens on the capture
+  // phase instead of the usual delegated-on-bubble pattern the rest of
+  // this file uses (2026-08-10, item thumbnails — see
+  // itemImageCellHtml()'s docstring).
+  el.pickLinesBody.addEventListener(
+    "error",
+    (e) => {
+      const img = e.target;
+      if (!img.classList || !img.classList.contains("item-image-thumb")) return;
+      const wrap = img.closest(".item-image-wrap");
+      if (!wrap) return;
+      wrap.classList.remove("item-image-wrap--inline");
+      wrap.classList.add("item-image-wrap--empty");
+      wrap.textContent = "—";
+    },
+    true
+  );
+
   el.pickLinesBody.addEventListener("click", (e) => {
     const splitBtn = e.target.closest(".pick-split-btn");
     if (splitBtn) {
@@ -3009,8 +3187,7 @@
     const toteInput = e.target.closest(".tote-id-input");
     if (toteInput) {
       getToteGroupState(toteInput.dataset.groupKey).value = toteInput.value;
-      toteInput.classList.toggle("invalid", !toteInput.value.trim());
-      updatePickLineActionButtons();
+      scheduleToteValidation(toteInput.dataset.groupKey);
     }
   });
   el.pickLinesBody.addEventListener("change", (e) => {

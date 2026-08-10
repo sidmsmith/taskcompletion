@@ -31,6 +31,7 @@ from task_service import (  # noqa: E402
     preload_task_transactions,
     resolve_cycle_count_search_multi,
     resolve_search_multi,
+    validate_pick_tote_id,
     validate_putaway_location,
 )
 
@@ -39,7 +40,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.19.1"
+APP_VERSION = "0.20.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -492,6 +493,22 @@ def preload_pick_reason_codes_route():
     except Exception as e:
         print(f"[PRELOAD_PICK_REASON_CODES] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/validate_pick_tote", methods=["POST"])
+def validate_pick_tote_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    tote_id = (data.get("toteId") or data.get("tote_id") or "").strip()
+    try:
+        result = validate_pick_tote_id(token, org, tote_id, location=location)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[VALIDATE_PICK_TOTE] {e}")
+        return jsonify({"success": False, "valid": False, "error": str(e)}), 500
 
 
 @app.route("/api/preload_adjustment_reason_codes", methods=["POST"])

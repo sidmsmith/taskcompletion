@@ -1324,6 +1324,15 @@ def search_items(
     `ItemPackage[]` (exact same shape receivingworkbench's own
     search_items() confirmed live) — see task_service's UOM-resolution
     helpers, ported from that app, for how these back the UOM column.
+
+    Template extended again 2026-08-10 (thirteenth session) to also
+    fetch `ImageUrl` — same field receivingworkbench's own
+    search_items() already uses for its item thumbnail (see that
+    project's `rw_service.py`'s defensive `ImageUrl`/`imageUrl`/
+    `ImageURL` casing fallback, mirrored in this app's
+    `_normalize_pick_lines()`). Often empty for a given item — the
+    frontend renders a plain placeholder rather than a broken-image
+    icon when it is.
     """
     clean = [str(i).strip() for i in item_ids if str(i).strip()]
     if not clean:
@@ -1339,6 +1348,7 @@ def search_items(
             "ItemId": "",
             "Description": "",
             "DisplayUomId": "",
+            "ImageUrl": "",
             "ItemPackage": [
                 {
                     "UomId": None,
@@ -1966,3 +1976,61 @@ def commit_pick_move(
         body = {"data": body}
     body["_httpStatus"] = response.status_code
     return body
+
+
+# Statuses at which a real, already-existing iLPN/tote is considered
+# "empty and free to reuse" (2026-08-10, thirteenth session, per
+# explicit instruction: "WM should allow the reuse of totes/iLPNs, but
+# they would need to be in Consumed or above status"). Consumed
+# (already emptied out into a location, ILPN_CONSUMED_STATUS) plus
+# Lost/Canceled — the three ILPN_STATUS_LABELS entries "at or above"
+# Consumed on MAWM's own numeric ladder — count as free; anything below
+# (In Transit/Pre-Receipt Allocated/Not Allocated/Partially Allocated/
+# Allocated) means the container is still actively holding or reserved
+# for someone else's inventory right now.
+ILPN_REUSABLE_STATUSES = {"9000", "10000", "11000"}
+
+# CONFIRMED-by-user — real barcode-format validator, shared across
+# object types via `barcodeTypes` (comma-separated, e.g.
+# "Tote,ILPN") — this app only ever passes "Tote" for the tote-picking
+# textbox. GET, not POST (unlike almost everything else in this app).
+# A valid barcode returns a plain empty `200` body; an invalid one
+# returns `200` too, but with a real MAWM error envelope
+# (`messages.Message[].Type == "ERROR"`, e.g. `Code: "90001"`,
+# `Description: "Invalid Barcode"`) — so the HTTP status alone doesn't
+# distinguish valid from invalid, the body does.
+VALIDATE_BARCODE_URL = f"{HOST}/dmui-facade/api/dmui-facade/dmmobile-facade/services/rest/workflow/validateBarcode"
+
+
+def validate_barcode(
+    scanned_value: str, barcode_types: str, token: str, org: str, location: str = None
+) -> dict:
+    """Returns `{"valid": bool, "error": Optional[str]}` — `error` is
+    MAWM's own `Description` (e.g. "Invalid Barcode") when invalid,
+    `None` when valid. Network/unexpected-shape failures are treated as
+    invalid (fail closed — a tote id this app can't confirm shouldn't
+    silently be accepted) with an explanatory `error` of their own.
+    """
+    token = normalize_token(token)
+    try:
+        response = _get(
+            VALIDATE_BARCODE_URL,
+            headers=build_task_headers(token, org, location=location),
+            params={"barcodeTypes": barcode_types, "scannedValue": scanned_value},
+        )
+    except requests.RequestException as exc:
+        return {"valid": False, "error": f"Validation request failed: {exc}"}
+    if response.status_code != 200:
+        return {"valid": False, "error": f"Validation request failed: {response.status_code}"}
+    text = (response.text or "").strip()
+    if not text:
+        return {"valid": True, "error": None}
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return {"valid": True, "error": None}
+    messages = ((body or {}).get("messages") or {}).get("Message") or []
+    for msg in messages:
+        if str(msg.get("Type") or "").upper() == "ERROR":
+            return {"valid": False, "error": msg.get("Description") or "Invalid Barcode"}
+    return {"valid": True, "error": None}

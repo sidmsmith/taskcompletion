@@ -59,6 +59,7 @@ from mawm_client import (
     DEFAULT_ADJUSTMENT_REASON_CODE,
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
     ILPN_CONSUMED_STATUS,
+    ILPN_REUSABLE_STATUSES,
     LOCATION_ADJUSTMENT_STALE_RECORD_CODE,
     PICK_TRANSACTION_TYPE_ID,
     PUTAWAY_WORKFLOW_SCRIPT_NAME,
@@ -99,6 +100,7 @@ from mawm_client import (
     search_task_transactions,
     task_status_description,
     trigger_end_count,
+    validate_barcode,
     validate_item_and_get_item_details,
     validate_storage_location,
     workflow_execute,
@@ -636,6 +638,13 @@ def _normalize_pick_lines(raw_task: dict, items: Dict[str, dict]) -> List[dict]:
                 "taskDetailId": str(_first(line, "TaskDetailId") or idx),
                 "itemId": item_id,
                 "description": str(item.get("Description") or ""),
+                # Same defensive casing fallback receivingworkbench's
+                # rw_service.py uses for the same field (2026-08-10,
+                # thirteenth session) — item-master's own casing for
+                # this field isn't 100% consistent across responses.
+                "itemImageUrl": str(
+                    item.get("ImageUrl") or item.get("imageUrl") or item.get("ImageURL") or ""
+                ),
                 "sourceLocationId": str(_first(line, "SourceLocationId") or ""),
                 "sourceContainerId": str(_first(line, "SourceContainerId") or ""),
                 "sourceContainerTypeId": str(_first(line, "SourceContainerTypeId") or ""),
@@ -1080,6 +1089,68 @@ def preload_pick_reason_codes(
         entries.append({"key": key, "value": value})
     entries.sort(key=lambda e: e["key"].lower())
     return {"success": True, "count": len(entries), "entries": entries}
+
+
+def validate_pick_tote_id(
+    token: str, org: str, tote_id: str, location: str = None
+) -> Dict[str, Any]:
+    """Confirms a tote id is safe to commit against before the picker
+    submits it (2026-08-10, per explicit instruction — "we should
+    probably add a tote validation routine to ensure that someone
+    enters a valid tote number"). Two real, distinct checks, run in
+    order:
+
+    1. Does this id already exist as a real iLPN
+       (`search_ilpn_current_location()`)? If so, it's only safe to
+       reuse when its own status is Consumed or "above" on MAWM's
+       ladder (`ILPN_REUSABLE_STATUSES`) — anything less means it's
+       still actively holding or reserved for someone else's real
+       inventory right now.
+    2. If it doesn't exist yet, is it at least a *valid barcode
+       format* (`validate_barcode()`, real MAWM format validation) —
+       catches a typo/garbage value before it becomes a brand-new
+       (but wrongly-formed) iLPN, since commit_pick_move() would
+       otherwise happily create one for literally any string.
+
+    Returns `{"valid": bool, "error": Optional[str], "reason":
+    "existing_reusable"|"existing_in_use"|"new"|"invalid_format"}`.
+    """
+    tote_id = (tote_id or "").strip()
+    if not tote_id:
+        return {"valid": False, "error": "Tote id is required", "reason": "empty"}
+
+    dest = resolve_location(org, location)
+
+    try:
+        ilpn = search_ilpn_current_location(tote_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"valid": False, "error": f"Could not check tote: {exc}", "reason": "error"}
+
+    if ilpn:
+        status = str(ilpn.get("Status") or "")
+        if status in ILPN_REUSABLE_STATUSES:
+            return {
+                "valid": True,
+                "error": None,
+                "reason": "existing_reusable",
+                "status": status,
+                "statusLabel": ilpn_status_description(status),
+            }
+        return {
+            "valid": False,
+            "error": f"Tote {tote_id} is already in use (status: {ilpn_status_description(status)})",
+            "reason": "existing_in_use",
+            "status": status,
+            "statusLabel": ilpn_status_description(status),
+        }
+
+    try:
+        result = validate_barcode(tote_id, "Tote", token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"valid": False, "error": f"Could not validate tote format: {exc}", "reason": "error"}
+    if result.get("valid"):
+        return {"valid": True, "error": None, "reason": "new"}
+    return {"valid": False, "error": result.get("error") or "Invalid tote format", "reason": "invalid_format"}
 
 
 def _line_state(
