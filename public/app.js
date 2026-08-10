@@ -2188,12 +2188,36 @@
    * exists yet (see task_service._resolve_pick_task()'s docstring) —
    * statusBadgeHtml(null, status) shows the raw code in a badge rather
    * than guessing at a translation.
+   *
+   * Type/Size always shown (2026-08-10, twelfth session — the oLPN's
+   * own `ContainerTypeId`/`ContainerSizeId`, e.g. "BOX"/"MED"), Slot
+   * shown only when `slotId` is populated — a cart-picking task per
+   * explicit instruction, keyed purely off whether the data itself
+   * carries a slot, never off TaskExecutionMode/TransactionId text
+   * (see task_service._resolve_pick_task()'s slot_by_olpn comment).
+   *
+   * `PlannedSlotId`'s own text format is NOT consistent across real
+   * cart plans — confirmed live 2026-08-10 against 3 different tasks:
+   * a plain number ("2"), a pre-labeled string ("Slot 1"), and a
+   * terse lowercase form ("slot1"). Blindly prepending "Slot " would
+   * double up on the already-labeled case ("Slot Slot 1", seen live
+   * before this fix), so this only adds the "Slot " prefix when the
+   * raw value doesn't already start with it (case-insensitive).
    */
-  function pickOlpnHeaderRowHtml(olpnId, status, statusLabel) {
+  function pickOlpnSlotLabel(slotId) {
+    if (!slotId) return "";
+    return /^slot\b/i.test(slotId) ? slotId : `Slot ${slotId}`;
+  }
+
+  function pickOlpnHeaderRowHtml(olpnId, status, statusLabel, slotId, containerTypeId, containerSizeId) {
+    const typeSize = [containerTypeId, containerSizeId].filter(Boolean).join(" / ");
+    const slotLabel = pickOlpnSlotLabel(slotId);
     return `
         <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(olpnId)}">
           <td colspan="9">
             <strong>oLPN</strong> ${escapeHtml(olpnId)}
+            ${typeSize ? `<span class="pick-olpn-type-size">${escapeHtml(typeSize)}</span>` : ""}
+            ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
             <span class="pick-olpn-status">${status ? statusBadgeHtml(statusLabel, status) : ""}</span>
           </td>
         </tr>`;
@@ -2212,7 +2236,12 @@
     if (!olpnId) return;
     state.groups.forEach((g) => {
       if (g.olpnStatuses && g.olpnStatuses[olpnId] !== undefined) {
-        g.olpnStatuses[olpnId] = { status, statusLabel };
+        // Merge, not replace (2026-08-10) — slotId/containerTypeId/
+        // containerSizeId don't come back from a line completion, only
+        // status/statusLabel do; a plain replace would silently drop
+        // them and make the Slot/Type-Size header disappear after the
+        // first completion on that oLPN.
+        g.olpnStatuses[olpnId] = { ...g.olpnStatuses[olpnId], status, statusLabel };
       }
     });
     const header = el.pickLinesBody.querySelector(
@@ -2240,11 +2269,19 @@
   /**
    * Grouped by oLPN, not one flat line list (2026-08-10, per explicit
    * instruction) — each distinct oLPN gets its own header row (id +
-   * status) followed by just its own lines, so a multi-oLPN task (or,
-   * later, a pick-cart task with many more) reads as separate sections
-   * rather than one undifferentiated table. Line ordering within each
-   * oLPN follows the order lines already came back in (task-detail
+   * status) followed by just its own lines, so a multi-oLPN task (or a
+   * pick-cart task with many more) reads as separate sections rather
+   * than one undifferentiated table. Line ordering within each oLPN
+   * follows the order lines already came back in (task-detail
    * sequence), not re-sorted.
+   *
+   * Group ORDER (2026-08-10, twelfth session, cart-picking support):
+   * if any oLPN in this result carries a `slotId`, every group is
+   * sorted by slot number instead of first-appearance order — per
+   * explicit instruction, this check is purely data-driven (does a
+   * slot value actually exist), not based on TaskExecutionMode or
+   * TransactionId text. A task with no slots at all keeps the
+   * original first-appearance order, unchanged.
    */
   function renderPickGroups() {
     state.selectedTaskDetailId = null;
@@ -2263,12 +2300,45 @@
       }
       byOlpn.get(key).push(line);
     });
+
+    const olpnInfoFor = (olpnId) => {
+      const groupLines = byOlpn.get(olpnId);
+      const owningGroup = state.groups.find((g) => g.taskId === groupLines[0].groupTaskId);
+      return owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[olpnId] || {} : {};
+    };
+
+    // slotId's own text isn't always a bare number (see
+    // pickOlpnSlotLabel()'s docstring — "2", "Slot 1", "slot1" all seen
+    // live), so sorting pulls out the first digit run rather than
+    // Number()-ing the whole string directly.
+    const slotSortKey = (slotId) => {
+      const match = String(slotId || "").match(/\d+/);
+      return match ? Number(match[0]) : NaN;
+    };
+    const isSlotTask = olpnKeys.some((olpnId) => olpnId && olpnInfoFor(olpnId).slotId);
+    if (isSlotTask) {
+      olpnKeys.sort((a, b) => {
+        const slotA = slotSortKey(olpnInfoFor(a).slotId);
+        const slotB = slotSortKey(olpnInfoFor(b).slotId);
+        if (Number.isFinite(slotA) && Number.isFinite(slotB)) return slotA - slotB;
+        return Number.isFinite(slotA) ? -1 : Number.isFinite(slotB) ? 1 : 0;
+      });
+    }
+
     el.pickLinesBody.innerHTML = olpnKeys
       .map((olpnId) => {
         const groupLines = byOlpn.get(olpnId);
-        const owningGroup = state.groups.find((g) => g.taskId === groupLines[0].groupTaskId);
-        const olpnInfo = owningGroup && owningGroup.olpnStatuses ? owningGroup.olpnStatuses[olpnId] || {} : {};
-        const header = olpnId ? pickOlpnHeaderRowHtml(olpnId, olpnInfo.status, olpnInfo.statusLabel) : "";
+        const olpnInfo = olpnInfoFor(olpnId);
+        const header = olpnId
+          ? pickOlpnHeaderRowHtml(
+              olpnId,
+              olpnInfo.status,
+              olpnInfo.statusLabel,
+              olpnInfo.slotId,
+              olpnInfo.containerTypeId,
+              olpnInfo.containerSizeId
+            )
+          : "";
         return header + groupLines.map((line) => pickLineRowHtml(line)).join("");
       })
       .join("");

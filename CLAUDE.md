@@ -2654,3 +2654,92 @@ correctly-ordered raw call kept succeeding in between attempts. Worth
 remembering next time an "auth" failure doesn't reproduce consistently
 across two superficially similar calls — check argument order before
 assuming the server is flaky.
+
+## Picking: cart-picking (`PICK_INTO_CART`) supported (2026-08-10, twelfth session)
+
+**Research first, live-tested before building anything.** `PICK0637` (a
+real 5-line/3-oLPN/3-slot cart task) was fetched and inspected for its
+raw `TaskDetail` shape, then `commit_pick_move()` was called directly
+against all 5 of its lines — **unmodified, no new fields** — before
+any code changed. Every line committed correctly, each oLPN closed
+once its own lines were done (`Status: "7200"`), and the task
+auto-closed on the last line — identical behavior to a plain
+`PICK_INTO_OLPN` task. One thing confirmed worth remembering: the
+first commit's response body echoed a **completely different line's**
+`InventoryMove` data than the one actually submitted (not just
+misleadingly empty, as already documented) — the real state, re-verified
+independently, showed the correct line had in fact completed. Never
+trust the commit response alone; this app already didn't.
+
+**What actually changed, once the backend was proven:**
+- `task_service._classify_pick_task()` — `TaskExecutionMode` allowlist
+  widened from `PICK_INTO_OLPN` only to `{PICK_INTO_OLPN,
+  PICK_INTO_CART}`. The per-line `SourceContainerTypeId == "LOCATION"`
+  check is unchanged — still excludes the unresolved iLPN bug case.
+  `PICK_INTO_TOTE` deliberately **not** added — confirmed live
+  (`PICK0540`) it also carries a real per-line `OlpnId` and is
+  `LOCATION`-sourced, so it would likely also "just work," but its
+  destination container during picking is a `TOTE`, not an `OLPN` —
+  untested, left for a future decision rather than silently folded in.
+- `task_service._resolve_pick_task()` — each `olpnStatuses[olpnId]`
+  entry gained `slotId`, `containerTypeId`, `containerSizeId`.
+  `slotId` comes from that oLPN's own lines'
+  `TaskDetail.PlannedSlotId` (confirmed live: every line sharing an
+  oLPN shares the same slot value, so the first non-empty one found is
+  authoritative) — **not** derived from `TaskExecutionMode` or
+  `TransactionId` text, per explicit instruction, since other task
+  types could plausibly use the same "pick multiple oLPNs at once"
+  mechanism without being cart tasks. `containerTypeId`/
+  `containerSizeId` come off the same `search_olpn()` call already
+  made for status — no extra API call.
+- `app.js` `pickOlpnHeaderRowHtml()` — oLPN Type/Size (e.g. `"BOX /
+  MED"`) now always shown; `Slot ...` shown only when `slotId` is
+  populated, i.e. purely data-driven per oLPN, matching the backend.
+  `renderPickGroups()` — oLPN groups sort by slot number (extracted
+  from the slot text, see below) when *any* oLPN in the result has a
+  slot; a task with no slots at all keeps the original
+  first-line-appearance order, unchanged.
+
+**`PlannedSlotId`'s own text format is NOT consistent across real cart
+plans** — confirmed live against 3 different tasks/cart-plan
+configurations:
+- `PICK0637`, plan `"Pick Cart-4 Slots"` → plain numbers (`"1"`,
+  `"2"`, `"3"`)
+- `PICK0184`, plan `"Hybrid Tote oLPN Pick Cart 3 Slots"` → pre-labeled
+  strings (`"Slot 1"`, `"Slot 2"`, `"Slot 3"`) — **and** two of its 4
+  oLPNs both landed on `"Slot 1"`, so the 1-oLPN-per-slot mapping
+  confirmed on `PICK0637` is not universal; also 3 of its 4 lines had
+  `Quantity: 0.0` and their destination oLPNs didn't exist yet as
+  queryable `search_olpn()` records (`None` returned) — this task
+  looked like degenerate/placeholder demo data rather than a real
+  cart-picking scenario, so it wasn't used for the full completion
+  test.
+- `PICKPICK0008` → terse lowercase form (`"slot1"`, `"slot2"`), clean
+  data (real quantities, both oLPNs pre-existing), used for the actual
+  end-to-end completion test below.
+
+Two real bugs this caused, both fixed before the final test: (1) the
+UI naively prepended `"Slot "` to the raw value, producing `"Slot Slot
+1"` on the `PICK0184`-style data — fixed with `pickOlpnSlotLabel()`,
+which only prepends when the raw text doesn't already start with
+"slot" (case-insensitive); (2) the sort comparator did `Number(slotId)`
+directly, which is `NaN` for `"Slot 1"`/`"slot1"` and silently
+disabled sorting — fixed by extracting the first digit run out of the
+string instead (`String(slotId).match(/\d+/)`).
+
+**Confirmed end-to-end through the real browser UI**, `PICKPICK0008`
+(2 oLPNs, `slot1`/`slot2`, 4 lines total) via "Complete All": both
+oLPN groups rendered correctly ordered by slot with Type/Size and
+status shown on each header, all 4 lines completed cleanly in one
+shot, task auto-closed (`Status: "8000"`), both oLPNs closed
+(`Status: "7200"`) — independently re-verified via a fresh
+`search_task()`/`search_olpn()` query, not just the UI's own success
+message.
+
+**Also noticed, not chased further**: SS-DEMO's task data appears to
+reset periodically — `PICK0094` and `PICK0100`, both fully completed
+earlier this same session, came back with their original
+untouched quantities on a later re-query. Convenient for testing
+(never permanently runs out of fresh tasks), but means task state
+observed in this file may not persist indefinitely in the live
+environment.

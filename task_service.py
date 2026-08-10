@@ -559,15 +559,31 @@ def _resolve_cycle_count_task(
 # ---------------------------------------------------------------------
 # Picking (2026-08-10, eleventh session) — see mawm_client.py's
 # matching module docstring for the full confirmed-live API shape.
-# Locked down to `TaskExecutionMode: "PICK_INTO_OLPN"` tasks with every
-# line sourced from a plain `LOCATION` — anything else is refused with
-# a clear reason rather than guessed at, per explicit instruction
-# ("if you know exactly the scenario that causes the issue, you can
-# restrict those tasks for now"). `PICK_INTO_CART` (cart picking) is a
-# real strategy planned for later, not permanently excluded.
+# Locked down to `TaskExecutionMode` in _PICK_SUPPORTED_EXECUTION_MODES
+# with every line sourced from a plain `LOCATION` — anything else is
+# refused with a clear reason rather than guessed at, per explicit
+# instruction ("if you know exactly the scenario that causes the
+# issue, you can restrict those tasks for now").
+#
+# `PICK_INTO_CART` added 2026-08-10 (twelfth session) — confirmed live
+# against a real cart task (PICK0637, 5 lines/3 oLPNs/3 cart slots)
+# that commit_pick_move() needs zero changes: every line committed
+# correctly, each oLPN closed once its own lines were done, and the
+# task auto-closed on the last line, identical to a plain
+# PICK_INTO_OLPN task. One thing confirmed worth remembering: the
+# commit response's echoed InventoryMove can reference a completely
+# different line than the one submitted (not just be misleadingly
+# empty, as already documented) — reinforces why this app never
+# trusts the commit response and always independently re-verifies.
+#
+# `PICK_INTO_TOTE` deliberately NOT added here despite also being
+# LOCATION-sourced with a real per-line OlpnId (confirmed live,
+# PICK0540) — its destination container during picking is a TOTE, not
+# an oLPN, an untested and different downstream shape. Left for a
+# future decision, not silently folded in.
 # ---------------------------------------------------------------------
 
-_PICK_SUPPORTED_EXECUTION_MODE = "PICK_INTO_OLPN"
+_PICK_SUPPORTED_EXECUTION_MODES = {"PICK_INTO_OLPN", "PICK_INTO_CART"}
 
 
 def _classify_pick_task(raw_task: dict) -> tuple:
@@ -576,10 +592,10 @@ def _classify_pick_task(raw_task: dict) -> tuple:
     these two specific checks are the lockdown boundary.
     """
     exec_mode = str(_first(raw_task, "TaskExecutionMode") or "").strip()
-    if exec_mode != _PICK_SUPPORTED_EXECUTION_MODE:
+    if exec_mode not in _PICK_SUPPORTED_EXECUTION_MODES:
         return False, (
             f"execution mode {exec_mode!r} is not yet supported here "
-            f"(only direct-to-oLPN picking is) — planned for later"
+            f"(only direct-to-oLPN and cart picking are) — planned for later"
         )
     for line in raw_task.get("TaskDetail") or []:
         source_type = str(_first(line, "SourceContainerTypeId") or "").strip()
@@ -612,6 +628,7 @@ def _normalize_pick_lines(raw_task: dict, items: Dict[str, dict]) -> List[dict]:
                 "sourceContainerTypeId": str(_first(line, "SourceContainerTypeId") or ""),
                 "uomTypeId": str(_first(line, "UomTypeId") or ""),
                 "olpnId": str(_first(line, "OlpnId") or ""),
+                "plannedSlotId": str(_first(line, "PlannedSlotId") or ""),
                 "plannedQuantity": _num(planned),
                 "completedQuantity": _num(completed),
                 "status": str(_first(line, "Status") or ""),
@@ -646,6 +663,25 @@ def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest:
     # (mawm_api_library/_conventions/statuses.json's "olpn_status"
     # domain, confirmed live 2026-08-10 — "1000"/"7200" read back as
     # "Created"/"Packed" exactly as the reference library says).
+    #
+    # `slotId`/`containerTypeId`/`containerSizeId` added 2026-08-10
+    # (twelfth session, cart-picking support). `slotId` comes from
+    # this oLPN's own lines (`TaskDetail.PlannedSlotId`), not from
+    # TaskExecutionMode/TransactionId — confirmed live (PICK0637) that
+    # every line sharing an oLPN shares the same slot, so the first
+    # non-empty one found is authoritative; empty/absent on a plain
+    # non-cart task, which is exactly the signal the frontend uses to
+    # decide whether to show/sort by slot at all, per explicit
+    # instruction not to key that off the execution mode string.
+    # `containerTypeId`/`containerSizeId` come off the same
+    # search_olpn() call already made for status — no extra API call.
+    slot_by_olpn: Dict[str, str] = {}
+    for line in lines:
+        olpn_id = line["olpnId"]
+        slot = line.get("plannedSlotId") or ""
+        if olpn_id and slot and not slot_by_olpn.get(olpn_id):
+            slot_by_olpn[olpn_id] = slot
+
     olpn_statuses: Dict[str, Dict[str, Any]] = {}
     for olpn_id in olpn_ids:
         try:
@@ -653,7 +689,13 @@ def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest:
         except Exception:  # noqa: BLE001
             olpn = None
         status = str((olpn or {}).get("Status") or "")
-        olpn_statuses[olpn_id] = {"status": status, "statusLabel": olpn_status_description(status)}
+        olpn_statuses[olpn_id] = {
+            "status": status,
+            "statusLabel": olpn_status_description(status),
+            "slotId": slot_by_olpn.get(olpn_id, ""),
+            "containerTypeId": str((olpn or {}).get("ContainerTypeId") or ""),
+            "containerSizeId": str((olpn or {}).get("ContainerSizeId") or ""),
+        }
 
     return {
         "success": True,
