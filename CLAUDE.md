@@ -3257,3 +3257,54 @@ split line's first half), 1 unit (its second half, the one dragged to
 the new group), 2 units (line 2, untouched), 2 units (line 3,
 untouched) — 7 total, matching the task's original 3+2+2 exactly,
 correctly spread across all 4 real totes.
+
+## Picking: cosmetic fixes — one tote by default, Split as its own column (2026-08-10, thirteenth session)
+
+**One real correctness bug, found by the user on `PICK1997`**: a plain
+non-cart "Pick To Tote" task with 4 lines was rendering **4 separate
+tote groups** (one per line) instead of one. Root cause:
+`pickGroupKey()`'s no-slot fallback was `"line:" + taskDetailId` — a
+unique key per line — copied from the deliberately-per-line design
+used for oLPN grouping, but wrong for totes. The user's correction:
+totes should only ever be split into multiple groups when there's a
+real physical reason to (a cart, where each slot is a genuinely
+separate physical tote) — a plain non-cart task's lines all go into
+**one** tote by default, since packing (a separate, not-yet-built app)
+is what actually splits them out into their eventual distinct oLPNs
+later, not this app's concern. Fixed: the no-slot fallback is now
+`"tote-default:" + groupTaskId` — one shared key per task — so every
+slot-less tote-destined line on the same task starts in one group.
+Splitting that default group further is still available via the
+existing Split action; this only changes the *starting* grouping, not
+a hard limit. Confirmed live: `PICK1997`'s 4 lines now render under
+one `TOTE` header; a real cart task (`PICK0391`) still correctly shows
+one group per slot, unchanged.
+
+**Also found while investigating the reported column-alignment
+issue**: `pickLineRowHtml()`'s Line/Source Location/Item `<td>`s had
+been missing their `col-line`/`col-loc`/`col-item` width classes
+entirely since these were first built — only the header cells
+(`pickColumnHeaderRowHtml()`, the static `<thead>`) had them. Fixed by
+adding the matching classes to the data cells, confirmed live via a
+before/after zoomed screenshot comparison that the Completed Qty
+column (and everything after it) now lines up correctly under its own
+header.
+
+**UI change, per explicit instruction**: the Split action moved out of
+the Completed Qty cell (where it sat stacked below the input,
+contributing to the alignment confusion above) into its own narrow
+column immediately to its right — a small icon-only button
+(`fa-code-branch`, FontAwesome 6, already loaded) instead of a text
+link, to keep the row compact. Required a 10th column across the
+header row(s) (`pickColumnHeaderRowHtml()`, the static `<thead>`) and
+bumping every group header's `colspan` from `9` to `10`.
+
+**Search box cleanup, per explicit instruction**: removed the
+`taskIdInput` placeholder text and the matching "empty" hint shown
+below it (both said the same thing — "Scan or type a Task Id, iLPN, or
+Storage Location..." — redundant once the placeholder already said
+it, and the user wants the box to start visually clean). The other
+hint states (mixed input, cycle count, plain task) are unchanged, just
+still there once something's actually typed. `loadTaskBtn`'s label
+changed from "Load Task" to "Confirm," including the 3 other places in
+`matchHint`'s own text that named the button by its old label.

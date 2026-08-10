@@ -311,15 +311,14 @@
     if (!state.token) {
       el.matchHint.textContent = "Authenticate to begin.";
     } else if (kind === "empty") {
-      el.matchHint.textContent =
-        "Scan or type a Task Id, iLPN, or Storage Location — separate multiple with ; , or a space.";
+      el.matchHint.textContent = "";
     } else if (kind === "mixed") {
       el.matchHint.textContent =
-        "Enter either Task Ids/iLPNs or Storage Locations, not both — Load Task is disabled until this is one or the other.";
+        "Enter either Task Ids/iLPNs or Storage Locations, not both — Confirm is disabled until this is one or the other.";
     } else if (kind === "cycle_count") {
-      el.matchHint.textContent = "Press Enter or click Load Task to start an ad hoc Cycle Count.";
+      el.matchHint.textContent = "Press Enter or click Confirm to start an ad hoc Cycle Count.";
     } else {
-      el.matchHint.textContent = "Press Enter or click Load Task.";
+      el.matchHint.textContent = "Press Enter or click Confirm.";
     }
   }
 
@@ -2225,9 +2224,9 @@
     const canSplitOrDrag = row.isToteDestined && !isDone;
     return `
         <tr class="pick-line-row line-row" data-split-id="${escapeAttr(row.splitId)}" data-task-detail-id="${escapeAttr(row.taskDetailId)}" ${canSplitOrDrag ? 'draggable="true"' : ""}>
-          <td>${escapeHtml(row.lineNumber)}</td>
-          <td>${escapeHtml(row.sourceLocationId)}</td>
-          <td>${escapeHtml(row.itemId)}</td>
+          <td class="col-line">${escapeHtml(row.lineNumber)}</td>
+          <td class="col-loc">${escapeHtml(row.sourceLocationId)}</td>
+          <td class="col-item">${escapeHtml(row.itemId)}</td>
           <td><div class="col-desc-narrow" title="${escapeAttr(row.description)}">${escapeHtml(row.description)}</div></td>
           <td class="col-qty-wide">${escapeHtml(row.plannedQuantity)}</td>
           <td class="col-uom">${escapeHtml(row.uomTypeId)}</td>
@@ -2241,7 +2240,9 @@
               step="any"
               ${isDone ? "disabled" : ""}
             />
-            ${canSplitOrDrag ? `<button type="button" class="pick-split-btn" data-split-id="${escapeAttr(row.splitId)}" title="Split this line across totes">Split</button>` : ""}
+          </td>
+          <td class="col-split">
+            ${canSplitOrDrag ? `<button type="button" class="pick-split-btn" data-split-id="${escapeAttr(row.splitId)}" title="Split this line across totes"><i class="fas fa-code-branch"></i></button>` : ""}
           </td>
           <td class="col-reason">
             <select class="form-select reason-code-select invalid" data-split-id="${escapeAttr(row.splitId)}">
@@ -2283,20 +2284,23 @@
   }
 
   /**
-   * The grouping key for a line (2026-08-10, thirteenth session — tote-
-   * picking UI). An oLPN-destined line groups by its real, already-
-   * known `olpnId` (unchanged). A tote-destined line has no known
-   * container id yet — nothing to group by until the picker types one
-   * in — so it groups by its cart slot when one exists (every line
-   * sharing a slot is physically the same tote, confirmed live for
-   * oLPN slots this session, assumed to hold the same way for tote
-   * slots), or falls back to a group of exactly one line (keyed by its
-   * own taskDetailId) when there's no slot at all — a plain non-cart
-   * "Pick To Tote" task line has nothing else stable to group on.
+   * The grouping key for a line. An oLPN-destined line groups by its
+   * real, already-known `olpnId` (unchanged). A tote-destined line's
+   * grouping depends on *why* it doesn't have an oLPN yet (2026-08-10,
+   * per explicit correction — see CLAUDE.md's "one tote, not one per
+   * line" note): on a cart, each slot is a physically distinct tote —
+   * a picker genuinely needs a separate one per slot, so it groups by
+   * `plannedSlotId`. On a plain non-cart "Pick To Tote" task, there's
+   * no slot at all — those lines all go into *one* tote by default
+   * (packing splits them out into their eventual separate oLPNs later,
+   * not this app's concern), so every slot-less tote-destined line on
+   * the same task shares one default group key. Splitting that default
+   * group into more totes is still available via the Split action —
+   * this is only the *starting* grouping, not a hard limit.
    */
   function pickGroupKey(line) {
     if (line.isToteDestined) {
-      return line.plannedSlotId ? "slot:" + line.plannedSlotId : "line:" + line.taskDetailId;
+      return line.plannedSlotId ? "slot:" + line.plannedSlotId : "tote-default:" + line.groupTaskId;
     }
     return line.olpnId || "";
   }
@@ -2384,10 +2388,12 @@
   /**
    * A repeated column-header row rendered once per group (2026-08-10,
    * per explicit instruction to test this layout instead of one fixed
-   * header at the top of the table) — same 9 columns as
+   * header at the top of the table) — same 10 columns as
    * #pickLinesTable's own (now-hidden, see .pick-repeats-headers)
    * <thead>, kept in sync by hand since there's no single source of
-   * truth for both.
+   * truth for both. The blank `col-split` header (between Completed
+   * Qty and Reason Code) is the Split icon's own column — see
+   * pickLineRowHtml().
    */
   function pickColumnHeaderRowHtml() {
     return `
@@ -2399,6 +2405,7 @@
           <td class="col-qty-wide">Planned Qty</td>
           <td class="col-uom"></td>
           <td class="col-qty-wide">Completed Qty</td>
+          <td class="col-split"></td>
           <td class="col-reason">Reason Code</td>
           <td class="col-reason">Status</td>
         </tr>`;
@@ -2424,7 +2431,7 @@
       const hasValue = !!(info.value && info.value.trim());
       return `
         <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
-          <td colspan="9">
+          <td colspan="10">
             <strong>TOTE</strong>
             <input
               type="text"
@@ -2442,7 +2449,7 @@
     const typeSize = [info.containerTypeId, info.containerSizeId].filter(Boolean).join(" / ");
     return `
         <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(info.containerId)}" data-group-key="${escapeAttr(groupKey)}">
-          <td colspan="9">
+          <td colspan="10">
             <strong>oLPN</strong> ${escapeHtml(info.containerId)}
             ${typeSize ? `<span class="pick-olpn-type-size">${escapeHtml(typeSize)}</span>` : ""}
             ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
