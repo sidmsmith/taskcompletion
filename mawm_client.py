@@ -1720,3 +1720,143 @@ def complete_task(
     if isinstance(body, dict):
         body["_requestPayload"] = payload
     return body if isinstance(body, dict) else {"data": body, "_requestPayload": payload}
+
+
+# ---------------------------------------------------------------------
+# Picking (2026-08-10, eleventh session) — real TransactionTypeId is
+# `"Pick"` (the app's own earlier TASK_TYPES/"PICKING" constant above
+# was never live-verified — this is the confirmed real value). Locked
+# down at the task_service layer to `TaskExecutionMode:
+# "PICK_INTO_OLPN"` tasks with every line sourced from a plain
+# `LOCATION` — confirmed live this session that an iLPN-sourced /
+# `FullContainerAllocated: true` line hits a real, unresolved MAWM
+# validation bug (`PPK::0513 "Quantity exceeds order line quantity"`)
+# no matter what payload shape is sent (four distinct shapes tried,
+# including the fully-enriched `fetchNextMove` response verbatim with
+# only `CompletedQuantity` changed) — see CLAUDE.md's Picking section
+# for the full investigation. `PICK_INTO_CART` (cart picking) is a
+# real strategy to support later, not permanently excluded — refused
+# for now as "not yet supported."
+#
+# **Confirmed live: one `commitPickMove` call does everything** for a
+# `LOCATION`-sourced line — commits the inventory move, completes the
+# task detail, and auto-closes the task when it's the last open line —
+# no separate "end"/"trigger" call needed, unlike this app's Cycle
+# Count feature. Also confirmed synchronous (not async like Cycle
+# Count's booking) — every test showed the real outcome immediately on
+# re-query right after the commit call, no polling needed.
+# ---------------------------------------------------------------------
+
+PICK_TRANSACTION_TYPE_ID = "Pick"
+PICK_COMMIT_MOVE_URL = f"{HOST}/pickpack/api/pickpack/pick/commitPickMove"
+PICK_OLPN_SEARCH_URL = f"{HOST}/pickpack/api/pickpack/olpn/search"
+
+
+def search_task_id_for_olpn(olpn_id: str, token: str, org: str, location: str = None) -> List[str]:
+    """Real, open (not Completed/Canceled) Pick TaskIds whose own
+    TaskDetail references this OlpnId — same dotted-path
+    `TaskDetail.<field>` query pattern already confirmed for Putaway's
+    search_task_id_for_container(). Returns a **list**, not a single
+    Optional[str] like that function — confirmed live this session
+    that a single oLPN's lines can be split across more than one real
+    Task record (e.g. two real SS-DEMO examples, each split 1-line/
+    1-line across two separate tasks). Callers must handle more than
+    one match explicitly rather than silently picking the first.
+    """
+    token = normalize_token(token)
+    quoted = olpn_id.replace("'", "''")
+    query = (
+        f"TaskDetail.OlpnId ='{quoted}' and "
+        f"TransactionTypeId ='{PICK_TRANSACTION_TYPE_ID}' and "
+        f"Status !='8000' and Status !='9000'"
+    )
+    response = _post(
+        TASK_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={"Query": query, "Size": 10, "Page": 0},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"task-by-olpn search failed: {response.status_code} {response.text[:500]}"
+        )
+    rows = _response_data_list(response.json())
+    task_ids: List[str] = []
+    seen = set()
+    for row in rows:
+        task_id = str(row.get("TaskId") or "")
+        if task_id and task_id not in seen:
+            seen.add(task_id)
+            task_ids.append(task_id)
+    return task_ids
+
+
+def search_olpn(olpn_id: str, token: str, org: str, location: str = None) -> Optional[dict]:
+    """The oLPN header + OlpnDetail array — used to confirm real
+    PickedQuantity after a commit (this app's own verification, not
+    part of the commit chain itself). CONFIRMED live —
+    `pickpack/api/pickpack/olpn/search`, `Query: "OlpnId ='{id}'"`,
+    same response shape as a Task/iLPN search (`data: [...]`).
+    """
+    token = normalize_token(token)
+    quoted = olpn_id.replace("'", "''")
+    response = _post(
+        PICK_OLPN_SEARCH_URL,
+        headers=build_task_headers(token, org, location=location),
+        json={"Query": f"OlpnId ='{quoted}'", "Size": 5},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"olpn search failed: {response.status_code} {response.text[:500]}")
+    rows = _response_data_list(response.json())
+    return rows[0] if rows else None
+
+
+def commit_pick_move(
+    source_container_id: str,
+    source_container_type: str,
+    task_id: str,
+    task_detail_id: str,
+    olpn_id: str,
+    transaction_id: str,
+    quantity,
+    token: str,
+    org: str,
+    location: str = None,
+) -> dict:
+    """CONFIRMED live — commits one Pick task-detail line. Deliberately
+    the plain/minimal payload shape (not the fetch-then-enrich pattern
+    Putaway needs) — confirmed live this session that the minimal shape
+    below is sufficient and correct for every `LOCATION`-sourced line
+    tested (single-line and multi-line tasks, `UNIT` and `PACK` UOM
+    both), with no separate fetch call needed first. Only an
+    iLPN-sourced/full-container line needed (and still didn't resolve
+    with) the richer fetch/enrich/commit shape — see the module
+    docstring above; this function is intentionally not used for that
+    case at all (locked out one layer up, in task_service.py).
+    """
+    token = normalize_token(token)
+    payload = {
+        "InventoryMove": {
+            "SourceContainerId": source_container_id,
+            "SourceContainerType": source_container_type,
+            "TaskId": task_id,
+            "CurrentTaskDetailId": task_detail_id,
+            "OlpnId": olpn_id,
+            "TransactionId": transaction_id,
+            "CompletedQuantity": quantity,
+        },
+        "ExceptionMove": False,
+        "EndTargetContainer": False,
+    }
+    response = _post(
+        PICK_COMMIT_MOVE_URL,
+        headers=build_task_headers(token, org, location=location),
+        json=payload,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text[:1200]}
+    if not isinstance(body, dict):
+        body = {"data": body}
+    body["_httpStatus"] = response.status_code
+    return body

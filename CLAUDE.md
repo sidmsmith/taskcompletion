@@ -2237,3 +2237,161 @@ reads `TaskDetail` this way.
 from before this fix (like the one the user manually closed via
 mobile) needs the same manual resolution as before — this only
 prevents it from happening again going forward.
+
+## Picking — v1 built and confirmed live (2026-08-10, eleventh session)
+
+Real `TransactionTypeId` is `"Pick"`, not `"Picking"` (this app's
+earlier `TASK_TYPES` constant was never live-verified — a guess). Real
+API surface confirmed live this session, via a mix of a Glean-sourced
+starting point and this app's own investigation once the API itself
+disagreed with the documentation (see below):
+
+- `POST {host}/pickpack/api/pickpack/pick/commitPickMove` — commits
+  one task-detail line. **One call does everything**: inventory move,
+  task-detail completion, and task auto-close when it's the last open
+  line — confirmed live, no separate "end"/"trigger" call needed
+  (unlike this app's Cycle Count feature). Also confirmed
+  **synchronous** — the real outcome is visible on an immediate
+  re-query right after the call, no polling needed (unlike Cycle
+  Count's async booking).
+- `POST {host}/pickpack/api/pickpack/olpn/search` — the oLPN header +
+  `OlpnDetail` array (used for this app's own independent
+  verification, not part of the commit chain).
+- `pickpack/api/pickpack/pick/byTask/fetchNextMove` — the
+  fetch-before-commit "enriched move" call (Putaway's own equivalent
+  is `fetchNextPutawayMoveAndStartLaborActivity`). **Confirmed live
+  this session that the actual contract differs from what Glean's
+  documentation search initially returned**: it's `POST` with a
+  PascalCase JSON body (`{"TaskId": ..., "TransactionId": ...}`), not
+  `GET` with query parameters — confirmed by reading the real Java
+  stack trace a wrong-shaped request returned
+  (`PickingServicesController.fetchAndProcessNextMoveByTask(Context,
+  PickRequestDTO)`), not by guessing. **Not currently used by this
+  app** — see below.
+
+**The confirmed-safe scope this app actually supports (v1)**: a plain
+minimal `commitPickMove` payload (`SourceContainerId`,
+`SourceContainerType`, `TaskId`, `CurrentTaskDetailId`, `OlpnId`,
+`TransactionId`, `CompletedQuantity`) — no `fetchNextMove` step needed
+first — confirmed live and correct for every `LOCATION`-sourced line
+tested this session (single-line and multi-line tasks, `UNIT` and
+`PACK` UOM both, real inventory/task/oLPN-detail verified after each).
+
+**What's excluded, and why — a real, unresolved MAWM issue, not a
+guess.** An iLPN-sourced / `FullContainerAllocated: true` line
+(`PICK0597`'s line 2, `TaskDetailId
+d27a009a-1f6c-4026-bd04-7f09a9e60443`) reliably fails with `PPK::0513
+"Quantity exceeds order line quantity"` — tried **four distinct
+payload shapes**, all against a freshly-fetched, never-modified state:
+a plain hand-built payload with `CompletedQuantity` at both `24`
+(matching planned `Quantity`) and `1` (matching the reported UOM
+conversion factor); the fully-enriched `fetchNextMove` response
+verbatim with only `CompletedQuantity` changed to `24`; and the same
+enriched response with `CompletedQuantity` changed to `1` (Glean's own
+specific recommended combination, tested verbatim to its Python
+sketch). **All four failed identically.** The fetched move consistently
+shows `AllocatedQuantity: 0` despite `Quantity: 24.0` and the source
+iLPN independently confirmed to hold all 24 units, fully allocated —
+the working theory is that `PPK::0513` validates against
+`AllocatedQuantity`, not `Quantity`, and this line's allocation is
+broken or stale server-side in a way no client-side payload can work
+around. Full investigation, live test transcripts, and the specific
+open questions for Glean are saved in
+`mawm_picking_commitpickmove_full_container_issue.md` /
+`_updated.md` and `mawm_picking_fetch_enriched_commit_test.md` (the
+user's Downloads folder — not checked into this repo).
+
+Also found, separately: `PICK_INTO_CART` (cart picking) is a real,
+valid MAWM execution mode the user explicitly wants to support
+*later* — not excluded because it's wrong, just not yet built.
+Confirmed cart-mode tasks (e.g. `PICK0637`) can have **multiple
+different oLPNs on one single task** (5 lines split across 3 oLPNs) —
+a structurally different complexity than the "one oLPN split across
+multiple separate tasks" case found earlier (`PICK0490`/`PICK0492`,
+which occurs even in the supported `PICK_INTO_OLPN` mode). Two other
+execution modes exist too, also excluded for now: `PICK_INTO_TOTE` and
+`PICK_INTO_ILPN`.
+
+**Lockdown** (`task_service._classify_pick_task()`, mirroring the
+Cycle Count lockdown pattern): a task is only processed when
+`TaskExecutionMode == "PICK_INTO_OLPN"` **and** every one of its lines
+has `SourceContainerTypeId == "LOCATION"` — anything else is refused
+with a clear, specific reason rather than guessed at, per explicit
+instruction ("if you know exactly the scenario that causes the issue,
+you can restrict those tasks for now"). Refusal happens at the whole-
+task level (not per-line) for v1 simplicity — a task with 2 fine lines
+and 1 iLPN-sourced line is refused entirely, not partially rendered.
+
+**Search**: extended the existing "Task Id or iLPN" box
+(`resolve_search()`) — a real Pick TaskId routes to `_resolve_pick_task()`
+exactly like a Cycle Count TaskId already did; a real oLPN routes
+through a new `search_task_id_for_olpn()` (same `TaskDetail.<field>`
+dotted-path query pattern as Putaway's `search_task_id_for_container()`,
+confirmed live it also works for `TaskDetail.OlpnId`). **Confirmed
+live**: an oLPN split across more than one task is refused with a
+clear message (`"oLPN X is split across N tasks... search by TaskId
+directly instead"`) rather than guessed at — matches the earlier
+finding that this can happen even for supported `PICK_INTO_OLPN`
+tasks, and the user's own note that it "would never" happen in a real
+paper-based environment, so it's being treated the same way as the
+excluded execution modes: refused clearly, not solved.
+
+**Completion**: `complete_pick_line()` (one line) and
+`complete_pick_task()` ("submit all in one shot," per explicit
+instruction) — both call `commitPickMove()` and then independently
+re-verify via `search_task()` (never trust the commit response alone
+— confirmed live early on that a genuine success can return a
+mostly-null echo). Unlike Cycle Count, **lines are independent** —
+confirmed live that completing one line doesn't require the others to
+be addressed first, so `complete_pick_task()` loops per line and
+continues past an individual failure rather than stopping the whole
+batch, and the frontend's per-line selection/completion model mirrors
+Putaway's (one line at a time), not Cycle Count's atomic per-group
+model.
+
+**Frontend**: new `#pickLinesTable` (Line / Source Location / Item /
+Description / Planned Qty / UOM / Completed Qty / Status), its own
+render/select/complete function set (`pickLineRowHtml()`,
+`selectPickLine()`, `completePickLineAction()`,
+`openAllPickLinesModal()`/`confirmAllPickLines()`), reusing
+`state.selectedTaskDetailId`/`getLineByTaskDetailId()` rather than a
+new state field (already documented as globally unique across every
+group). Completed Qty pre-fills with the planned quantity (matching
+Putaway's convention) — editable for exceptions later, per explicit
+instruction ("we can figure out exceptions later and start with happy
+path"). Header shows the real Task Id, live status (updates after a
+completion, since a line can auto-close the task), and every distinct
+oLPN across the task's lines.
+
+**Confirmed live end-to-end through the actual browser UI**
+(`PICK0593`, 2 lines): searched by TaskId, both lines correctly
+rendered with pre-filled planned quantities; completed line 1 alone
+(banner "Completed line 1.", header status live-updated to "In
+Progress"); Complete All correctly showed only the one remaining
+outstanding line in its confirmation modal, completed it, and the
+header updated to "Completed." Independently re-verified via direct
+API: `Task.Status: 8000`, both `TaskDetail.CompletedQuantity` matching
+planned exactly, real source on-hand decreased correctly at both
+locations. Also confirmed live: the lockdown correctly refuses a
+`PICK_INTO_TOTE` task with a clear message through the actual UI, and
+searching by oLPN correctly finds and loads its task (tested against
+`PICK0295`, which — an incidental discovery — turned out to itself
+span 4 different oLPNs across its own 4 lines; handled correctly
+without any special-casing since completion already keys off each
+line's own `olpnId`, not a task-level one).
+
+**Known limitation, not yet handled**: a multi-search batch mixing
+Pick with Cycle Count or generic task/iLPN results falls back to the
+generic table (same limitation already accepted for Cycle Count's own
+multi-search case) — realistic usage is one type at a time.
+
+**Remaining for later, explicitly deferred**: exceptions (short
+picks, item substitution, etc. — happy path only for now, per explicit
+instruction), `PICK_INTO_CART`/`PICK_INTO_TOTE`/`PICK_INTO_ILPN`
+support, the iLPN/full-container `PPK::0513` mystery, the
+`commitAllPickMoves` (byOlpn) taskless/paper-based path Glean
+originally proposed as the eventual production target (not yet tested
+at all — this session's scope stayed within the current tasked
+SS-DEMO environment), and closing/`EndTargetContainer` behavior beyond
+what's already been observed (every task tested so far auto-closed on
+its own without it being set).

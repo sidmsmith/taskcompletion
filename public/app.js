@@ -118,6 +118,8 @@
     linesBody: document.getElementById("linesBody"),
     cycleCountLinesTable: document.getElementById("cycleCountLinesTable"),
     cycleCountLinesBody: document.getElementById("cycleCountLinesBody"),
+    pickLinesTable: document.getElementById("pickLinesTable"),
+    pickLinesBody: document.getElementById("pickLinesBody"),
     fullLineBtn: document.getElementById("fullLineBtn"),
     allLinesBtn: document.getElementById("allLinesBtn"),
     actionStatus: document.getElementById("actionStatus"),
@@ -501,6 +503,7 @@
   function renderGroups() {
     state.selectedTaskDetailId = null;
     el.cycleCountLinesTable.style.display = "none";
+    el.pickLinesTable.style.display = "none";
     el.linesTable.style.display = "";
     renderTaskMeta();
     const multiGroup = state.groups.length > 1;
@@ -1015,6 +1018,7 @@
   function renderCycleCountGroups() {
     state.selectedCycleCountGroupKey = null;
     el.linesTable.style.display = "none";
+    el.pickLinesTable.style.display = "none";
     el.cycleCountLinesTable.style.display = "";
     renderCycleCountTaskMeta();
     el.cycleCountLinesBody.innerHTML = state.groups.map((g) => cycleCountGroupRowsHtml(g)).join("");
@@ -1549,15 +1553,21 @@
     // 2026-08-09) — route those through the cycle-count table exactly
     // like ad hoc, rather than the generic task rendering that would
     // otherwise misrender a Cycle Count task's own itemless TaskDetail.
-    // Mixed batches (some cycle-count, some not) aren't specially
-    // handled — falls back to the generic table, a known limitation.
+    // A real Pick TaskId or oLPN (2026-08-10) resolves into
+    // mode:"pick" groups the same way — routed to its own table below.
+    // Mixed batches (some cycle-count, some pick, some plain task)
+    // aren't specially handled — falls back to the generic table, a
+    // known limitation.
     const isTaskedCycleCount = groups.length > 0 && groups.every((g) => g.mode === "cycle_count");
+    const isPick = groups.length > 0 && groups.every((g) => g.mode === "pick");
     state.groups = groups;
     state.lastSearchValue = searchValue;
-    state.lastSearchMode = isTaskedCycleCount ? "cycle_count" : "task";
+    state.lastSearchMode = isTaskedCycleCount ? "cycle_count" : isPick ? "pick" : "task";
     state.lastSearchIsTaskedCycleCount = isTaskedCycleCount;
     if (isTaskedCycleCount) {
       renderCycleCountGroups();
+    } else if (isPick) {
+      renderPickGroups();
     } else {
       renderGroups();
     }
@@ -2052,6 +2062,289 @@
     if (reasonSelect) reasonSelect.classList.toggle("visible", visible);
   }
 
+  // ---------------------------------------------------------------------
+  // Picking (2026-08-10, eleventh session) — its own table
+  // (#pickLinesTable) but a much simpler completion model than Putaway
+  // or Cycle Count: no warning-confirm modal, no reason code, no
+  // location override — commitPickMove() is a plain source/destination/
+  // quantity commit. Confirmed live: synchronous (no polling needed,
+  // unlike Cycle Count's async booking) and one call closes the task
+  // automatically when it's the last open line (no separate "end"/
+  // "trigger" call, unlike Cycle Count). Lines are INDEPENDENT
+  // (confirmed live: completing one doesn't require the others to be
+  // addressed first, unlike Cycle Count's atomic multi-item locations),
+  // so selection/completion is per-LINE like Putaway, not per-GROUP
+  // like Cycle Count — reuses state.selectedTaskDetailId/
+  // getLineByTaskDetailId() (already documented as globally unique
+  // across every group) rather than a new state field.
+  //
+  // Locked down server-side (task_service._classify_pick_task()) to
+  // `TaskExecutionMode: "PICK_INTO_OLPN"` tasks with every line sourced
+  // from a plain `LOCATION` — an iLPN-sourced/full-container line hits
+  // a real, unresolved MAWM validation bug regardless of payload shape
+  // (see CLAUDE.md's Picking section), so those tasks are refused with
+  // a clear reason at search time and never reach this rendering code.
+  // ---------------------------------------------------------------------
+
+  function pickLineRowHtml(line) {
+    const isDone = line.status === "8000";
+    const qtyValue = isDone ? line.completedQuantity : line.plannedQuantity;
+    return `
+        <tr class="pick-line-row line-row" data-task-detail-id="${escapeAttr(line.taskDetailId)}">
+          <td>${escapeHtml(line.lineNumber)}</td>
+          <td>${escapeHtml(line.sourceLocationId)}</td>
+          <td>${escapeHtml(line.itemId)}</td>
+          <td><div class="col-desc-narrow" title="${escapeAttr(line.description)}">${escapeHtml(line.description)}</div></td>
+          <td class="col-qty-wide">${escapeHtml(line.plannedQuantity)}</td>
+          <td class="col-uom">${escapeHtml(line.uomTypeId)}</td>
+          <td class="col-qty-wide">
+            <input
+              type="number"
+              class="form-control pick-qty-input"
+              data-task-detail-id="${escapeAttr(line.taskDetailId)}"
+              value="${escapeAttr(qtyValue)}"
+              step="any"
+              ${isDone ? "disabled" : ""}
+            />
+          </td>
+          <td class="col-reason pick-result" data-task-detail-id="${escapeAttr(line.taskDetailId)}" data-done="${isDone}">${isDone ? "Completed" : ""}</td>
+        </tr>`;
+  }
+
+  function renderPickTaskMeta() {
+    const groups = state.groups;
+    if (groups.length === 1) {
+      const g = groups[0];
+      el.taskMeta.innerHTML = `
+        <span><strong>Task</strong> ${escapeHtml(g.taskId)}</span>
+        <span><strong>Status</strong> ${statusBadgeHtml(g.taskStatusLabel, g.taskStatus)}</span>
+        <span><strong>oLPN</strong> ${escapeHtml((g.olpnIds || []).join(", "))}</span>
+      `;
+      el.transactionIdValue.textContent = g.taskTransactionId || "Picking";
+    } else {
+      el.taskMeta.innerHTML = `<span><strong>${groups.length} tasks loaded</strong></span>`;
+      el.transactionIdValue.textContent = "Picking";
+    }
+  }
+
+  function renderPickGroups() {
+    state.selectedTaskDetailId = null;
+    el.linesTable.style.display = "none";
+    el.cycleCountLinesTable.style.display = "none";
+    el.pickLinesTable.style.display = "";
+    renderPickTaskMeta();
+    el.pickLinesBody.innerHTML = allLines().map((line) => pickLineRowHtml(line)).join("");
+    updatePickLineActionButtons();
+  }
+
+  function getPickQtyInput(taskDetailId) {
+    return el.pickLinesBody.querySelector(
+      '.pick-qty-input[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+  }
+
+  function isPickQtyValid(taskDetailId) {
+    const input = getPickQtyInput(taskDetailId);
+    if (!input) return false;
+    const raw = input.value.trim();
+    if (raw === "") return false;
+    return Number.isFinite(Number(raw));
+  }
+
+  function isPickLineDone(taskDetailId) {
+    const cell = el.pickLinesBody.querySelector(
+      '.pick-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    return !!cell && cell.dataset.done === "true";
+  }
+
+  function selectPickLine(taskDetailId) {
+    state.selectedTaskDetailId = taskDetailId;
+    el.pickLinesBody.querySelectorAll("tr.pick-line-row").forEach((row) => {
+      row.classList.toggle("selected", row.dataset.taskDetailId === String(taskDetailId));
+    });
+    updatePickLineActionButtons();
+  }
+
+  function outstandingPickLines() {
+    return allLines().filter((l) => !isPickLineDone(l.taskDetailId));
+  }
+
+  function updatePickLineActionButtons() {
+    const line = state.selectedTaskDetailId ? getLineByTaskDetailId(state.selectedTaskDetailId) : null;
+    const hasSelection = !!line;
+    const selectedDone = hasSelection && isPickLineDone(line.taskDetailId);
+    const selectedValid = hasSelection && !selectedDone && isPickQtyValid(line.taskDetailId);
+    el.fullLineBtn.disabled = !hasSelection || !selectedValid;
+    const outstanding = outstandingPickLines();
+    el.allLinesBtn.disabled = !outstanding.length || !outstanding.every((l) => isPickQtyValid(l.taskDetailId));
+  }
+
+  function setPickResultCell(taskDetailId, message, kind, done) {
+    const cell = el.pickLinesBody.querySelector(
+      '.pick-result[data-task-detail-id="' + CSS.escape(String(taskDetailId)) + '"]'
+    );
+    if (!cell) return;
+    cell.textContent = message;
+    cell.className = "col-reason pick-result" + (kind ? " " + kind : "");
+    cell.dataset.done = done ? "true" : "false";
+    if (done) {
+      const qtyInput = getPickQtyInput(taskDetailId);
+      if (qtyInput) qtyInput.disabled = true;
+    }
+  }
+
+  function pickResultKind(result) {
+    return result.success ? "success" : "error";
+  }
+
+  function pickResultText(result) {
+    if (result.success) {
+      return "Completed " + result.completedQuantity + (result.taskStatus === "8000" ? " — task closed" : "");
+    }
+    return result.error || "Failed";
+  }
+
+  async function completePickLineAction() {
+    const line = getSelectedLine();
+    if (!line) return;
+    if (isPickLineDone(line.taskDetailId)) return;
+    const qtyInput = getPickQtyInput(line.taskDetailId);
+    const quantity = qtyInput ? Number(qtyInput.value) : null;
+    setBusy(true, "Completing line " + line.lineNumber + "…");
+    try {
+      const result = await api("complete_pick_line", {
+        org: state.org,
+        token: state.token,
+        location: state.facility,
+        taskId: line.groupTaskId,
+        taskDetailId: line.taskDetailId,
+        sourceContainerId: line.sourceContainerId,
+        sourceContainerType: line.sourceContainerTypeId,
+        olpnId: line.olpnId,
+        transactionId: line.groupTaskTransactionId,
+        quantity,
+      });
+      setPickResultCell(line.taskDetailId, pickResultText(result), pickResultKind(result), result.success);
+      setActionStatus(
+        result.success ? "Completed line " + line.lineNumber + "." : result.error || "Complete failed",
+        result.success ? "success" : "error"
+      );
+      if (result.taskStatus) {
+        state.groups.forEach((g) => {
+          if (g.taskId === line.groupTaskId) {
+            g.taskStatus = result.taskStatus;
+            g.taskStatusLabel = result.taskStatusLabel;
+          }
+        });
+        renderPickTaskMeta();
+      }
+      updatePickLineActionButtons();
+    } catch (e) {
+      setPickResultCell(line.taskDetailId, e.message || String(e), "error", false);
+      setActionStatus(e.message || String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  let allPickLinesPending = [];
+
+  function openAllPickLinesModal() {
+    allPickLinesPending = outstandingPickLines();
+    if (!allPickLinesPending.length) {
+      setActionStatus("No outstanding lines to complete.", "");
+      return;
+    }
+    if (!allPickLinesPending.every((l) => isPickQtyValid(l.taskDetailId))) {
+      setActionStatus("Enter a Completed Qty for every line before completing all.", "error");
+      return;
+    }
+    el.allLinesList.innerHTML = allPickLinesPending
+      .map((l) => {
+        const qtyInput = getPickQtyInput(l.taskDetailId);
+        const qty = qtyInput ? qtyInput.value : l.plannedQuantity;
+        return `<li>Line ${escapeHtml(l.lineNumber)} — ${escapeHtml(l.itemId)}: ${escapeHtml(qty)}</li>`;
+      })
+      .join("");
+    allLinesModal.show();
+  }
+
+  /**
+   * Groups pending lines by task before submitting (2026-08-10) — a
+   * multi-search batch (several Pick TaskIds/oLPNs typed at once) can
+   * span more than one task, and complete_pick_task() commits all the
+   * lines of *one* task per call, so this fans out one call per task
+   * rather than assuming everything on screen belongs to a single one.
+   */
+  async function confirmAllPickLines() {
+    allLinesModal.hide();
+    const byTask = new Map();
+    allPickLinesPending.forEach((l) => {
+      const key = l.groupTaskId;
+      if (!byTask.has(key)) byTask.set(key, []);
+      byTask.get(key).push(l);
+    });
+    const total = allPickLinesPending.length;
+    let succeeded = 0;
+    const failures = [];
+    setBusy(true, "Completing " + total + " line(s)…");
+    for (const [taskId, lines] of byTask.entries()) {
+      const lineCompletions = lines.map((l) => {
+        const qtyInput = getPickQtyInput(l.taskDetailId);
+        return {
+          taskDetailId: l.taskDetailId,
+          sourceContainerId: l.sourceContainerId,
+          sourceContainerType: l.sourceContainerTypeId,
+          olpnId: l.olpnId,
+          transactionId: l.groupTaskTransactionId,
+          quantity: qtyInput ? Number(qtyInput.value) : null,
+        };
+      });
+      try {
+        const response = await api("complete_pick_task", {
+          org: state.org,
+          token: state.token,
+          location: state.facility,
+          taskId,
+          lineCompletions,
+        });
+        (response.results || []).forEach((r) => {
+          setPickResultCell(r.taskDetailId, pickResultText(r), pickResultKind(r), r.success);
+          if (r.success) succeeded++;
+          else failures.push("Line " + r.taskDetailId + ": " + (r.error || "failed"));
+        });
+        const g = state.groups.find((gr) => gr.taskId === taskId);
+        const last = (response.results || [])[response.results.length - 1];
+        if (g && last && last.taskStatus) {
+          g.taskStatus = last.taskStatus;
+          g.taskStatusLabel = last.taskStatusLabel;
+        }
+      } catch (e) {
+        lines.forEach((l) => failures.push("Line " + l.taskDetailId + ": " + (e.message || String(e))));
+      }
+    }
+    renderPickTaskMeta();
+    updatePickLineActionButtons();
+    setBusy(false);
+    setActionStatus(
+      failures.length
+        ? succeeded + " of " + total + " completed. Failures: " + failures.join("; ")
+        : "Completed all " + total + " line(s).",
+      failures.length ? "error" : "success"
+    );
+  }
+
+  el.pickLinesBody.addEventListener("click", (e) => {
+    const row = e.target.closest("tr.pick-line-row");
+    if (!row) return;
+    selectPickLine(row.dataset.taskDetailId);
+  });
+  el.pickLinesBody.addEventListener("input", (e) => {
+    const qtyInput = e.target.closest(".pick-qty-input");
+    if (qtyInput) updatePickLineActionButtons();
+  });
+
   const allLinesModal = window.bootstrap
     ? new window.bootstrap.Modal(document.getElementById("allLinesModal"))
     : null;
@@ -2062,14 +2355,17 @@
 
   el.fullLineBtn.addEventListener("click", () => {
     if (state.lastSearchMode === "cycle_count") completeCycleCountLine();
+    else if (state.lastSearchMode === "pick") completePickLineAction();
     else completeLine();
   });
   el.allLinesBtn.addEventListener("click", () => {
     if (state.lastSearchMode === "cycle_count") openAllCycleCountLinesModal();
+    else if (state.lastSearchMode === "pick") openAllPickLinesModal();
     else openAllLinesModal();
   });
   el.allLinesConfirmBtn.addEventListener("click", () => {
     if (state.lastSearchMode === "cycle_count") confirmAllCycleCountLines();
+    else if (state.lastSearchMode === "pick") confirmAllPickLines();
     else confirmAllLines();
   });
 

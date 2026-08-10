@@ -21,6 +21,8 @@ from task_service import (  # noqa: E402
     complete_cycle_count_line,
     complete_cycle_count_location,
     complete_line,
+    complete_pick_line,
+    complete_pick_task,
     complete_putaway_line,
     preload_adjustment_reason_codes,
     preload_putaway_locations,
@@ -36,7 +38,7 @@ app = Flask(__name__)
 PASSWORD = os.getenv("MANHATTAN_PASSWORD")
 CLIENT_SECRET = os.getenv("MANHATTAN_SECRET")
 APP_NAME = "taskcompletion-app"
-APP_VERSION = "0.13.3"
+APP_VERSION = "0.14.0"
 DEFAULT_ORG = os.getenv("MANHATTAN_DEFAULT_ORG", "SS-DEMO").strip().upper() or "SS-DEMO"
 TOKEN_FILE = ROOT / ".token"
 USAGE_INGEST_URL = os.getenv("MANHATTAN_USAGE_INGEST_URL", "").strip()
@@ -329,6 +331,77 @@ def check_cycle_count_location_status_route():
         return jsonify(result)
     except Exception as e:
         print(f"[CHECK_CYCLE_COUNT_LOCATION_STATUS] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/complete_pick_line", methods=["POST"])
+def complete_pick_line_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    task_id = (data.get("taskId") or data.get("task_id") or "").strip()
+    task_detail_id = (data.get("taskDetailId") or data.get("task_detail_id") or "").strip()
+    source_container_id = (data.get("sourceContainerId") or data.get("source_container_id") or "").strip()
+    source_container_type = (data.get("sourceContainerType") or data.get("source_container_type") or "").strip()
+    olpn_id = (data.get("olpnId") or data.get("olpn_id") or "").strip()
+    transaction_id = (data.get("transactionId") or data.get("transaction_id") or "").strip()
+    quantity = data.get("quantity")
+    try:
+        result = complete_pick_line(
+            token,
+            org,
+            task_id,
+            task_detail_id,
+            source_container_id,
+            source_container_type,
+            olpn_id,
+            transaction_id,
+            quantity,
+            location=location,
+        )
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "complete_pick_line_completed" if result.get("success") else "complete_pick_line_failed",
+                "org": org,
+                "taskId": task_id,
+                "taskDetailId": task_detail_id,
+            }
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[COMPLETE_PICK_LINE] {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/complete_pick_task", methods=["POST"])
+def complete_pick_task_route():
+    data = _json()
+    org, token, err = _require_auth_fields(data)
+    if err:
+        return err
+    location = (data.get("location") or data.get("facility") or "").strip() or None
+    task_id = (data.get("taskId") or data.get("task_id") or "").strip()
+    # [{"taskDetailId", "sourceContainerId", "sourceContainerType", "olpnId", "transactionId", "quantity"}, ...]
+    line_completions = data.get("lineCompletions") or data.get("line_completions") or []
+    try:
+        result = complete_pick_task(token, org, task_id, line_completions, location=location)
+        forward_usage_event(
+            {
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "event_name": "complete_pick_task_completed" if result.get("success") else "complete_pick_task_failed",
+                "org": org,
+                "taskId": task_id,
+                "lineCount": len(line_completions),
+            }
+        )
+        return jsonify(result)
+    except Exception as e:
+        print(f"[COMPLETE_PICK_TASK] {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

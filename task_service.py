@@ -60,6 +60,7 @@ from mawm_client import (
     DEFAULT_TRANSACTION_BY_TASK_TYPE,
     ILPN_CONSUMED_STATUS,
     LOCATION_ADJUSTMENT_STALE_RECORD_CODE,
+    PICK_TRANSACTION_TYPE_ID,
     PUTAWAY_WORKFLOW_SCRIPT_NAME,
     TASK_TYPE_LABELS,
     USER_DIRECTED_TRANSACTION_ID,
@@ -67,6 +68,7 @@ from mawm_client import (
     adjust_ilpn_inventory,
     adjust_location_inventory,
     apply_warning_overrides,
+    commit_pick_move,
     commit_putaway_move,
     complete_task,
     extract_message,
@@ -87,9 +89,11 @@ from mawm_client import (
     search_items,
     search_location_count_info,
     search_location_inventory,
+    search_olpn,
     search_putaway_reason_codes,
     search_task,
     search_task_id_for_container,
+    search_task_id_for_olpn,
     search_task_transactions,
     task_status_description,
     trigger_end_count,
@@ -550,6 +554,103 @@ def _resolve_cycle_count_task(
     return result
 
 
+# ---------------------------------------------------------------------
+# Picking (2026-08-10, eleventh session) — see mawm_client.py's
+# matching module docstring for the full confirmed-live API shape.
+# Locked down to `TaskExecutionMode: "PICK_INTO_OLPN"` tasks with every
+# line sourced from a plain `LOCATION` — anything else is refused with
+# a clear reason rather than guessed at, per explicit instruction
+# ("if you know exactly the scenario that causes the issue, you can
+# restrict those tasks for now"). `PICK_INTO_CART` (cart picking) is a
+# real strategy planned for later, not permanently excluded.
+# ---------------------------------------------------------------------
+
+_PICK_SUPPORTED_EXECUTION_MODE = "PICK_INTO_OLPN"
+
+
+def _classify_pick_task(raw_task: dict) -> tuple:
+    """Returns (is_supported: bool, reason: str) — reason is only
+    meaningful when not supported. See module docstring above for why
+    these two specific checks are the lockdown boundary.
+    """
+    exec_mode = str(_first(raw_task, "TaskExecutionMode") or "").strip()
+    if exec_mode != _PICK_SUPPORTED_EXECUTION_MODE:
+        return False, (
+            f"execution mode {exec_mode!r} is not yet supported here "
+            f"(only direct-to-oLPN picking is) — planned for later"
+        )
+    for line in raw_task.get("TaskDetail") or []:
+        source_type = str(_first(line, "SourceContainerTypeId") or "").strip()
+        if source_type and source_type != "LOCATION":
+            return False, (
+                f"a line sourced from a {source_type} container is not yet "
+                f"supported here — confirmed live this session that this hits "
+                f"an unresolved MAWM validation issue (PPK::0513) regardless "
+                f"of payload shape; see CLAUDE.md's Picking section"
+            )
+    return True, ""
+
+
+def _normalize_pick_lines(raw_task: dict, items: Dict[str, dict]) -> List[dict]:
+    raw_lines = raw_task.get("TaskDetail") or []
+    lines: List[Dict[str, Any]] = []
+    for idx, line in enumerate(raw_lines, start=1):
+        item_id = str(_first(line, "ItemId") or "")
+        item = items.get(item_id) or {}
+        planned = _dec(_first(line, "Quantity") or 0)
+        completed = _dec(_first(line, "CompletedQuantity") or 0)
+        lines.append(
+            {
+                "lineNumber": idx,
+                "taskDetailId": str(_first(line, "TaskDetailId") or idx),
+                "itemId": item_id,
+                "description": str(item.get("Description") or ""),
+                "sourceLocationId": str(_first(line, "SourceLocationId") or ""),
+                "sourceContainerId": str(_first(line, "SourceContainerId") or ""),
+                "sourceContainerTypeId": str(_first(line, "SourceContainerTypeId") or ""),
+                "uomTypeId": str(_first(line, "UomTypeId") or ""),
+                "olpnId": str(_first(line, "OlpnId") or ""),
+                "plannedQuantity": _num(planned),
+                "completedQuantity": _num(completed),
+                "status": str(_first(line, "Status") or ""),
+            }
+        )
+    return lines
+
+
+def _resolve_pick_task(raw_task: dict, task_id: str, token: str, org: str, dest: str) -> Dict[str, Any]:
+    """Routes a real Pick task found via resolve_search() (by TaskId or
+    by oLPN — see search_task_id_for_olpn()) into its own response
+    shape (`mode: "pick"`), refusing anything outside the confirmed-safe
+    scope via _classify_pick_task() rather than rendering it through
+    the generic Putaway-style _build_task_response().
+    """
+    supported, reason = _classify_pick_task(raw_task)
+    if not supported:
+        return {"success": False, "error": f"Pick task {task_id}: {reason}"}
+
+    raw_lines = raw_task.get("TaskDetail") or []
+    item_ids = [str(l.get("ItemId") or "") for l in raw_lines if l.get("ItemId")]
+    items = search_items(item_ids, token, org, location=dest) if item_ids else {}
+    lines = _normalize_pick_lines(raw_task, items)
+    olpn_ids = sorted({l["olpnId"] for l in lines if l["olpnId"]})
+
+    return {
+        "success": True,
+        "mode": "pick",
+        "taskId": task_id,
+        "facility": dest,
+        "taskType": "PICK",
+        "taskTypeLabel": "Picking",
+        "taskStatus": str(_first(raw_task, "Status") or ""),
+        "taskStatusLabel": task_status_description(_first(raw_task, "Status")),
+        "taskTransactionId": str(_first(raw_task, "TransactionId") or ""),
+        "olpnIds": olpn_ids,
+        "lineCount": len(lines),
+        "lines": lines,
+    }
+
+
 def resolve_search(
     token: str,
     org: str,
@@ -561,14 +662,18 @@ def resolve_search(
     1. Try `search_value` as a Task Id directly.
     2. Else try it as a container — resolve its open (not Completed/
        Canceled) Putaway task, if one exists, and load that.
-    3. Else, if `search_value` is at least a real iLPN, return a
+    3. Else try it as an oLPN — resolve its open Pick task(s), if any
+       (see search_task_id_for_olpn()'s docstring: an oLPN can be split
+       across more than one task; more than one match is refused
+       clearly here rather than guessed at).
+    4. Else, if `search_value` is at least a real iLPN, return a
        synthetic single "no open task" line: Current Location = the
        iLPN's real CurrentLocationId (may be blank), To Location blank
        (the operator must enter one — see complete_container_putaway()),
        Item/Description/Qty pulled from the container's actual on-hand
        inventory. `mode: "no_task"` tells the frontend to render/complete
        this differently than a real task.
-    4. Else, not found.
+    5. Else, not found.
     """
     search_value = (search_value or "").strip()
     if not search_value:
@@ -581,6 +686,8 @@ def resolve_search(
         transaction_type = str(_first(raw_task, "TransactionTypeId") or "").strip()
         if transaction_type == "Cycle Count":
             return _resolve_cycle_count_task(raw_task, search_value, token, org, dest)
+        if transaction_type == PICK_TRANSACTION_TYPE_ID:
+            return _resolve_pick_task(raw_task, search_value, token, org, dest)
         return _build_task_response(raw_task, search_value, token, org, dest)
 
     found_task_id = search_task_id_for_container(search_value, token, org, location=dest)
@@ -588,6 +695,21 @@ def resolve_search(
         raw_task = search_task(found_task_id, token, org, location=dest)
         if raw_task:
             return _build_task_response(raw_task, found_task_id, token, org, dest)
+
+    found_pick_task_ids = search_task_id_for_olpn(search_value, token, org, location=dest)
+    if len(found_pick_task_ids) == 1:
+        raw_task = search_task(found_pick_task_ids[0], token, org, location=dest)
+        if raw_task:
+            return _resolve_pick_task(raw_task, found_pick_task_ids[0], token, org, dest)
+    elif len(found_pick_task_ids) > 1:
+        return {
+            "success": False,
+            "error": (
+                f"oLPN {search_value} is split across {len(found_pick_task_ids)} "
+                f"tasks ({', '.join(found_pick_task_ids)}) — not yet supported, "
+                f"search by TaskId directly instead"
+            ),
+        }
 
     ilpn = search_ilpn_current_location(search_value, token, org, location=dest)
     if ilpn is None:
@@ -2457,3 +2579,146 @@ def check_cycle_count_location_status(
     }
     _attach_polled_task_status(response, task_id, token, org, dest)
     return response
+
+
+def complete_pick_line(
+    token: str,
+    org: str,
+    task_id: str,
+    task_detail_id: str,
+    source_container_id: str,
+    source_container_type: str,
+    olpn_id: str,
+    transaction_id: str,
+    quantity,
+    location: str = None,
+) -> Dict[str, Any]:
+    """Commits one Pick task-detail line via commitPickMove() and
+    independently re-verifies the outcome — confirmed live this session
+    that the commit response body alone can be misleadingly empty (a
+    genuine success returned a mostly-null echo the first time this was
+    tested), so this never trusts `success: true` from the commit call
+    by itself. Unlike Cycle Count, confirmed live that commitPickMove is
+    **synchronous** — the real outcome is already visible on an
+    immediate re-query, no polling needed — and that **one call closes
+    the task automatically** when it's the last open line, no separate
+    "end"/"trigger" call required.
+
+    Only ever called for `LOCATION`-sourced lines — the search/resolve
+    layer (`_classify_pick_task()`) already refuses to surface any task
+    containing an unsupported line, so this function doesn't re-check
+    that itself.
+    """
+    task_id = (task_id or "").strip()
+    task_detail_id = (task_detail_id or "").strip()
+    if not task_id or not task_detail_id:
+        return {"success": False, "error": "taskId and taskDetailId are required"}
+    if quantity is None:
+        return {"success": False, "error": "Quantity is required", "taskDetailId": task_detail_id}
+
+    dest = resolve_location(org, location)
+
+    try:
+        commit_result = commit_pick_move(
+            source_container_id,
+            source_container_type,
+            task_id,
+            task_detail_id,
+            olpn_id,
+            transaction_id,
+            quantity,
+            token,
+            org,
+            location=dest,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"commitPickMove failed: {exc}", "taskDetailId": task_detail_id}
+    if not (200 <= int(commit_result.get("_httpStatus") or 0) < 300):
+        return {
+            "success": False,
+            "error": extract_message(commit_result) or "commitPickMove failed",
+            "taskDetailId": task_detail_id,
+        }
+
+    try:
+        task = search_task(task_id, token, org, location=dest)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"Could not verify completion: {exc}", "taskDetailId": task_detail_id}
+    line = None
+    for td in (task.get("TaskDetail") or []) if task else []:
+        if str(td.get("TaskDetailId") or "") == task_detail_id:
+            line = td
+            break
+    if line is None:
+        return {
+            "success": False,
+            "error": "Could not verify completion — task detail not found after commit",
+            "taskDetailId": task_detail_id,
+        }
+
+    completed_qty = _dec(line.get("CompletedQuantity") or 0)
+    planned_qty = _dec(line.get("Quantity") or 0)
+    line_status = str(line.get("Status") or "")
+    return {
+        "success": line_status == "8000",
+        "taskId": task_id,
+        "taskDetailId": task_detail_id,
+        "completedQuantity": _num(completed_qty),
+        "plannedQuantity": _num(planned_qty),
+        "status": line_status,
+        "error": None if line_status == "8000" else f"Line not completed (status: {line_status})",
+        "taskStatus": str(task.get("Status") or "") if task else "",
+        "taskStatusLabel": task_status_description(task.get("Status")) if task else "",
+    }
+
+
+def complete_pick_task(
+    token: str, org: str, task_id: str, line_completions: List[dict], location: str = None
+) -> Dict[str, Any]:
+    """Completes multiple lines of one Pick task in a single call —
+    "submit all in one shot," per explicit instruction. Pick lines are
+    **independent** (confirmed live: completing one doesn't require the
+    others to be addressed first, unlike Cycle Count's atomic
+    multi-item locations), so this loops calling complete_pick_line()
+    once per line and continues past an individual failure rather than
+    stopping the whole batch — a picker can legitimately complete some
+    lines now and leave an exception for later.
+
+    `line_completions` is `[{"taskDetailId", "sourceContainerId",
+    "sourceContainerType", "olpnId", "transactionId", "quantity"}, ...]`.
+    """
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return {"success": False, "error": "taskId is required"}
+
+    dest = resolve_location(org, location)
+    results: List[Dict[str, Any]] = []
+    for completion in line_completions or []:
+        completion = completion or {}
+        task_detail_id = str(completion.get("taskDetailId") or "").strip()
+        quantity = completion.get("quantity")
+        if not task_detail_id or quantity is None:
+            results.append(
+                {"success": False, "taskDetailId": task_detail_id, "error": "taskDetailId and quantity are required"}
+            )
+            continue
+        results.append(
+            complete_pick_line(
+                token,
+                org,
+                task_id,
+                task_detail_id,
+                str(completion.get("sourceContainerId") or ""),
+                str(completion.get("sourceContainerType") or ""),
+                str(completion.get("olpnId") or ""),
+                str(completion.get("transactionId") or ""),
+                quantity,
+                location=dest,
+            )
+        )
+
+    return {
+        "success": bool(results) and all(r.get("success") for r in results),
+        "taskId": task_id,
+        "results": results,
+    }
