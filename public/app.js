@@ -93,6 +93,11 @@
     // taskDetailId -> integer (2026-08-10) — mints unique splitIds
     // across repeated splits of the same line; see nextSplitId().
     pickSplitCounters: {},
+    // Array of tote-kind groupKeys currently rendered on the Pick screen
+    // (2026-08-10) — repopulated by renderPickGroups() on every render.
+    // Used by duplicateToteGroupKeys() to scan across groups without a
+    // DOM query; see that function's docstring.
+    toteGroupKeysOnScreen: [],
   };
 
   function allLines() {
@@ -216,6 +221,12 @@
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
     themeList: document.getElementById("themeList"),
+    toteScannerRegion: document.getElementById("toteScannerRegion"),
+    toteScanConfirmPanel: document.getElementById("toteScanConfirmPanel"),
+    toteScanResultInput: document.getElementById("toteScanResultInput"),
+    toteScanConfirmStatus: document.getElementById("toteScanConfirmStatus"),
+    toteScanUseBtn: document.getElementById("toteScanUseBtn"),
+    toteScanRetryBtn: document.getElementById("toteScanRetryBtn"),
   };
 
   /** Case-insensitive query params: org/organization, theme, task/taskid/task_id/task-id */
@@ -2523,6 +2534,44 @@
     return state.toteGroupState[groupKey];
   }
 
+  /** Every tote-kind groupKey on screen (state.toteGroupKeysOnScreen,
+   * populated by renderPickGroups()) whose own trimmed, uppercased
+   * value collides with another group's — a cart's slot-based totes
+   * and any user-added tote (see "+ Add Tote") all share one flat
+   * namespace on a single task screen (2026-08-10, per explicit
+   * instruction: "we should not allow the same toteIDs on a single
+   * screen, whether its a cart or if a user adds a tote"). Includes
+   * locked (already-committed) groups in the scan — a locked box's own
+   * display never shows invalid (see pickGroupHeaderRowHtml()), but its
+   * value still has to block a *new* box from reusing it. Uppercased
+   * comparison since this is a client-side UX guard, not a data
+   * operation — the backend's own reuse check (validate_pick_tote_id())
+   * is the real source of truth. */
+  function duplicateToteGroupKeys() {
+    const byValue = new Map();
+    (state.toteGroupKeysOnScreen || []).forEach((key) => {
+      const raw = getToteGroupState(key).value;
+      const norm = String(raw || "").trim().toUpperCase();
+      if (!norm) return;
+      if (!byValue.has(norm)) byValue.set(norm, []);
+      byValue.get(norm).push(key);
+    });
+    const dupes = new Set();
+    byValue.forEach((keys) => {
+      if (keys.length > 1) keys.forEach((k) => dupes.add(k));
+    });
+    return dupes;
+  }
+
+  /** Re-renders every tote group's header display (2026-08-10) — a
+   * value change in one group can flip another group's duplicate
+   * status (see duplicateToteGroupKeys()), so a single-group render
+   * isn't enough once duplicates are possible. Cheap: at most a
+   * handful of groups per task. */
+  function refreshToteValidationDisplays() {
+    (state.toteGroupKeysOnScreen || []).forEach((key) => renderToteValidationState(key));
+  }
+
   /** Mints a unique splitId for a new piece of a split line
    * (2026-08-10) — see splitPickRow(). */
   function nextSplitId(taskDetailId) {
@@ -2537,9 +2586,11 @@
    * header at the top of the table) — same 10 columns as
    * #pickLinesTable's own (now-hidden, see .pick-repeats-headers)
    * <thead>, kept in sync by hand since there's no single source of
-   * truth for both. The blank `col-split` header (between Completed
+   * truth for both. The blank `col-split` header (between Picked
    * Qty and Reason Code) is the Split icon's own column — see
-   * pickLineRowHtml().
+   * pickLineRowHtml(). "Required Qty"/"Picked Qty" (2026-08-10, renamed
+   * from "Planned Qty"/"Completed Qty" per explicit instruction) —
+   * Pick-only; Putaway's #linesTable keeps its own original labels.
    */
   function pickColumnHeaderRowHtml() {
     return `
@@ -2548,9 +2599,9 @@
           <td class="col-loc">Source Location</td>
           <td class="col-item">Item</td>
           <td class="col-desc-narrow">Description</td>
-          <td class="col-qty-wide">Planned Qty</td>
+          <td class="col-qty-wide">Required Qty</td>
           <td class="col-uom"></td>
-          <td class="col-qty-wide">Completed Qty</td>
+          <td class="col-qty-wide">Picked Qty</td>
           <td class="col-split"></td>
           <td class="col-reason">Reason Code</td>
           <td class="col-reason">Status</td>
@@ -2569,32 +2620,55 @@
    * already-committed tote box back to empty. Also a drop target for
    * dragging a line into this group — see the dragover/drop listeners
    * near the bottom of this section — and its own drop target even
-   * when empty (an "+ Add Tote" group with zero rows so far).
+   * when empty (an "+ Add Tote" group with zero rows so far). A tote
+   * box also gates on duplicateToteGroupKeys() (2026-08-10) and offers
+   * a barcode/QR scan button (see openToteScanner()) beside the
+   * textbox, both max 500 characters — see the input's own maxlength.
    */
   function pickGroupHeaderRowHtml(groupKey, info) {
     const slotLabel = pickOlpnSlotLabel(info.slotId);
+    // Slot shown before TOTE/oLPN, bold/larger via .pick-olpn-slot
+    // (2026-08-10, per explicit instruction — a cart picker locates a
+    // group by its slot first, the container label second).
+    const slotHtml = slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : "";
     if (info.kind === "tote") {
       const hasValue = !!(info.value && info.value.trim());
+      const isDuplicate = !info.locked && duplicateToteGroupKeys().has(groupKey);
       // Not locked yet: invalid until a real check confirms it (empty,
-      // still checking, or confirmed bad all render red — only
-      // `validated === true` clears it). Locked (already committed):
-      // always fine, it already proved itself via a real commit.
-      const isInvalid = !info.locked && (!hasValue || info.validated !== true);
-      const message = info.locked ? "" : info.validating ? "Checking…" : info.validationMessage || "";
+      // still checking, confirmed bad, or a duplicate of another tote
+      // group already on this screen all render red — only
+      // `validated === true` with no duplicate clears it). Locked
+      // (already committed): always fine, it already proved itself via
+      // a real commit.
+      const isInvalid = !info.locked && (!hasValue || info.validated !== true || isDuplicate);
+      const message = info.locked
+        ? ""
+        : isDuplicate
+          ? "Duplicate tote id — already used on this screen"
+          : info.validating
+            ? "Checking…"
+            : info.validationMessage || "";
       return `
         <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="10">
-            <strong>TOTE</strong>
+            ${slotHtml}<strong>TOTE</strong>
             <input
               type="text"
               class="form-control tote-id-input${isInvalid ? " invalid" : ""}${info.validating ? " checking" : ""}"
               data-group-key="${escapeAttr(groupKey)}"
               placeholder="Enter tote id"
               value="${escapeAttr(info.value || "")}"
+              maxlength="500"
               ${info.locked ? "disabled" : ""}
             />
+            <button
+              type="button"
+              class="btn btn-outline-secondary btn-sm tote-scan-btn"
+              data-group-key="${escapeAttr(groupKey)}"
+              title="Scan barcode or QR code"
+              ${info.locked ? "disabled" : ""}
+            ><i class="fas fa-barcode" aria-hidden="true"></i><span class="visually-hidden">Scan tote</span></button>
             <span class="tote-validation-msg">${escapeHtml(message)}</span>
-            ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
             <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
         </tr>`;
@@ -2603,9 +2677,8 @@
     return `
         <tr class="pick-olpn-header" data-olpn-id="${escapeAttr(info.containerId)}" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="10">
-            <strong>oLPN</strong> ${escapeHtml(info.containerId)}
+            ${slotHtml}<strong>oLPN</strong> ${escapeHtml(info.containerId)}
             ${typeSize ? `<span class="pick-olpn-type-size">${escapeHtml(typeSize)}</span>` : ""}
-            ${slotLabel ? `<span class="pick-olpn-slot">${escapeHtml(slotLabel)}</span>` : ""}
             <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
         </tr>`;
@@ -2767,6 +2840,12 @@
       return { kind: "olpn", containerId: firstRow.olpnId, ...olpnInfo };
     };
 
+    // Feeds duplicateToteGroupKeys() (2026-08-10) — every tote-kind
+    // group currently on screen, so a duplicate scan never needs a DOM
+    // query and works the instant a value changes, before any
+    // debounced validation resolves.
+    state.toteGroupKeysOnScreen = groupKeys.filter((key) => groupInfoFor(key).kind === "tote");
+
     // slotId's own text isn't always a bare number (see
     // pickOlpnSlotLabel()'s docstring — "2", "Slot 1", "slot1" all seen
     // live), so sorting pulls out the first digit run rather than
@@ -2813,12 +2892,25 @@
     );
   }
 
+  /** Capped at this row's own required qty (2026-08-10, per explicit
+   * instruction: "we should not allow a user to submit a qty > the
+   * planned qty... we need to account for a split line as well") —
+   * the cap is `data-default-qty`, the row's own slice (its full
+   * remaining amount if not split, or just its own piece if it has
+   * been — see pickLineRowHtml()), not the line's original full
+   * Required Qty column value. The spinner's up-arrow is never blocked
+   * (see the qty `input` handler's `.exceeds` class) — only submission
+   * is gated, here and via updatePickLineActionButtons(). */
   function isPickQtyValid(splitId) {
     const input = getPickQtyInput(splitId);
     if (!input) return false;
     const raw = input.value.trim();
     if (raw === "") return false;
-    return Number.isFinite(Number(raw));
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return false;
+    const cap = Number(input.dataset.defaultQty);
+    if (Number.isFinite(cap) && value > cap) return false;
+    return true;
   }
 
   /** A short pick = entered qty strictly less than Planned Qty — see the
@@ -2849,18 +2941,24 @@
   }
 
   /** A tote-destined row requires its group's TOTE textbox to hold a
-   * *confirmed-valid* tote id before it can complete (2026-08-10,
-   * tightened from "just non-empty" once live validation was added —
-   * see scheduleToteValidation()) — an oLPN-destined row always
+   * *confirmed-valid*, non-duplicate tote id before it can complete
+   * (2026-08-10, tightened from "just non-empty" once live validation
+   * was added — see scheduleToteValidation() — then again to also
+   * reject a duplicate of another tote group already on this screen,
+   * see duplicateToteGroupKeys()) — an oLPN-destined row always
    * passes, since its container id is already known. A locked group
    * (already committed at least once) is always fine regardless of
-   * `validated`, since it already proved itself via a real commit.
-   * Takes a row (not just a splitId) since it needs pickRowGroupKey(),
-   * which needs the row's own isToteDestined/plannedSlotId/olpnId. */
+   * `validated`/duplicate status, since it already proved itself via a
+   * real commit. Takes a row (not just a splitId) since it needs
+   * pickRowGroupKey(), which needs the row's own
+   * isToteDestined/plannedSlotId/olpnId. */
   function isPickToteValid(row) {
     if (!row || !row.isToteDestined) return true;
-    const gs = getToteGroupState(pickRowGroupKey(row));
-    return gs.locked || gs.validated === true;
+    const key = pickRowGroupKey(row);
+    const gs = getToteGroupState(key);
+    if (gs.locked) return true;
+    if (duplicateToteGroupKeys().has(key)) return false;
+    return gs.validated === true;
   }
 
   /** Plain click toggles membership (2026-08-10, multi-select) — same
@@ -3061,7 +3159,10 @@
       return;
     }
     if (!allPickLinesPending.every((r) => isPickQtyValid(r.splitId))) {
-      setActionStatus("Enter a Completed Qty for every line before completing.", "error");
+      setActionStatus(
+        "Enter a Picked Qty (not exceeding the Required Qty) for every line before completing.",
+        "error"
+      );
       return;
     }
     if (!allPickLinesPending.every((r) => isPickReasonValid(r.splitId))) {
@@ -3069,7 +3170,10 @@
       return;
     }
     if (!allPickLinesPending.every((r) => isPickToteValid(r))) {
-      setActionStatus("Enter and confirm a valid Tote Id for every tote-destined line before completing.", "error");
+      setActionStatus(
+        "Enter and confirm a valid, unique Tote Id for every tote-destined line before completing.",
+        "error"
+      );
       return;
     }
     el.allLinesList.innerHTML = allPickLinesPending
@@ -3211,12 +3315,16 @@
     gs.validationMessage = "";
     if (!gs.value.trim()) {
       gs.validating = false;
-      renderToteValidationState(groupKey);
+      // A value change here can also resolve/create a duplicate for
+      // *another* group (2026-08-10 — see duplicateToteGroupKeys()), so
+      // every group's display needs a refresh, not just this one's.
+      refreshToteValidationDisplays();
       updatePickLineActionButtons();
       return;
     }
     gs.validating = true;
-    renderToteValidationState(groupKey);
+    refreshToteValidationDisplays();
+    updatePickLineActionButtons();
     toteValidateTimers[groupKey] = setTimeout(() => runToteValidation(groupKey), 1000);
   }
 
@@ -3225,7 +3333,7 @@
     const value = gs.value.trim();
     if (!value) {
       gs.validating = false;
-      renderToteValidationState(groupKey);
+      refreshToteValidationDisplays();
       return;
     }
     try {
@@ -3246,7 +3354,7 @@
       gs.validationMessage = e.message || String(e);
     }
     gs.validating = false;
-    renderToteValidationState(groupKey);
+    refreshToteValidationDisplays();
     updatePickLineActionButtons();
   }
 
@@ -3256,9 +3364,10 @@
     );
     if (!header) return;
     const gs = getToteGroupState(groupKey);
+    const isDuplicate = !gs.locked && duplicateToteGroupKeys().has(groupKey);
     const input = header.querySelector(".tote-id-input");
     if (input) {
-      const isInvalid = !gs.locked && (!gs.value.trim() || gs.validated !== true);
+      const isInvalid = !gs.locked && (!gs.value.trim() || gs.validated !== true || isDuplicate);
       input.classList.toggle("invalid", isInvalid);
       input.classList.toggle("checking", gs.validating);
     }
@@ -3268,7 +3377,228 @@
       msg.className = "tote-validation-msg";
       header.querySelector("td").appendChild(msg);
     }
-    msg.textContent = gs.locked ? "" : gs.validating ? "Checking…" : gs.validationMessage || "";
+    msg.textContent = gs.locked
+      ? ""
+      : isDuplicate
+        ? "Duplicate tote id — already used on this screen"
+        : gs.validating
+          ? "Checking…"
+          : gs.validationMessage || "";
+  }
+
+  /**
+   * Tote barcode/QR scanning (2026-08-10, per explicit instruction —
+   * "add a barcode icon on the right side of the input textbox similar
+   * to the inspection app... we should allow a QR code or a 2d
+   * barcode"). Same overall UX shape as the inspection app's own
+   * openBarcodeScanner()/handleBarcodeScan()/applyConfirmedBarcode()
+   * (scan → editable confirm panel → "Use this ID"/"Scan again"), which
+   * only decodes 1D formats via Quagga2. QR/2D support is added the
+   * same way `driver_pickup` combines engines — jsQR polls the same
+   * video element Quagga2 attaches to, via its own canvas/getImageData
+   * loop, racing Quagga2 rather than running as a sequential fallback
+   * (see the barcode-qr-scanning pattern doc in mawm_api_library).
+   * Whichever engine decodes first wins; both stop once a value is
+   * accepted into the confirm panel.
+   *
+   * `activeToteScanGroupKey` tracks which tote group's textbox the
+   * (single, shared) modal is scanning for — set by openToteScanner(),
+   * consumed by applyConfirmedToteScan(). The confirm panel's own input
+   * is intentionally editable and unbounded up to 500 chars (matching
+   * the tote textbox's own maxlength) rather than auto-applied on first
+   * decode: a QR code may encode a longer string (e.g. ~20 locations/
+   * LPNs) that only *contains* the real tote id, so the picker trims it
+   * down here before it's ever written into the tote textbox.
+   */
+  let activeToteScanGroupKey = null;
+  let quaggaToteScanActive = false;
+  let quaggaToteDetectedHandler = null;
+  let qrToteScanInterval = null;
+  let lastToteScanValue = "";
+  let lastToteScanAt = 0;
+
+  const toteScanModalEl = document.getElementById("toteScanModal");
+  const toteScanModal = window.bootstrap ? new window.bootstrap.Modal(toteScanModalEl) : null;
+
+  function resetToteScanConfirmPanel() {
+    if (el.toteScanConfirmPanel) el.toteScanConfirmPanel.hidden = true;
+    if (el.toteScanResultInput) el.toteScanResultInput.value = "";
+    if (el.toteScanConfirmStatus) el.toteScanConfirmStatus.textContent = "";
+  }
+
+  function updateToteScanConfirmStatus(value) {
+    if (!el.toteScanConfirmStatus) return;
+    const trimmed = String(value || "").trim();
+    if (!trimmed) {
+      el.toteScanConfirmStatus.textContent = "";
+      el.toteScanConfirmStatus.className = "tote-scan-confirm-status mb-2";
+      return;
+    }
+    el.toteScanConfirmStatus.textContent = "Will fill the tote id field with this value";
+    el.toteScanConfirmStatus.className = "tote-scan-confirm-status mb-2 text-success";
+  }
+
+  function showToteScanConfirmPanel(raw) {
+    if (!el.toteScanConfirmPanel || !el.toteScanResultInput) return;
+    el.toteScanResultInput.value = raw;
+    el.toteScanConfirmPanel.hidden = false;
+    updateToteScanConfirmStatus(raw);
+    el.toteScanResultInput.focus();
+    el.toteScanResultInput.select();
+  }
+
+  function stopToteScanner() {
+    if (quaggaToteScanActive && typeof Quagga !== "undefined") {
+      try {
+        if (quaggaToteDetectedHandler) {
+          Quagga.offDetected(quaggaToteDetectedHandler);
+          quaggaToteDetectedHandler = null;
+        }
+        Quagga.stop();
+      } catch (err) {
+        console.warn("[TOTE SCAN] Quagga stop failed:", err);
+      }
+      quaggaToteScanActive = false;
+    }
+    if (qrToteScanInterval) {
+      clearInterval(qrToteScanInterval);
+      qrToteScanInterval = null;
+    }
+    if (el.toteScannerRegion) el.toteScannerRegion.innerHTML = "";
+  }
+
+  function handleToteScanDetected(decodedText) {
+    const raw = String(decodedText || "").trim();
+    if (!raw) return;
+    const now = Date.now();
+    if (raw === lastToteScanValue && now - lastToteScanAt < 2500) return;
+    lastToteScanValue = raw;
+    lastToteScanAt = now;
+    stopToteScanner();
+    showToteScanConfirmPanel(raw);
+  }
+
+  /** jsQR polling loop (2026-08-10) — runs alongside Quagga2 against the
+   * same <video> element Quagga2 attaches to inside el.toteScannerRegion
+   * (Quagga2 owns the camera stream; this just reads frames from its
+   * video via its own canvas/getImageData, same approach as
+   * driver_pickup's startQRCodeScanning()). Retries every 500ms until
+   * Quagga2's video element actually exists, then polls every 300ms
+   * while the scanner is active. */
+  function startToteQrScanning() {
+    if (!window.jsQR) return;
+    const video = el.toteScannerRegion ? el.toteScannerRegion.querySelector("video") : null;
+    if (!video) {
+      setTimeout(() => {
+        if (quaggaToteScanActive) startToteQrScanning();
+      }, 500);
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    qrToteScanInterval = setInterval(() => {
+      if (!quaggaToteScanActive || video.readyState !== video.HAVE_ENOUGH_DATA) return;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const code = window.jsQR(imageData.data, imageData.width, imageData.height);
+      if (code && code.data) handleToteScanDetected(code.data);
+    }, 300);
+  }
+
+  function applyConfirmedToteScan() {
+    const raw = el.toteScanResultInput ? el.toteScanResultInput.value.trim() : "";
+    if (!raw || !activeToteScanGroupKey) return;
+    const groupKey = activeToteScanGroupKey;
+    if (toteScanModal) toteScanModal.hide();
+    const input = el.pickLinesBody.querySelector(
+      '.tote-id-input[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
+    );
+    if (input) {
+      input.value = raw;
+      // Real 'input' event, not a direct state write (2026-08-10) — the
+      // existing delegated el.pickLinesBody "input" listener already
+      // does exactly what a scanned value needs (getToteGroupState()
+      // update + scheduleToteValidation()); dispatching through it
+      // keeps this one code path instead of duplicating that logic.
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      // Group's row scrolled out / re-rendered mid-scan — still record
+      // the value so the next render picks it up.
+      getToteGroupState(groupKey).value = raw;
+      scheduleToteValidation(groupKey);
+    }
+  }
+
+  function openToteScanner(groupKey) {
+    if (typeof Quagga === "undefined") {
+      setActionStatus("Barcode scanning is not available in this browser", "error");
+      return;
+    }
+    activeToteScanGroupKey = groupKey;
+    lastToteScanValue = "";
+    lastToteScanAt = 0;
+    resetToteScanConfirmPanel();
+    if (toteScanModal) toteScanModal.show();
+    stopToteScanner();
+    if (!el.toteScannerRegion) return;
+
+    quaggaToteDetectedHandler = (result) => {
+      const code = result && result.codeResult && result.codeResult.code;
+      if (code) handleToteScanDetected(code);
+    };
+
+    Quagga.init(
+      {
+        inputStream: {
+          name: "Live",
+          type: "LiveStream",
+          target: el.toteScannerRegion,
+          constraints: {
+            width: { min: 640 },
+            height: { min: 480 },
+            facingMode: "environment",
+          },
+        },
+        locator: { patchSize: "medium", halfSample: true },
+        numOfWorkers: Math.min(2, navigator.hardwareConcurrency || 2),
+        decoder: { readers: ["code_128_reader", "code_39_reader"] },
+        locate: true,
+      },
+      (err) => {
+        if (err) {
+          console.warn("[TOTE SCAN] Quagga init failed:", err);
+          stopToteScanner();
+          if (toteScanModal) toteScanModal.hide();
+          setActionStatus("Could not start barcode camera", "error");
+          return;
+        }
+        quaggaToteScanActive = true;
+        Quagga.onDetected(quaggaToteDetectedHandler);
+        Quagga.start();
+        startToteQrScanning();
+      }
+    );
+  }
+
+  if (el.toteScanUseBtn) el.toteScanUseBtn.addEventListener("click", applyConfirmedToteScan);
+  if (el.toteScanRetryBtn) {
+    el.toteScanRetryBtn.addEventListener("click", () => openToteScanner(activeToteScanGroupKey));
+  }
+  if (el.toteScanResultInput) {
+    el.toteScanResultInput.addEventListener("input", () => {
+      updateToteScanConfirmStatus(el.toteScanResultInput.value);
+    });
+    el.toteScanResultInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") applyConfirmedToteScan();
+    });
+  }
+  if (toteScanModalEl) {
+    toteScanModalEl.addEventListener("hidden.bs.modal", () => {
+      stopToteScanner();
+      resetToteScanConfirmPanel();
+    });
   }
 
   // `error` doesn't bubble on <img>, so this listens on the capture
@@ -3295,6 +3625,11 @@
       splitPickRow(splitBtn.dataset.splitId);
       return;
     }
+    const scanBtn = e.target.closest(".tote-scan-btn");
+    if (scanBtn) {
+      openToteScanner(scanBtn.dataset.groupKey);
+      return;
+    }
     const row = e.target.closest("tr.pick-line-row");
     if (!row) return;
     selectPickRow(row.dataset.splitId);
@@ -3305,7 +3640,15 @@
       const value = Number(qtyInput.value);
       const planned = Number(qtyInput.dataset.defaultQty);
       const short = Number.isFinite(value) && Number.isFinite(planned) && value < planned;
+      // Over the row's own required qty (2026-08-10) — the up-arrow can
+      // still increment past it (nothing here blocks typing/spinning),
+      // but this flags it red and updatePickLineActionButtons() (via
+      // isPickQtyValid()) keeps Complete Line/Complete All disabled
+      // until it's brought back down.
+      const exceeds = Number.isFinite(value) && Number.isFinite(planned) && value > planned;
       qtyInput.classList.toggle("overridden", short);
+      qtyInput.classList.toggle("exceeds", exceeds);
+      qtyInput.title = exceeds ? "Exceeds required qty of " + planned : "";
       toggleReasonSelect(qtyInput, short);
       updatePickLineActionButtons();
       return;

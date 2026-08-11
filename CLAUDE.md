@@ -3531,3 +3531,153 @@ flakiness; DOM-level checks (`querySelector`, reading `.className`/
 `.textContent`/element properties directly) were used as the primary
 verification method throughout this round specifically because of it,
 with screenshots only for a final visual sanity check.
+
+## Picking: duplicate-tote guard, barcode/QR scan, qty cap, relabeled columns, Slot-first cart headers (2026-08-10, fourteenth session)
+
+Six items, all Pick-only, all per explicit instruction in one request:
+
+- **Duplicate tote id guard**: a cart's slot-based totes and any
+  user-added tote (`+ Add Tote`) now share one flat namespace per task
+  screen — two tote groups can no longer hold the same (trimmed,
+  uppercased) value at once. `duplicateToteGroupKeys()` scans
+  `state.toteGroupKeysOnScreen` (a new array, repopulated by
+  `renderPickGroups()` every render — every currently-rendered
+  tote-kind groupKey) and returns the set of groupKeys whose value
+  collides with another's; includes locked (already-committed) groups
+  in the scan so a *new* box can't reuse an already-real tote id, even
+  though a locked box's own display never shows invalid. Wired into
+  three places: `pickGroupHeaderRowHtml()`'s initial render,
+  `renderToteValidationState()`'s live re-render, and
+  `isPickToteValid()`'s submit gate. A single value change can flip
+  *another* group's duplicate status (typing into an empty box can
+  create or resolve a collision for a sibling already on screen), so
+  `refreshToteValidationDisplays()` re-renders every tote group's
+  header on each keystroke rather than just the one being edited —
+  confirmed live this actually matters (see Testing below).
+- **Barcode/QR scan on the tote textbox**: a scan button
+  (`.tote-scan-btn`, FontAwesome `fa-barcode`) sits to the right of
+  every tote input, opening a shared `#toteScanModal` — same UX shape
+  as the `inspection` app's own `#barcodeScanModal` (scan → editable
+  confirm panel → "Use this ID"/"Scan again"), ported deliberately
+  rather than copied verbatim because inspection only decodes 1D
+  formats via Quagga2 and this needed QR/2D too. Solved the same way
+  `driver_pickup` does it: jsQR polls the same `<video>` element
+  Quagga2 attaches to (own canvas/`getImageData` loop, 300ms interval),
+  racing Quagga2 rather than a sequential fallback — see the
+  `barcode-qr-scanning` pattern doc in `mawm_api_library` for why this
+  approach was chosen over `proofofdelivery`'s primary-with-fallback
+  design (simplicity over the extra multi-scan stability gate, since a
+  tote id is short/typo-obvious and the confirm-panel edit step is
+  already the real safety net). `openToteScanner(groupKey)` tracks
+  which group's textbox the shared modal is filling via
+  `activeToteScanGroupKey`. On "Use this ID", the target input's value
+  is set and a real `input` event is dispatched (`bubbles: true`)
+  rather than writing to `state.toteGroupState` directly — reuses the
+  exact same delegated listener a manually-typed value goes through
+  (value capture + `scheduleToteValidation()`), one code path instead
+  of two. Libraries: `@ericblade/quagga2@1.8.4` + `jsqr@1.4.0` from
+  jsDelivr, same exact versions already vetted live elsewhere in this
+  ecosystem (`inspection`, `driver_pickup`).
+- **500-char tote textbox**: `maxlength="500"` on both the inline tote
+  input and the scan modal's own confirm-panel input — a QR code may
+  encode a longer string (e.g. ~20 locations/LPNs) that only *contains*
+  the real tote id; the confirm panel's own editable field is where a
+  picker trims it down before it's ever written into the tote textbox,
+  not new parsing logic.
+- **Qty cap, accounting for splits**: `isPickQtyValid()` now rejects a
+  value greater than `data-default-qty` — the *row's own* required qty
+  (`row.quantity`: the full remaining line if never split, or just that
+  split's own slice if it has been — see `pickLineRowHtml()`), not the
+  line's original full Required Qty column value. Confirmed live this
+  distinction matters: a split row's own cap can be smaller than the
+  original line's Required Qty, and entering a value between the two
+  correctly still fails (see Testing). The spinner's up-arrow is never
+  blocked — only submission is gated, via a new `.pick-qty-input.exceeds`
+  class (red, mirrors the existing `.invalid` styling family) toggled
+  in the qty `input` handler alongside the pre-existing `.overridden`
+  (short-pick) logic; both `isPickQtyValid()` (used directly by
+  `completeLine`'s button-disable check) and `preparePickLinesModal()`
+  (shared by Complete All and multi-select) pick this up automatically
+  since both already called `isPickQtyValid()` for other reasons.
+- **Column labels**: "Planned Qty" → "Required Qty", "Completed Qty" →
+  "Picked Qty" — Pick-only (`#pickLinesTable`'s static `<thead>` and
+  `pickColumnHeaderRowHtml()`'s repeated-per-group header row). Putaway
+  and Cycle Count keep their own original labels; this was never asked
+  for there and their own `#linesTable`/`#cycleCountLinesTable` headers
+  were left untouched.
+- **Slot before TOTE/oLPN on cart tasks, bold/larger**: `.pick-olpn-slot`
+  moved from *after* the container label to *before* it in both branches
+  of `pickGroupHeaderRowHtml()` (e.g. "**Slot 3** oLPN 000009999...",
+  "**Slot 1** TOTE [textbox]") — a cart picker locates a group by its
+  slot first, the container label second. Styling changed from
+  `font-weight: 400` to `700` and added `font-size: 1.05em` (confirmed
+  via `getComputedStyle()`: `fontWeight: "700"`, computed to `15.12px`
+  against the page's `14.4px` base). Non-cart tasks are unaffected —
+  `slotLabel` is empty when there's no `PlannedSlotId`, so nothing
+  renders differently.
+
+**One incidental CSS fix required by the scan button's placement**: the
+existing `.tote-id-input.checking + .tote-validation-msg` rule (adjacent-
+sibling selector, `+`) broke once `.tote-scan-btn` was inserted between
+the input and the validation message in the DOM — changed to a general-
+sibling selector (`~`) so the "Checking…" italic styling still applies
+regardless of what sits between them.
+
+**Confirmed live end-to-end against real SS-DEMO tasks** (found via a
+direct `task/api/task/task/search` query for open
+`TransactionId ='Pick to Tote'`/`'Hybrid Pick Cart'` rows — the app
+itself has no task-browsing UI, so candidates were located the same way
+prior sessions did):
+- **`PICK0180`** (Pick To Tote, but this particular line actually has an
+  oLPN — confirms task classification is per-line, not per-transaction-
+  label, exactly as CLAUDE.md's cart-picking section already documents):
+  confirmed "Required Qty"/"Picked Qty" render correctly on a plain
+  oLPN-kind group.
+- **`PICK0319`** (Pick To Tote, one tote-destined line, Required Qty 10):
+  typed a tote id, confirmed it validates (blue/normal border after the
+  1s debounce); clicked "+ Add Tote", typed the *same* id into the new
+  group — both boxes turned red instantly with "Duplicate tote id —
+  already used on this screen" and Complete All disabled, all *before*
+  the debounced API call could have run, confirming duplicate detection
+  is instant and doesn't wait on `validate_pick_tote_id()`; corrected
+  the second box to a different id — both boxes cleared and Complete
+  All re-enabled. Then typed `15` into the Picked Qty (cap 10) — turned
+  red, Complete Line/Complete All both disabled; pressed the Up arrow
+  key twice while the value was already over cap — it kept incrementing
+  (17), confirming the spinner itself is never blocked, only submission;
+  reset to `10` — both buttons re-enabled. Split the line (two rows of
+  5 each) and typed `7` into the first split's Picked Qty — turned red
+  and disabled the buttons even though 7 is still under the *original*
+  line's Required Qty of 10, confirming the cap correctly uses the
+  split's own remaining slice (5), not the line's original full
+  quantity.
+- **`PICK0184`**/**`PICK0393`** (Hybrid Pick Cart, 3-4 slots each):
+  confirmed via `getComputedStyle()` that every rendered `.pick-olpn-slot`
+  is `font-weight: 700` at `1.05em`, and via direct DOM/screenshot that
+  the Slot text renders before both "TOTE" (tote-kind groups) and "oLPN
+  <id>" (oLPN-kind groups, e.g. `PICK0393`'s Slot 3 — an oLPN group
+  alongside two tote groups on the same task, confirming both branches
+  of the header function render the new order correctly).
+- **Barcode/QR scan modal, `PICK0393`**: opened the scanner from a real
+  tote textbox — Quagga2 genuinely initialized and started a live camera
+  feed (confirmed visually; this environment has real camera access, not
+  a stub), and both `Quagga`/`window.jsQR` loaded successfully with zero
+  console errors. Since driving an actual physical barcode/QR code
+  through a webcam isn't reproducible from this agent, the
+  decode→confirm→apply leg was exercised by directly populating
+  `#toteScanResultInput` and dispatching a real `input` event (the same
+  DOM path `handleToteScanDetected()`/`showToteScanConfirmPanel()` drive
+  after a real decode) and clicking the real "Use this ID" button — the
+  modal closed, the correct tote group's textbox received the scanned
+  value via a real dispatched `input` event (confirmed the *other*
+  slot's box was untouched), and it validated normally afterward.
+  Confirmed the modal correctly releases the camera on close
+  (`toteScannerRegion.innerHTML` empty, modal `.show` class removed)
+  before moving on — `stopToteScanner()` firing correctly off
+  `hidden.bs.modal`. `maxlength="500"` confirmed via direct DOM read on
+  both rendered tote inputs.
+
+No console errors were observed at any point across this round's testing
+(`read_console_messages` with `onlyErrors: true` came back empty after
+all of the above). Putaway/Cycle Count were not re-tested this round —
+nothing in this batch touched their code paths.
