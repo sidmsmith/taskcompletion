@@ -3681,3 +3681,57 @@ No console errors were observed at any point across this round's testing
 (`read_console_messages` with `onlyErrors: true` came back empty after
 all of the above). Putaway/Cycle Count were not re-tested this round —
 nothing in this batch touched their code paths.
+
+### Correction, same day: scan button + 500-char textbox moved to the initial search box
+
+The barcode/QR scan button and 500-character textbox described above
+were built against the Pick tote textbox — **wrong location**, per
+explicit correction: *"the barcode button and 500 character textbox is
+for the initial prompt screen, not the tote textbox."* "The prompt"
+means the main `#taskIdInput` search box ("Task Id, iLPN, or Storage
+Location"), the very first screen after authenticating — the same
+screen/field the earlier design discussion (this document's "Picking:
+live tote validation, split icon, item thumbnails" section) already
+modeled after the inspection app's `#criteria`/`.criteria-scan-btn`
+pattern for barcode scanning in general; the scan feature just landed
+on the wrong specific input this round.
+
+**Everything scanning/500-char-related was moved, not duplicated**:
+- `#taskIdInput` now sits in a `.criteria-input-row` flex wrapper next
+  to a new `#taskScanBtn` (`.criteria-scan-btn`, matching inspection's
+  own class name this time), both disabled until authentication enables
+  them (mirrors `el.taskIdInput.disabled = false` in the same spot).
+  `maxlength="500"` moved onto `#taskIdInput` itself.
+- The modal (`#toteScanModal` → `#taskScanModal`, "Scan Tote" →
+  "Scan Barcode", hint text now says "for a Task Id, iLPN, or Storage
+  Location") and every function/variable in the scanning module were
+  renamed tote→task throughout (`openToteScanner()` →
+  `openTaskScanner()`, `activeToteScanGroupKey` removed entirely since
+  there's only one fixed target now, not a per-group one) — no
+  leftover `tote-scan`/`toteScan` references remain (confirmed via a
+  full-file grep on both `app.js` and `index.html`).
+- `applyConfirmedTaskScan()` sets `el.taskIdInput.value` and dispatches
+  a real `input` event, same reused-listener approach as before
+  (`updateLoadButton()` already does exactly what a scanned value
+  needs — classify it and enable Confirm — no new logic required).
+- The Pick tote textbox (`.tote-id-input`) reverted to exactly its
+  pre-scan state: no scan button, no `maxlength`, and the
+  `.tote-id-input.checking + .tote-validation-msg` CSS selector reverted
+  from the general-sibling (`~`) fix back to adjacent-sibling (`+`)
+  since the scan button that came between them is gone.
+- **Untouched by this correction**: duplicate-tote detection
+  (`duplicateToteGroupKeys()`), the qty cap, the "Required Qty"/"Picked
+  Qty" relabel, and the Slot-before-TOTE/oLPN styling — none of those
+  were ever about the tote scan button, so none of that code changed.
+
+**Confirmed live** (`v0.22.1`, real camera activation again, this time
+from `#taskScanBtn`): opened the scanner from the initial search screen
+— hint text correctly read "for a Task Id, iLPN, or Storage Location";
+simulated a decode via the confirm panel (`PICK0393`) and clicked the
+real "Use this ID" button — the modal closed, `#taskIdInput` received
+the value via a real dispatched `input` event, focused itself, and
+"Confirm" enabled with the "Press Enter or click Confirm." hint;
+pressed Enter and the task loaded correctly. Confirmed via direct DOM
+read: `#taskIdInput.maxLength === 500`, both rendered `.tote-id-input`
+elements back to `maxLength === -1` (no attribute), and the camera
+region/modal `.show` class both cleared after close. No console errors.

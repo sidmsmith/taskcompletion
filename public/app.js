@@ -221,12 +221,13 @@
     themeLogo: document.getElementById("themeLogo"),
     themeSelectorBtn: document.getElementById("themeSelectorBtn"),
     themeList: document.getElementById("themeList"),
-    toteScannerRegion: document.getElementById("toteScannerRegion"),
-    toteScanConfirmPanel: document.getElementById("toteScanConfirmPanel"),
-    toteScanResultInput: document.getElementById("toteScanResultInput"),
-    toteScanConfirmStatus: document.getElementById("toteScanConfirmStatus"),
-    toteScanUseBtn: document.getElementById("toteScanUseBtn"),
-    toteScanRetryBtn: document.getElementById("toteScanRetryBtn"),
+    taskScanBtn: document.getElementById("taskScanBtn"),
+    taskScannerRegion: document.getElementById("taskScannerRegion"),
+    taskScanConfirmPanel: document.getElementById("taskScanConfirmPanel"),
+    taskScanResultInput: document.getElementById("taskScanResultInput"),
+    taskScanConfirmStatus: document.getElementById("taskScanConfirmStatus"),
+    taskScanUseBtn: document.getElementById("taskScanUseBtn"),
+    taskScanRetryBtn: document.getElementById("taskScanRetryBtn"),
   };
 
   /** Case-insensitive query params: org/organization, theme, task/taskid/task_id/task-id */
@@ -384,6 +385,7 @@
       el.orgSection.style.display = "none";
       el.mainUI.style.display = "block";
       el.taskIdInput.disabled = false;
+      if (el.taskScanBtn) el.taskScanBtn.disabled = false;
       el.taskIdInput.focus();
       const via =
         data.source === "token-file"
@@ -2621,9 +2623,8 @@
    * dragging a line into this group — see the dragover/drop listeners
    * near the bottom of this section — and its own drop target even
    * when empty (an "+ Add Tote" group with zero rows so far). A tote
-   * box also gates on duplicateToteGroupKeys() (2026-08-10) and offers
-   * a barcode/QR scan button (see openToteScanner()) beside the
-   * textbox, both max 500 characters — see the input's own maxlength.
+   * box also gates on duplicateToteGroupKeys() (2026-08-10) — see that
+   * function's docstring.
    */
   function pickGroupHeaderRowHtml(groupKey, info) {
     const slotLabel = pickOlpnSlotLabel(info.slotId);
@@ -2658,16 +2659,8 @@
               data-group-key="${escapeAttr(groupKey)}"
               placeholder="Enter tote id"
               value="${escapeAttr(info.value || "")}"
-              maxlength="500"
               ${info.locked ? "disabled" : ""}
             />
-            <button
-              type="button"
-              class="btn btn-outline-secondary btn-sm tote-scan-btn"
-              data-group-key="${escapeAttr(groupKey)}"
-              title="Scan barcode or QR code"
-              ${info.locked ? "disabled" : ""}
-            ><i class="fas fa-barcode" aria-hidden="true"></i><span class="visually-hidden">Scan tote</span></button>
             <span class="tote-validation-msg">${escapeHtml(message)}</span>
             <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
@@ -3387,10 +3380,11 @@
   }
 
   /**
-   * Tote barcode/QR scanning (2026-08-10, per explicit instruction —
-   * "add a barcode icon on the right side of the input textbox similar
-   * to the inspection app... we should allow a QR code or a 2d
-   * barcode"). Same overall UX shape as the inspection app's own
+   * Barcode/QR scanning on the main Task Id/iLPN/Location search box
+   * (2026-08-10, corrected same-day — originally built against the Pick
+   * tote textbox, per explicit correction: "the barcode button and 500
+   * character textbox is for the initial prompt screen, not the tote
+   * textbox"). Same overall UX shape as the inspection app's own
    * openBarcodeScanner()/handleBarcodeScan()/applyConfirmedBarcode()
    * (scan → editable confirm panel → "Use this ID"/"Scan again"), which
    * only decodes 1D formats via Quagga2. QR/2D support is added the
@@ -3401,152 +3395,138 @@
    * Whichever engine decodes first wins; both stop once a value is
    * accepted into the confirm panel.
    *
-   * `activeToteScanGroupKey` tracks which tote group's textbox the
-   * (single, shared) modal is scanning for — set by openToteScanner(),
-   * consumed by applyConfirmedToteScan(). The confirm panel's own input
-   * is intentionally editable and unbounded up to 500 chars (matching
-   * the tote textbox's own maxlength) rather than auto-applied on first
-   * decode: a QR code may encode a longer string (e.g. ~20 locations/
-   * LPNs) that only *contains* the real tote id, so the picker trims it
-   * down here before it's ever written into the tote textbox.
+   * The confirm panel's own input is intentionally editable and
+   * unbounded up to 500 chars (matching el.taskIdInput's own maxlength)
+   * rather than auto-applied on first decode: a QR code may encode a
+   * longer string (e.g. ~20 locations/LPNs) that only *contains* the
+   * real id, so the picker trims it down here before it's ever written
+   * into the search box.
    */
-  let activeToteScanGroupKey = null;
-  let quaggaToteScanActive = false;
-  let quaggaToteDetectedHandler = null;
-  let qrToteScanInterval = null;
-  let lastToteScanValue = "";
-  let lastToteScanAt = 0;
+  let quaggaTaskScanActive = false;
+  let quaggaTaskDetectedHandler = null;
+  let qrTaskScanInterval = null;
+  let lastTaskScanValue = "";
+  let lastTaskScanAt = 0;
 
-  const toteScanModalEl = document.getElementById("toteScanModal");
-  const toteScanModal = window.bootstrap ? new window.bootstrap.Modal(toteScanModalEl) : null;
+  const taskScanModalEl = document.getElementById("taskScanModal");
+  const taskScanModal = window.bootstrap ? new window.bootstrap.Modal(taskScanModalEl) : null;
 
-  function resetToteScanConfirmPanel() {
-    if (el.toteScanConfirmPanel) el.toteScanConfirmPanel.hidden = true;
-    if (el.toteScanResultInput) el.toteScanResultInput.value = "";
-    if (el.toteScanConfirmStatus) el.toteScanConfirmStatus.textContent = "";
+  function resetTaskScanConfirmPanel() {
+    if (el.taskScanConfirmPanel) el.taskScanConfirmPanel.hidden = true;
+    if (el.taskScanResultInput) el.taskScanResultInput.value = "";
+    if (el.taskScanConfirmStatus) el.taskScanConfirmStatus.textContent = "";
   }
 
-  function updateToteScanConfirmStatus(value) {
-    if (!el.toteScanConfirmStatus) return;
+  function updateTaskScanConfirmStatus(value) {
+    if (!el.taskScanConfirmStatus) return;
     const trimmed = String(value || "").trim();
     if (!trimmed) {
-      el.toteScanConfirmStatus.textContent = "";
-      el.toteScanConfirmStatus.className = "tote-scan-confirm-status mb-2";
+      el.taskScanConfirmStatus.textContent = "";
+      el.taskScanConfirmStatus.className = "task-scan-confirm-status mb-2";
       return;
     }
-    el.toteScanConfirmStatus.textContent = "Will fill the tote id field with this value";
-    el.toteScanConfirmStatus.className = "tote-scan-confirm-status mb-2 text-success";
+    el.taskScanConfirmStatus.textContent = "Will fill the search field with this value";
+    el.taskScanConfirmStatus.className = "task-scan-confirm-status mb-2 text-success";
   }
 
-  function showToteScanConfirmPanel(raw) {
-    if (!el.toteScanConfirmPanel || !el.toteScanResultInput) return;
-    el.toteScanResultInput.value = raw;
-    el.toteScanConfirmPanel.hidden = false;
-    updateToteScanConfirmStatus(raw);
-    el.toteScanResultInput.focus();
-    el.toteScanResultInput.select();
+  function showTaskScanConfirmPanel(raw) {
+    if (!el.taskScanConfirmPanel || !el.taskScanResultInput) return;
+    el.taskScanResultInput.value = raw;
+    el.taskScanConfirmPanel.hidden = false;
+    updateTaskScanConfirmStatus(raw);
+    el.taskScanResultInput.focus();
+    el.taskScanResultInput.select();
   }
 
-  function stopToteScanner() {
-    if (quaggaToteScanActive && typeof Quagga !== "undefined") {
+  function stopTaskScanner() {
+    if (quaggaTaskScanActive && typeof Quagga !== "undefined") {
       try {
-        if (quaggaToteDetectedHandler) {
-          Quagga.offDetected(quaggaToteDetectedHandler);
-          quaggaToteDetectedHandler = null;
+        if (quaggaTaskDetectedHandler) {
+          Quagga.offDetected(quaggaTaskDetectedHandler);
+          quaggaTaskDetectedHandler = null;
         }
         Quagga.stop();
       } catch (err) {
-        console.warn("[TOTE SCAN] Quagga stop failed:", err);
+        console.warn("[TASK SCAN] Quagga stop failed:", err);
       }
-      quaggaToteScanActive = false;
+      quaggaTaskScanActive = false;
     }
-    if (qrToteScanInterval) {
-      clearInterval(qrToteScanInterval);
-      qrToteScanInterval = null;
+    if (qrTaskScanInterval) {
+      clearInterval(qrTaskScanInterval);
+      qrTaskScanInterval = null;
     }
-    if (el.toteScannerRegion) el.toteScannerRegion.innerHTML = "";
+    if (el.taskScannerRegion) el.taskScannerRegion.innerHTML = "";
   }
 
-  function handleToteScanDetected(decodedText) {
+  function handleTaskScanDetected(decodedText) {
     const raw = String(decodedText || "").trim();
     if (!raw) return;
     const now = Date.now();
-    if (raw === lastToteScanValue && now - lastToteScanAt < 2500) return;
-    lastToteScanValue = raw;
-    lastToteScanAt = now;
-    stopToteScanner();
-    showToteScanConfirmPanel(raw);
+    if (raw === lastTaskScanValue && now - lastTaskScanAt < 2500) return;
+    lastTaskScanValue = raw;
+    lastTaskScanAt = now;
+    stopTaskScanner();
+    showTaskScanConfirmPanel(raw);
   }
 
   /** jsQR polling loop (2026-08-10) — runs alongside Quagga2 against the
-   * same <video> element Quagga2 attaches to inside el.toteScannerRegion
+   * same <video> element Quagga2 attaches to inside el.taskScannerRegion
    * (Quagga2 owns the camera stream; this just reads frames from its
    * video via its own canvas/getImageData, same approach as
    * driver_pickup's startQRCodeScanning()). Retries every 500ms until
    * Quagga2's video element actually exists, then polls every 300ms
    * while the scanner is active. */
-  function startToteQrScanning() {
+  function startTaskQrScanning() {
     if (!window.jsQR) return;
-    const video = el.toteScannerRegion ? el.toteScannerRegion.querySelector("video") : null;
+    const video = el.taskScannerRegion ? el.taskScannerRegion.querySelector("video") : null;
     if (!video) {
       setTimeout(() => {
-        if (quaggaToteScanActive) startToteQrScanning();
+        if (quaggaTaskScanActive) startTaskQrScanning();
       }, 500);
       return;
     }
     const canvas = document.createElement("canvas");
     const context = canvas.getContext("2d");
-    qrToteScanInterval = setInterval(() => {
-      if (!quaggaToteScanActive || video.readyState !== video.HAVE_ENOUGH_DATA) return;
+    qrTaskScanInterval = setInterval(() => {
+      if (!quaggaTaskScanActive || video.readyState !== video.HAVE_ENOUGH_DATA) return;
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
       const code = window.jsQR(imageData.data, imageData.width, imageData.height);
-      if (code && code.data) handleToteScanDetected(code.data);
+      if (code && code.data) handleTaskScanDetected(code.data);
     }, 300);
   }
 
-  function applyConfirmedToteScan() {
-    const raw = el.toteScanResultInput ? el.toteScanResultInput.value.trim() : "";
-    if (!raw || !activeToteScanGroupKey) return;
-    const groupKey = activeToteScanGroupKey;
-    if (toteScanModal) toteScanModal.hide();
-    const input = el.pickLinesBody.querySelector(
-      '.tote-id-input[data-group-key="' + CSS.escape(String(groupKey)) + '"]'
-    );
-    if (input) {
-      input.value = raw;
-      // Real 'input' event, not a direct state write (2026-08-10) — the
-      // existing delegated el.pickLinesBody "input" listener already
-      // does exactly what a scanned value needs (getToteGroupState()
-      // update + scheduleToteValidation()); dispatching through it
-      // keeps this one code path instead of duplicating that logic.
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    } else {
-      // Group's row scrolled out / re-rendered mid-scan — still record
-      // the value so the next render picks it up.
-      getToteGroupState(groupKey).value = raw;
-      scheduleToteValidation(groupKey);
-    }
+  function applyConfirmedTaskScan() {
+    const raw = el.taskScanResultInput ? el.taskScanResultInput.value.trim() : "";
+    if (!raw) return;
+    if (taskScanModal) taskScanModal.hide();
+    el.taskIdInput.value = raw;
+    // Real 'input' event, not a direct assignment (2026-08-10) — the
+    // existing el.taskIdInput "input" listener (updateLoadButton) already
+    // does exactly what a scanned value needs (classification + enabling
+    // Confirm); dispatching through it keeps this one code path instead
+    // of duplicating that logic.
+    el.taskIdInput.dispatchEvent(new Event("input", { bubbles: true }));
+    el.taskIdInput.focus();
   }
 
-  function openToteScanner(groupKey) {
+  function openTaskScanner() {
     if (typeof Quagga === "undefined") {
-      setActionStatus("Barcode scanning is not available in this browser", "error");
+      setStatus("Barcode scanning is not available in this browser", "error");
       return;
     }
-    activeToteScanGroupKey = groupKey;
-    lastToteScanValue = "";
-    lastToteScanAt = 0;
-    resetToteScanConfirmPanel();
-    if (toteScanModal) toteScanModal.show();
-    stopToteScanner();
-    if (!el.toteScannerRegion) return;
+    lastTaskScanValue = "";
+    lastTaskScanAt = 0;
+    resetTaskScanConfirmPanel();
+    if (taskScanModal) taskScanModal.show();
+    stopTaskScanner();
+    if (!el.taskScannerRegion) return;
 
-    quaggaToteDetectedHandler = (result) => {
+    quaggaTaskDetectedHandler = (result) => {
       const code = result && result.codeResult && result.codeResult.code;
-      if (code) handleToteScanDetected(code);
+      if (code) handleTaskScanDetected(code);
     };
 
     Quagga.init(
@@ -3554,7 +3534,7 @@
         inputStream: {
           name: "Live",
           type: "LiveStream",
-          target: el.toteScannerRegion,
+          target: el.taskScannerRegion,
           constraints: {
             width: { min: 640 },
             height: { min: 480 },
@@ -3568,36 +3548,35 @@
       },
       (err) => {
         if (err) {
-          console.warn("[TOTE SCAN] Quagga init failed:", err);
-          stopToteScanner();
-          if (toteScanModal) toteScanModal.hide();
-          setActionStatus("Could not start barcode camera", "error");
+          console.warn("[TASK SCAN] Quagga init failed:", err);
+          stopTaskScanner();
+          if (taskScanModal) taskScanModal.hide();
+          setStatus("Could not start barcode camera", "error");
           return;
         }
-        quaggaToteScanActive = true;
-        Quagga.onDetected(quaggaToteDetectedHandler);
+        quaggaTaskScanActive = true;
+        Quagga.onDetected(quaggaTaskDetectedHandler);
         Quagga.start();
-        startToteQrScanning();
+        startTaskQrScanning();
       }
     );
   }
 
-  if (el.toteScanUseBtn) el.toteScanUseBtn.addEventListener("click", applyConfirmedToteScan);
-  if (el.toteScanRetryBtn) {
-    el.toteScanRetryBtn.addEventListener("click", () => openToteScanner(activeToteScanGroupKey));
-  }
-  if (el.toteScanResultInput) {
-    el.toteScanResultInput.addEventListener("input", () => {
-      updateToteScanConfirmStatus(el.toteScanResultInput.value);
+  if (el.taskScanBtn) el.taskScanBtn.addEventListener("click", openTaskScanner);
+  if (el.taskScanUseBtn) el.taskScanUseBtn.addEventListener("click", applyConfirmedTaskScan);
+  if (el.taskScanRetryBtn) el.taskScanRetryBtn.addEventListener("click", openTaskScanner);
+  if (el.taskScanResultInput) {
+    el.taskScanResultInput.addEventListener("input", () => {
+      updateTaskScanConfirmStatus(el.taskScanResultInput.value);
     });
-    el.toteScanResultInput.addEventListener("keypress", (e) => {
-      if (e.key === "Enter") applyConfirmedToteScan();
+    el.taskScanResultInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") applyConfirmedTaskScan();
     });
   }
-  if (toteScanModalEl) {
-    toteScanModalEl.addEventListener("hidden.bs.modal", () => {
-      stopToteScanner();
-      resetToteScanConfirmPanel();
+  if (taskScanModalEl) {
+    taskScanModalEl.addEventListener("hidden.bs.modal", () => {
+      stopTaskScanner();
+      resetTaskScanConfirmPanel();
     });
   }
 
@@ -3623,11 +3602,6 @@
     const splitBtn = e.target.closest(".pick-split-btn");
     if (splitBtn) {
       splitPickRow(splitBtn.dataset.splitId);
-      return;
-    }
-    const scanBtn = e.target.closest(".tote-scan-btn");
-    if (scanBtn) {
-      openToteScanner(scanBtn.dataset.groupKey);
       return;
     }
     const row = e.target.closest("tr.pick-line-row");
