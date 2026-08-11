@@ -3802,3 +3802,74 @@ no red, no reason prompt — the exact case that was broken, now fixed
 **both** rows correctly showed "Select Reason Code" with `fullLineBtn`/
 `allLinesBtn` both disabled (confirmed via direct `.disabled` read, not
 just visually). No console errors at any point.
+
+## Picking: reason code choice syncs across split siblings, by taskDetailId (2026-08-11)
+
+The user objected to the fix above requiring a *separate* reason-code
+selection on every open row in a short split group — reasonable to gate
+on (per the design discussion, since which specific row "caused" an
+aggregate shortfall usually isn't determinable), but tedious to actually
+fill in twice for what's conceptually one explanation. Discussed three
+options before coding, per explicit request to "chat before you code
+the fix":
+- (a) show the prompt on only the "original" row — rejected: after a
+  split there's no single row that's meaningfully "the original" (both
+  are new synthetic rows), and the designation gets worse with a
+  re-split or once that row completes first, leaving no active prompt
+  for a still-open, still-short sibling.
+- (c) my own suggested alternative — one shared prompt attached to the
+  *group's header* rather than any specific row — also rejected, but
+  only after the user asked "how would that work when a line is moved
+  to another tote?" and the answer was: it doesn't. Once a split row is
+  dragged to a *different* tote (exactly what splitting is designed to
+  enable), its sibling renders under a different header entirely — there
+  is no longer one contiguous group to attach a shared prompt to.
+- **(b), the one built**: keep a reason-code select on every open row,
+  wherever it's currently rendered, but *sync the value* across
+  siblings sharing the same `taskDetailId` (not by visual position, so
+  it survives a drag to a different tote) every time any one of them
+  changes. A live default, not a lock — the picker can still give one
+  row a deliberately different reason afterward; that just won't
+  survive a *later* edit to a different row in the same group, which
+  re-propagates again. Scoped strictly by `taskDetailId`
+  (`pickSplitGroupRows()`, the same helper the qty-cap fix above already
+  uses) so it can never touch an unrelated line's own reason code.
+
+**Implementation**: `syncPickReasonCodeToSiblings(splitId, value)` —
+called from the existing `.reason-code-select` `change` handler right
+after it toggles the changed select's own `.invalid` class. Walks every
+other not-done row in the same split group (`getPickRowBySplitId()` →
+`taskDetailId` → `pickSplitGroupRows()`), sets each sibling's own
+`<select>.value` directly (not simulating a user change — no event
+dispatched to them, so no risk of a sync loop) and mirrors the
+`.invalid` toggle. Done rows are skipped (already locked/disabled,
+already committed with whatever they were submitted with).
+
+**Confirmed live on `PICK0393`** (same task/line as both bugs above):
+split 5 into 3+2, dropped the second row to 1 (3+1=4 short, both rows
+correctly prompting) → selected a reason on row 1 → row 2's dropdown
+updated to the same value with zero extra clicks, confirmed via direct
+DOM read (`select.value`, `.invalid` class), not just visually →
+dragged row 2's row to a *different* tote group (Slot 2, alongside
+unrelated lines 1 and 2) via a simulated native `DragEvent` sequence →
+selected a *different* reason on the now-relocated row 2 → row 1 (still
+in Slot 1) picked up the same value despite being under a different
+group header entirely, confirming the sync is keyed by `taskDetailId`,
+not DOM position → separately confirmed the sync never touched the
+three *other*, unrelated split groups' own (still-empty) reason selects
+on screen at the same time. No console errors.
+
+**A separate, pre-existing issue noticed along the way, not fixed
+here (out of scope of what was asked)**: dragging a split row to a
+different tote group triggers a full `renderPickGroups()` re-render,
+which rebuilds each row's Picked Qty box from `row.quantity` — the
+value that row was given *at split time* — not whatever the picker had
+since manually typed into the box. A manual qty edit made before a drag
+does not survive that drag (confirmed live: typed `1` into a row,
+dragged it, and the box came back showing its original split default of
+`2`). This is not new behavior from either fix in this document — it's
+how `pickLineRowHtml()` has always rendered a not-done row's qty value
+— just not previously exercised by editing qty *before* triggering a
+re-render mid-edit. Worth a future session's attention if the picker
+workflow commonly involves adjusting qty before dragging, but is a
+distinct, separately-scoped issue from the reason-code sync built here.

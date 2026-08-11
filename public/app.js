@@ -3005,6 +3005,33 @@
     );
   }
 
+  /** Propagates a reason-code choice to every other not-done row in the
+   * same split group (2026-08-11, per explicit instruction — a shared
+   * per-group prompt turned out not to work once a split row can be
+   * dragged to a *different* tote than its sibling, at which point
+   * there's no single group header left to attach one shared prompt to;
+   * see this feature's design discussion). Scoped strictly by
+   * `taskDetailId` (`pickSplitGroupRows()`), so this only ever touches
+   * the same original line's own split siblings — never another line's
+   * reason code, regardless of what else is on screen. A live default,
+   * not a lock: it fires on every change (not just the first), so the
+   * picker can still deliberately give one row's split a different
+   * reason afterward — that just won't survive a later edit to a
+   * *different* row in the same group, which re-propagates again. Done
+   * rows are skipped (already locked/disabled, already committed with
+   * whatever they were submitted with). */
+  function syncPickReasonCodeToSiblings(splitId, value) {
+    const row = getPickRowBySplitId(splitId);
+    if (!row) return;
+    pickSplitGroupRows(row.taskDetailId).forEach((r) => {
+      if (r.splitId === splitId || isPickRowDone(r.splitId)) return;
+      const sib = getPickReasonSelect(r.splitId);
+      if (!sib) return;
+      sib.value = value;
+      sib.classList.toggle("invalid", !value);
+    });
+  }
+
   /** Only required once a line is actually short (see isPickShort()) —
    * a full-quantity pick never needs a reason code. */
   function isPickReasonValid(splitId) {
@@ -3719,6 +3746,7 @@
     const select = e.target.closest(".reason-code-select");
     if (!select) return;
     select.classList.toggle("invalid", !select.value);
+    syncPickReasonCodeToSiblings(select.dataset.splitId, select.value);
     updatePickLineActionButtons();
   });
 
