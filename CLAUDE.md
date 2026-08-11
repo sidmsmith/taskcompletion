@@ -3859,17 +3859,40 @@ not DOM position → separately confirmed the sync never touched the
 three *other*, unrelated split groups' own (still-empty) reason selects
 on screen at the same time. No console errors.
 
-**A separate, pre-existing issue noticed along the way, not fixed
-here (out of scope of what was asked)**: dragging a split row to a
-different tote group triggers a full `renderPickGroups()` re-render,
-which rebuilds each row's Picked Qty box from `row.quantity` — the
-value that row was given *at split time* — not whatever the picker had
-since manually typed into the box. A manual qty edit made before a drag
-does not survive that drag (confirmed live: typed `1` into a row,
-dragged it, and the box came back showing its original split default of
-`2`). This is not new behavior from either fix in this document — it's
-how `pickLineRowHtml()` has always rendered a not-done row's qty value
-— just not previously exercised by editing qty *before* triggering a
-re-render mid-edit. Worth a future session's attention if the picker
-workflow commonly involves adjusting qty before dragging, but is a
-distinct, separately-scoped issue from the reason-code sync built here.
+**A separate, pre-existing issue noticed along the way — fixed the same
+day, see below**: dragging a split row to a different tote group
+triggered a full `renderPickGroups()` re-render, which rebuilt each
+row's Picked Qty box from `row.quantity` — the value that row was given
+*at split time* — discarding whatever the picker had since manually
+typed into the box.
+
+## Picking: a manually-typed qty now survives a drag (2026-08-11, same day)
+
+Root cause matched the note above exactly: `pickLineRowHtml()` had
+always rendered a not-done row's qty box from `row.quantity` (fixed at
+split time, from `state.pickSplits`), with no path for a live edit to
+feed back into what a later re-render would use — never exercised
+before because nothing previously edited qty and *then* triggered a
+re-render mid-edit until the reason-code sync fix above surfaced it via
+testing a drag after an edit.
+
+**Fix**: a new `state.pickQtyOverride` (splitId -> the picker's own
+last-typed value), same established pattern as `state.pickRowStatus`/
+`state.toteGroupState` — state that has to survive a re-render moves out
+of the DOM into `state`, since re-renders are routine now (split, drag,
+add-tote, reason-code changes indirectly via `refreshPickQtyGroupDisplays()`).
+The qty `input` handler writes to it on every keystroke;
+`pickLineRowHtml()` reads it ahead of `row.quantity` when building a
+not-done row's initial `value`. Reset to `{}` alongside the rest of
+Pick's split/drag/tote state on a genuinely new search (same reset
+block as `pickSplits`/`pickGroupOverride`/etc.). Never explicitly
+cleared on completion or re-split — an orphaned entry for a splitId
+that no longer exists is simply never looked up again.
+
+**Confirmed live on `PICK0393`**: split 5 into 3+2, edited the second
+row to `1` → dragged that row to a different tote group (Slot 2,
+alongside unrelated lines) → the moved row correctly still showed `1`,
+not the split default of `2` it reverted to before this fix, confirmed
+both visually and via a fresh page load afterward showing the pristine
+unsplit `5` again (confirming the override resets cleanly on a new
+search, no stale carryover). No console errors.

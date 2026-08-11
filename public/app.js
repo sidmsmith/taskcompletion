@@ -98,6 +98,19 @@
     // Used by duplicateToteGroupKeys() to scan across groups without a
     // DOM query; see that function's docstring.
     toteGroupKeysOnScreen: [],
+    // splitId -> the picker's own last-typed Picked Qty value
+    // (2026-08-11) — a re-render (drag, add-tote, reason-code sync's own
+    // rendering is untouched but split/drag both call renderPickGroups())
+    // otherwise rebuilds the qty box from `row.quantity`, the value that
+    // row was given *at split time*, silently discarding whatever the
+    // picker had since typed (found live: type 1, drag the row, box
+    // reverts to its original split default). Populated by the qty
+    // `input` handler, consulted by pickLineRowHtml() ahead of
+    // `row.quantity`. Never cleared on completion/re-split — an orphaned
+    // entry for a splitId that no longer exists is simply never looked
+    // up again, and the whole map resets on a fresh search anyway (see
+    // fetchAndRenderTask()'s Pick state reset).
+    pickQtyOverride: {},
   };
 
   function allLines() {
@@ -1704,6 +1717,7 @@
     state.extraToteGroups = [];
     state.toteGroupState = {};
     state.pickSplitCounters = {};
+    state.pickQtyOverride = {};
     state.groups = groups;
     state.lastSearchValue = searchValue;
     state.lastSearchMode = isTaskedCycleCount ? "cycle_count" : isPick ? "pick" : "task";
@@ -2361,7 +2375,18 @@
   function pickLineRowHtml(row) {
     const isDone = isPickRowDone(row.splitId);
     const tracked = state.pickRowStatus[row.splitId];
-    const qtyValue = isDone ? (tracked && tracked.completedQuantity != null ? tracked.completedQuantity : row.quantity) : row.quantity;
+    // A not-done row prefers its own last-typed value over `row.quantity`
+    // (its split-time default) if one was ever recorded (2026-08-11) —
+    // see state.pickQtyOverride's own docstring for why this survives a
+    // re-render (drag/add-tote) that a plain `row.quantity` read wouldn't.
+    const override = state.pickQtyOverride[row.splitId];
+    const qtyValue = isDone
+      ? tracked && tracked.completedQuantity != null
+        ? tracked.completedQuantity
+        : row.quantity
+      : override !== undefined
+        ? override
+        : row.quantity;
     const canSplitOrDrag = row.isToteDestined && !isDone;
     return `
         <tr class="pick-line-row line-row" data-split-id="${escapeAttr(row.splitId)}" data-task-detail-id="${escapeAttr(row.taskDetailId)}" ${canSplitOrDrag ? 'draggable="true"' : ""}>
@@ -3727,6 +3752,9 @@
   el.pickLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".pick-qty-input");
     if (qtyInput) {
+      // Persisted so a later re-render (drag/add-tote) doesn't discard it
+      // — see state.pickQtyOverride's own docstring (2026-08-11).
+      state.pickQtyOverride[qtyInput.dataset.splitId] = qtyInput.value;
       // Group-based, not this row alone (2026-08-11, corrected same day
       // — see pickSplitGroupTotal()'s docstring) — one row's edit can
       // change whether its split siblings are short/exceeds too, so the
