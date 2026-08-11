@@ -744,3 +744,149 @@ design and iterate in Studio (compact format, `json.data` package) until
 it looks right, then have Claude do the classic-format conversion pass
 in one go at the end, using this document's syntax notes — rather than
 discovering each classic-format quirk one WMS upload at a time again.
+
+# Task Sheet (Pick Sheet) — `tasksheet.jrxml`
+
+A second report, added 2026-08-11: prints task detail lines (Location,
+Item, Description, Required Qty) for a warehouse picker to hand-write
+what they actually picked, with a blank Reason line for short picks —
+same purpose as Cycle Count Sheet, different domain (Pick tasks, not
+inventory counts). Single self-contained classic-format file, same
+conventions as `cyclecountsheet.jrxml` (see everything above this
+section — it all applies here too). **Built and locally verified in one
+session using `local-640-harness/render.ps1`, never yet uploaded to the
+WMS** — this section will need a "confirmed live" pass the same way
+Cycle Count Sheet's did.
+
+## Real payload shape (confirmed from two live captures)
+
+Same `Data`-rooted envelope pattern as Cycle Count Sheet:
+`{"Data": [ {TaskId, TransactionId, ..., TaskDetail: [ {SourceLocationId,
+ItemId, Quantity, UomTypeId, PlannedContainerTypeId, OlpnId,
+PlannedSlotId, PickExecutionSequence, Sequence, ...}, ... ]}, ... ]}`.
+Also duplicates the whole thing under `TransformedPayload.Data` —
+deliberately never referenced, which is the entire de-dup fix (nothing
+to de-dup if it's never read).
+
+**Two real fields confirmed absent from this payload, both hardcoded as
+placeholders for now, per explicit instruction**: `ItemDescription`
+(shown as `"Item " + ItemId + " Description"`) and oLPN Type/Size
+(shown as the literal text `"TYPE/SIZE"`). Both need real WMS-side work
+to add to the payload before they can be wired up for real — flagged in
+an inline JRXML comment at the top of the file too.
+
+**Sort key for pick-line order — confirmed from two real task types,
+not assumed**: `PickExecutionSequence` looked like the obvious walk-path
+field on a plain `PICK_INTO_OLPN` task (populated, and its order
+genuinely differs from the raw `TaskDetail` array order — confirmed
+live, one real task had its two lines in *reversed* sequence order
+relative to array position). But it's **`null` on every line of a real
+`PICK_INTO_CART` task** — that allocation path (`ResourceGroupId:
+"Putwall Resource Group"` in the sample) doesn't populate it at all.
+Falls back to the plain `Sequence` field (array-position ordinal) when
+null. Implemented as a subDataset `<variable name="EffectiveSequence">`
++ `<sortField type="Variable" name="EffectiveSequence">` — confirmed
+correct locally against both real task types (the reversed-order case
+sorted correctly; the cart task correctly fell back to `Sequence`
+order).
+
+## `<break>` inside `jr:list` — confirmed broken, don't retry
+
+The obvious way to force a page break before each task was `<break
+type="Page">` inside `jr:listContents` — schema-legal (`jr:list`
+explicitly allows `jr:break` as a child), but **throws a real
+`NullPointerException` at fill time**:
+
+```
+NullPointerException: Cannot invoke "JRFillBand.isPageBreakInhibited()"
+because "this.band" is null
+	at JRFillBreak.prepare()
+	at FillListContents.prepare()
+```
+
+Confirmed via the local harness, not a guess — `<break>` apparently
+never gets a valid band reference when it's inside a list component on
+this JasperReports version, regardless of configuration. Don't re-add
+`<break>` inside `jr:listContents`/`jr:table` without new evidence this
+was fixed in some way.
+
+**Why the real fix (a `<group isStartNewPage="true">`) isn't a simple
+substitute**: `jr:list`/`jr:table` use their subDataset purely as a flat
+record source — any `<group>` declared on that subDataset is never
+actually rendered (no groupHeader/groupFooter bands fire), because
+these components don't run the subDataset "as a report." Native,
+guaranteed group-based page breaking only happens in a genuine report —
+the main report, or a `<subreport>` (a full nested report execution
+with its own real band structure). The main/root report can't do the
+per-task iteration itself either (same root-query limitation
+`cyclecountsheet.jrxml` already worked around) — only something with
+its own `dataSourceExpression` can consume `Data` at all, and of those,
+only `<subreport>` gets real pagination.
+
+**Deliberately not pursued — per explicit instruction.** A `<subreport>`
+would mean a second, linked compiled-report file, and this app has
+**never confirmed MAWM's document-template deployment mechanism
+supports a report referencing an external subreport** — every report
+built here so far has been single-file. Introducing that risk for a
+"nice to have" forced break, in a demo-only report, wasn't worth it —
+"this is all demo stuff... just do what you think is right and we can
+revisit actual break logic later." **Current behavior: no forced page
+break between tasks** — multiple tasks can land on the same physical
+page. Each task still gets a bold, unmistakable dark banner and a 20pt
+gap before it, so it's visually clear where one task ends and the next
+begins, just not a hard page boundary. Revisit with a `<subreport>`
+(and confirm MAWM supports it first) if a real forced break is ever
+actually needed.
+
+## Container legend — v1 has no de-duplication, deliberately deferred
+
+Each task gets a "Containers for this task:" legend (one line per
+distinct Slot/Tote/oLPN) above the pick-line table, driven by its own
+independent `jr:list` (`LegendLineDataset`, its own
+`subDataSource("TaskDetail")` call — a second, separate read of the
+same array the pick-line table also reads, sorted independently by
+`PlannedSlotId`).
+
+**A real de-dup design was worked out (sort by a composite
+Slot/Type/OlpnId key, suppress a row via `printWhenExpression` when it
+matches the immediately preceding row's key) but deliberately not
+built** — it depends on whether a suppressed row inside `jr:list`
+actually collapses its height to zero or leaves a visible blank gap,
+which is unconfirmed, and stacking another unverified mechanism onto a
+report that had *just* failed once already (`<break>`) wasn't worth it
+in the same pass. **Current behavior**: two pick lines sharing one
+slot/tote print two identical legend lines, not one — confirmed live,
+acceptable for now per explicit instruction to keep this simple and
+revisit later. Legend shows the **full** oLPN id (unlike the pick-line
+table's own Destination column, which truncates a long oLPN as
+`"00...1234"` — oLPNs run ~20 characters, too long for that narrow
+column, per explicit instruction only the legend needed the full id).
+
+## Confirmed working locally (2026-08-11), via `render.ps1`
+
+Real 2-task sample (`local-640-harness/tasksheet_test_payload.json` —
+one plain `PICK_INTO_OLPN` task, one `PICK_INTO_CART` hybrid task with
+2 totes sharing a slot + 1 oLPN-destined line) rendered correctly in one
+pass:
+- Both tasks' pick lines sorted correctly (including the
+  `PickExecutionSequence`-reversed case and the `Sequence`-fallback
+  case).
+- Destination column showed `Slot N` / `TOTE` / truncated oLPN
+  correctly per line.
+- QR, banner, Item/Description-placeholder, Required Qty + UOM, blank
+  Picked Qty + Reason lines all rendered correctly.
+- One cosmetic issue found and fixed the same session: the per-task
+  `jr:listContents` height was declared generously enough (280) that
+  the *shorter* task didn't shrink to fit, pushing a nearly-empty
+  second page — same lesson already documented for Cycle Count Sheet's
+  own item table ("size for the minimum case, JasperReports stretches
+  up but never shrinks down"). Reduced to 185; re-confirmed single-page
+  output with both tasks landing correctly on page 1.
+
+**Not yet confirmed**: an actual WMS upload of this file. Everything
+above is proven against the real open-source JasperReports 6.4.0 engine
+locally, which has matched production closely for Cycle Count Sheet —
+but this is a first pass for a structurally different report (multiple
+independent nested `subDataSource()` calls per task, a coalesce-based
+sort variable), so treat it as unconfirmed until it's actually printed
+from MAWM.
