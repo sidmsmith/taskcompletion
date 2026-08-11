@@ -3040,6 +3040,70 @@
     return Number.isFinite(required) && pickSplitGroupTotal(taskDetailId) > required;
   }
 
+  /**
+   * Decides which row(s) among the ones about to be submitted should
+   * actually carry `exceptionMove: true` on their commit (2026-08-11,
+   * fixing a real bug found live the same day this was tested — see
+   * PICK_LINE_COMMIT_SUCCESS_STATUSES's own docstring in task_service.py
+   * for the *other* half of that finding).
+   *
+   * `exceptionMove` is not "this commit happens to be short" — in MAWM
+   * it means "cancel whatever's left on this line and close it, right
+   * now." That's a terminal action. Deriving it from `isPickShort()`
+   * (a per-row read of the *group's* short state) and sending it on
+   * *every* not-done row in a short split group — which is what this
+   * app did until this fix — means the very first split committed
+   * cancels the line's remaining balance immediately, before any of its
+   * still-open siblings in the same action ever get a chance to commit.
+   * Confirmed live: split 5 into three pieces (2/1/1), made the group
+   * short by editing down to 4, selected a reason, ran Complete All —
+   * the first commit (2 units, `exceptionMove: true`) closed the whole
+   * line; the other two (1 unit each, genuinely intended as real picks)
+   * then failed outright with "No Task Details found for Container
+   * Scanned" because the task no longer existed to commit against. Only
+   * 2 of the intended 4 units ever actually got picked — confirmed via
+   * an independent re-query, not just from the error text.
+   *
+   * The fix: only the *last* row committed for a given `taskDetailId`,
+   * across all the rows being submitted together in this one action
+   * (a single "Complete Line" click, or a "Complete Lines"/"Complete
+   * All" batch), may ever carry `exceptionMove: true` — and only if
+   * every other currently-open sibling for that same taskDetailId is
+   * *also* being addressed in this action (either already done, or
+   * included in `rows`). If some sibling is intentionally being left
+   * for later (not part of `rows`, not yet done), nothing in this
+   * action can be "final" for that line, so exceptionMove stays false
+   * across the board — the eventual short/close decision waits for
+   * whichever action actually does address every remaining piece.
+   *
+   * Takes `rows` (not splitIds) since it needs each row's own
+   * `taskDetailId`; returns a Map<splitId, boolean>. The UI's own
+   * reason-code *prompt* visibility (see refreshPickQtyGroupDisplays())
+   * is intentionally unaffected by any of this — a picker still has to
+   * pick a reason whenever the group is currently short, since there's
+   * no way to know in advance, from a single row's own perspective,
+   * whether it'll turn out to be the final commit.
+   */
+  function resolvePickExceptionMoveFlags(rows) {
+    const submittingIds = new Set(rows.map((r) => r.splitId));
+    const byTaskDetailId = new Map();
+    rows.forEach((r) => {
+      if (!byTaskDetailId.has(r.taskDetailId)) byTaskDetailId.set(r.taskDetailId, []);
+      byTaskDetailId.get(r.taskDetailId).push(r);
+    });
+    const flags = new Map();
+    byTaskDetailId.forEach((groupRows, taskDetailId) => {
+      const allSiblingsAddressed = pickSplitGroupRows(taskDetailId).every(
+        (r) => isPickRowDone(r.splitId) || submittingIds.has(r.splitId)
+      );
+      const eligible = allSiblingsAddressed && isPickGroupShort(taskDetailId);
+      groupRows.forEach((r, idx) => {
+        flags.set(r.splitId, eligible && idx === groupRows.length - 1);
+      });
+    });
+    return flags;
+  }
+
   /** Re-applies `.overridden`/`.exceeds`/the reason-select's visibility
    * to every not-done row sharing `taskDetailId`, based on the *group's*
    * current short/exceeds state (2026-08-11) — needed any time a single
@@ -3292,8 +3356,13 @@
     if (isPickRowDone(row.splitId)) return;
     const qtyInput = getPickQtyInput(row.splitId);
     const quantity = qtyInput ? Number(qtyInput.value) : null;
-    const short = isPickShort(row.splitId);
-    const reasonSelect = short ? getPickReasonSelect(row.splitId) : null;
+    // Only true if this is genuinely the last open piece of this line
+    // (2026-08-11 — see resolvePickExceptionMoveFlags()'s own docstring
+    // for the bug this fixes) — NOT just because this row's own group
+    // happens to be short right now, which isPickShort() alone would
+    // wrongly suggest whenever a not-yet-submitted sibling still exists.
+    const exceptionMove = resolvePickExceptionMoveFlags([row]).get(row.splitId) || false;
+    const reasonSelect = exceptionMove ? getPickReasonSelect(row.splitId) : null;
     const groupKey = pickRowGroupKey(row);
     const toteValue = row.isToteDestined ? getToteGroupState(groupKey).value.trim() : null;
     setBusy(true, "Completing line " + row.lineNumber + "…");
@@ -3309,7 +3378,7 @@
         olpnId: row.olpnId,
         transactionId: row.groupTaskTransactionId,
         quantity,
-        exceptionMove: short,
+        exceptionMove,
         reasonCodeId: reasonSelect ? reasonSelect.value : null,
         targetContainerId: toteValue,
       });
@@ -3419,6 +3488,11 @@
       if (!byTask.has(key)) byTask.set(key, []);
       byTask.get(key).push(r);
     });
+    // Computed once, across the whole batch (2026-08-11 — see its own
+    // docstring for the bug this fixes) — only the last row submitted
+    // for a given taskDetailId, among *everything* in this batch, may
+    // ever carry exceptionMove: true.
+    const exceptionMoveFlags = resolvePickExceptionMoveFlags(allPickLinesPending);
     const total = allPickLinesPending.length;
     let succeeded = 0;
     const failures = [];
@@ -3426,8 +3500,8 @@
     for (const [taskId, rows] of byTask.entries()) {
       const lineCompletions = rows.map((r) => {
         const qtyInput = getPickQtyInput(r.splitId);
-        const short = isPickShort(r.splitId);
-        const reasonSelect = short ? getPickReasonSelect(r.splitId) : null;
+        const exceptionMove = exceptionMoveFlags.get(r.splitId) || false;
+        const reasonSelect = exceptionMove ? getPickReasonSelect(r.splitId) : null;
         const groupKey = pickRowGroupKey(r);
         const toteValue = r.isToteDestined ? getToteGroupState(groupKey).value.trim() : null;
         return {
@@ -3437,7 +3511,7 @@
           olpnId: r.olpnId,
           transactionId: r.groupTaskTransactionId,
           quantity: qtyInput ? Number(qtyInput.value) : null,
-          exceptionMove: short,
+          exceptionMove,
           reasonCodeId: reasonSelect ? reasonSelect.value : null,
           targetContainerId: toteValue,
         };

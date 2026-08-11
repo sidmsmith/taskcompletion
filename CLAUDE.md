@@ -3964,3 +3964,84 @@ Separately confirmed on `PICK0319` (a plain non-cart "Pick to Tote"
 task) that the single global `#addToteBtn` still renders exactly as
 before, with no slot label and no per-slot "+" on its own tote row. No
 console errors at any point.
+
+## Picking: two real bugs in split-line completion, found live by the user testing the feature above, both fixed same day (2026-08-11)
+
+Asked to verify the per-slot Add Tote feature end-to-end, the user ran a
+real split+Complete All test on `PICK0393` and hit
+`"4 of 6 completed. Failures: Line b9157bb4-...: Line not completed
+(status: 7000)"` (repeated twice, same taskDetailId) — no HAR, so this
+was investigated directly against the live backend and code rather than
+from a recording.
+
+### Bug 1 — a genuinely successful partial commit was reported as a failure
+
+Re-querying `PICK0393` directly showed the task already `Status: 8000`
+(Completed), with the affected line's full 5 units correctly split
+across three real TaskDetail rows in three real totes — **no data
+corruption**. Root cause: `complete_pick_line()`'s post-commit
+verification required `line_status == "8000"` to call something a
+success. But a partial commit against a `taskDetailId` that still has
+*more* remaining after that specific commit legitimately leaves the
+line at `"7000"` ("In Progress" on the same status domain as
+`TASK_STATUS_LABELS`) until whichever commit finally exhausts the
+balance — never caught before because no earlier session had chained
+three partial commits against one `taskDetailId` back-to-back. Fixed:
+added `PICK_LINE_COMMIT_SUCCESS_STATUSES = {"7000", "8000"}` in
+`task_service.py`, both now treated as a successful commit. Noted as a
+known, accepted tradeoff in that constant's own docstring: this can't
+distinguish "genuine partial progress, more coming" from a
+theoretical silent no-op that happens to leave the status unchanged at
+an already-`"7000"` line — not solved here, since nothing in this
+session's testing (or the original "mostly-null echo" observation the
+existing verification step was built to catch) pointed at that actually
+recurring.
+
+### Bug 2 — found by re-testing bug 1's fix, more serious: real units were being silently short-picked instead of committed
+
+Re-testing bug 1's fix (split 5 into three pieces, short the group by 1,
+Complete All) surfaced a second, worse bug: the task closed after just
+the *first* commit (2 units), and the other two splits (1 unit each,
+meant as real picks) failed outright with `"No Task Details found for
+Container Scanned"` — confirmed via an independent re-query that only 2
+of the intended 4 units ever actually got recorded; the other 3 were
+short-canceled, not lost/corrupted, but not what was intended either.
+
+Root cause: `exceptionMove: true` doesn't mean "this commit happens to
+be short" — in MAWM it means "cancel whatever's left on this line and
+close it, right now," a terminal action. The frontend was deriving
+`exceptionMove` from `isPickShort()` (a per-row read of the *group's*
+short state) and sending it on **every** not-done row in a short split
+group — so the very first split committed in the batch canceled the
+line's entire remaining balance before its still-open siblings in the
+same action ever got a chance to commit.
+
+**Fix**: `resolvePickExceptionMoveFlags(rows)` (new, in `app.js`) —
+only the *last* row committed for a given `taskDetailId`, across all
+the rows being submitted together in one action (a single "Complete
+Line" click, or a "Complete Lines"/"Complete All" batch), may ever
+carry `exceptionMove: true`, and only if every other currently-open
+sibling for that same `taskDetailId` is *also* being addressed in this
+same action (already done, or included in the batch) — if a sibling is
+intentionally being left for later, nothing in this action can be
+"final" for that line, so `exceptionMove` stays false across the board.
+Wired into both `completePickRow()` (single-row) and
+`confirmAllPickLines()` (batch, computed once across the whole pending
+set so "last" is correctly scoped across every task/group in the
+batch, not just one line). The reason-code *prompt*'s own visibility
+(whether the picker has to pick a reason before submitting) is
+unaffected — still gated on `isPickGroupShort()` regardless of whether
+this particular commit will turn out to be final, since there's no way
+to know that in advance from a single row's own perspective.
+
+**Confirmed live, full re-test on a fresh task (`PICK0190`, item
+1000011, Required Qty 5)**: split into three pieces (2/2/1), edited one
+down to make the group short by 1 (2/1/1 = 4), reason code synced
+across all three (confirmed working correctly through this bug too),
+ran Complete All — **all 7 outstanding lines across the task completed
+successfully, zero failures**. Independently re-queried MAWM directly
+afterward: the line's TaskDetail shows `Quantity: 4.0, CompletedQuantity:
+4.0, Status: 8000` — exactly the intended "4 picked, 1 shorted" outcome,
+not the "2 picked, 3 canceled" bug 2 produced before the fix. Every
+other line on the task also independently verified consistent
+(`Status: 8000`, quantities matching exactly). No console errors.

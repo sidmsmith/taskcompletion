@@ -2783,6 +2783,25 @@ def check_cycle_count_location_status(
     return response
 
 
+# A line commit legitimately leaves the line's TaskDetail at "7000"
+# ("In Progress" on the same domain as TASK_STATUS_LABELS — Task and
+# TaskDetail share this status ladder), not "8000" ("Completed"), when
+# that taskDetailId still has more remaining after *this* commit — e.g.
+# one of several split pieces sharing one original taskDetailId (the
+# app always commits every split against the line's real, cached id —
+# see complete_pick_line()'s own docstring on target_container_id),
+# with sibling splits' commits still pending in the same batch or a
+# later single click (2026-08-11, found live: 3 splits of one line
+# committed in sequence within one Complete All batch; the first two
+# genuinely succeeded — real quantity landed in real totes, confirmed
+# via an independent re-query afterward — but were reported as
+# failures because only the third/final commit fully closed the line
+# to "8000"). Both are treated as a successful commit below; anything
+# else (still an unpicked "5000"/"3000", a Canceled "9000", etc.)
+# means this commit didn't actually take.
+PICK_LINE_COMMIT_SUCCESS_STATUSES = {"7000", "8000"}
+
+
 def complete_pick_line(
     token: str,
     org: str,
@@ -2923,14 +2942,15 @@ def complete_pick_line(
             ilpn = None
         tote_status = str((ilpn or {}).get("Status") or "")
 
+    commit_succeeded = line_status in PICK_LINE_COMMIT_SUCCESS_STATUSES
     return {
-        "success": line_status == "8000",
+        "success": commit_succeeded,
         "taskId": task_id,
         "taskDetailId": task_detail_id,
         "completedQuantity": _num(completed_qty),
         "plannedQuantity": _num(planned_qty),
         "status": line_status,
-        "error": None if line_status == "8000" else f"Line not completed (status: {line_status})",
+        "error": None if commit_succeeded else f"Line not completed (status: {line_status})",
         "taskStatus": str(task.get("Status") or "") if task else "",
         "taskStatusLabel": task_status_description(task.get("Status")) if task else "",
         "olpnId": olpn_id if not target_container_id else "",
