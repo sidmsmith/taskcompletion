@@ -3735,3 +3735,70 @@ pressed Enter and the task loaded correctly. Confirmed via direct DOM
 read: `#taskIdInput.maxLength === 500`, both rendered `.tote-id-input`
 elements back to `maxLength === -1` (no attribute), and the camera
 region/modal `.show` class both cleared after close. No console errors.
+
+## Picking: qty short/exceeds now evaluated per split GROUP, not per row (2026-08-11, found live by the user on `PICK0393`)
+
+**The bug, reported with a screenshot**: line 4 (`Seersucker Sport
+Coat`, Required Qty 5) was split into two rows (3 and 2). Bumping the
+"2" row to 3 correctly turned it red (group total 6 > 5). But bringing
+the *first* row back down from 3 to 2 (making the group 2+3=5 again,
+exactly balanced) left the first row wrongly prompting for a reason
+code, and the second row wrongly still red — even though the group as
+a whole was no longer short or over. Root cause: `isPickQtyValid()`/
+`isPickShort()` compared each row to its own **static** `data-default-qty`
+— the size that row happened to be *at the moment it was split*
+(`row.quantity`, frozen in `pickLineRowHtml()`'s template) — rather
+than the group's *current* total. Editing one sibling could never
+un-flag another, since each row's cap never moved.
+
+**The fix**: short/exceeds is now computed once per **split group**
+(`pickSplitGroupRows(taskDetailId)` — every row, done or not, sharing
+one real `taskDetailId`; a never-split line just has one) via
+`pickSplitGroupTotal()`, which live-sums a done row's real committed
+quantity (`state.pickRowStatus`, fixed) and a not-done row's currently
+typed value, and compares that sum to `pickGroupRequiredQty()` (the
+line's own original Required Qty — identical across every split piece,
+so any row in the group can supply it). `isPickGroupShort()`/
+`isPickGroupExceeds()` are the two group-level predicates;
+`isPickShort()`/`isPickQtyValid()` now delegate to them per-row (taking
+whichever row's `taskDetailId` to look up its group) instead of reading
+a static per-row cap — a never-split line's group is just that one row,
+so this is behavior-identical to the old per-row logic in the common
+(unsplit) case, confirmed by construction rather than by re-testing
+every unsplit scenario again.
+
+Since one row's edit can now change what its *siblings* should show
+(not just itself), a new `refreshPickQtyGroupDisplays(taskDetailId)`
+re-applies `.overridden`/`.exceeds`/the reason-select's visibility to
+every not-done row in the group, called from four places: the qty
+`input` handler (every keystroke), `renderPickGroups()` (so a stale
+imbalance carried into a fresh render — e.g. from a drag or "+ Add
+Tote" — still displays correctly, not just reactively on the next
+keystroke), and both `completePickRow()`/`confirmAllPickLines()` (a row
+completing fixes its own contribution to the group's total, which can
+flip whether its still-open siblings are short/exceeds).
+
+**Deliberate design choice, not yet requested to be more granular**:
+when a group is short, *every* not-yet-done row in that group shows the
+reason-code prompt (not just one) — confirmed live (see Testing). Since
+each split row commits independently as its own backend call
+(`complete_pick_line`'s own `reasonCodeId`), and which specific row
+"caused" an aggregate shortfall isn't generally determinable, requiring
+a reason on every open row in a short group was judged the simplest
+coherent behavior consistent with "depending on the total qty for the
+group" — not raised as an open question, just noted here in case a
+future session wants to revisit it (e.g. only requiring it on the row
+that was most recently edited).
+
+**Confirmed live on the exact reported task** (`PICK0393`, Slot 1,
+Line 4, `Seersucker Sport Coat`, Required Qty 5): split into 3+2 (no
+red, no reason prompt, matches original bug report's own "as
+expected" baseline) → bumped the 2 to 3 (6 > 5) → **both** rows turned
+red, an improvement over the original per-row behavior which only ever
+flagged whichever single row exceeded its own static cap → brought the
+first row back to 2 (2+3=5) → **both** rows cleared back to normal,
+no red, no reason prompt — the exact case that was broken, now fixed
+→ separately, dropped the second row to 2 as well (2+2=4 < 5) →
+**both** rows correctly showed "Select Reason Code" with `fullLineBtn`/
+`allLinesBtn` both disabled (confirmed via direct `.disabled` read, not
+just visually). No console errors at any point.

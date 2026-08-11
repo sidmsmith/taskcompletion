@@ -2876,6 +2876,13 @@
         return header + pickColumnHeaderRowHtml() + groupRows.map((row) => pickLineRowHtml(row)).join("");
       })
       .join("");
+    // A freshly split group always starts balanced (splitPickRow()
+    // preserves whatever total the row being split already had — see
+    // its own docstring), but a row that was already short/exceeds
+    // before this render (e.g. a drag/add-tote render triggered mid-
+    // edit) needs its display recomputed here too, not just reactively
+    // on the next keystroke (2026-08-11).
+    new Set(rows.map((r) => r.taskDetailId)).forEach((id) => refreshPickQtyGroupDisplays(id));
     updatePickLineActionButtons();
   }
 
@@ -2885,15 +2892,90 @@
     );
   }
 
-  /** Capped at this row's own required qty (2026-08-10, per explicit
-   * instruction: "we should not allow a user to submit a qty > the
-   * planned qty... we need to account for a split line as well") —
-   * the cap is `data-default-qty`, the row's own slice (its full
-   * remaining amount if not split, or just its own piece if it has
-   * been — see pickLineRowHtml()), not the line's original full
-   * Required Qty column value. The spinner's up-arrow is never blocked
-   * (see the qty `input` handler's `.exceeds` class) — only submission
-   * is gated, here and via updatePickLineActionButtons(). */
+  /** Every row (done or not) sharing one real taskDetailId (2026-08-11)
+   * — a line that's never been split has exactly one; a split line has
+   * one per piece (see splitPickRow()). This is the unit short/exceeds
+   * is now evaluated over — see pickSplitGroupTotal()'s docstring for
+   * why a per-row comparison was wrong. */
+  function pickSplitGroupRows(taskDetailId) {
+    return getPickRows().filter((r) => r.taskDetailId === taskDetailId);
+  }
+
+  /** The line's own original Required Qty (2026-08-11) — identical
+   * across every split piece of one line (splitting only divides up
+   * *how* the qty is entered, never the line's own required total), so
+   * any row in the group can supply it. */
+  function pickGroupRequiredQty(taskDetailId) {
+    const rows = pickSplitGroupRows(taskDetailId);
+    return rows.length ? Number(rows[0].plannedQuantity) : NaN;
+  }
+
+  /** Live sum across every row sharing `taskDetailId` (2026-08-11, per
+   * explicit correction — reported live: split 5 into 3+2, bumped the
+   * 2 to 3 [6 > 5, correctly flagged red], then brought the 3 back down
+   * to 2 [3+2=5 again] — but the row edited back to 2 wrongly showed a
+   * reason-code prompt and its sibling wrongly stayed red, because the
+   * old logic compared each row to its own *static* default — the size
+   * it happened to be at the moment it was split — rather than the
+   * *current* total across the whole split group). A done row
+   * contributes its real committed quantity (fixed, from
+   * state.pickRowStatus — falls back to its own starting slice if this
+   * row completed in an earlier session and was never tracked in this
+   * one); a not-yet-done row contributes whatever's currently typed in
+   * its own Picked Qty box. */
+  function pickSplitGroupTotal(taskDetailId) {
+    return pickSplitGroupRows(taskDetailId).reduce((sum, r) => {
+      if (isPickRowDone(r.splitId)) {
+        const tracked = state.pickRowStatus[r.splitId];
+        const q = tracked && tracked.completedQuantity != null ? Number(tracked.completedQuantity) : Number(r.quantity);
+        return sum + (Number.isFinite(q) ? q : 0);
+      }
+      const input = getPickQtyInput(r.splitId);
+      const v = input ? Number(input.value) : Number(r.quantity);
+      return sum + (Number.isFinite(v) ? v : 0);
+    }, 0);
+  }
+
+  function isPickGroupShort(taskDetailId) {
+    const required = pickGroupRequiredQty(taskDetailId);
+    return Number.isFinite(required) && pickSplitGroupTotal(taskDetailId) < required;
+  }
+
+  function isPickGroupExceeds(taskDetailId) {
+    const required = pickGroupRequiredQty(taskDetailId);
+    return Number.isFinite(required) && pickSplitGroupTotal(taskDetailId) > required;
+  }
+
+  /** Re-applies `.overridden`/`.exceeds`/the reason-select's visibility
+   * to every not-done row sharing `taskDetailId`, based on the *group's*
+   * current short/exceeds state (2026-08-11) — needed any time a single
+   * row's edit (or completion) can change what its siblings should show,
+   * since they're evaluated together, not independently. Doesn't call
+   * updatePickLineActionButtons() itself — callers that need it call it
+   * once after their own refresh(es), to avoid redundant repeats when
+   * several groups refresh in a row (e.g. a fresh render). */
+  function refreshPickQtyGroupDisplays(taskDetailId) {
+    const short = isPickGroupShort(taskDetailId);
+    const exceeds = isPickGroupExceeds(taskDetailId);
+    const required = pickGroupRequiredQty(taskDetailId);
+    pickSplitGroupRows(taskDetailId).forEach((r) => {
+      if (isPickRowDone(r.splitId)) return;
+      const input = getPickQtyInput(r.splitId);
+      if (!input) return;
+      input.classList.toggle("overridden", short);
+      input.classList.toggle("exceeds", exceeds);
+      input.title = exceeds ? "Group total exceeds required qty of " + required : "";
+      toggleReasonSelect(input, short);
+    });
+  }
+
+  /** Capped at the *split group's* total, not this row's own static
+   * default (2026-08-11, corrected same day — see
+   * pickSplitGroupTotal()'s docstring for the live bug this fixes): a
+   * row is only invalid for submission if its group as a whole now
+   * exceeds the line's Required Qty. The spinner's up-arrow is never
+   * blocked (see the qty `input` handler's `.exceeds` class) — only
+   * submission is gated, here and via updatePickLineActionButtons(). */
   function isPickQtyValid(splitId) {
     const input = getPickQtyInput(splitId);
     if (!input) return false;
@@ -2901,22 +2983,20 @@
     if (raw === "") return false;
     const value = Number(raw);
     if (!Number.isFinite(value)) return false;
-    const cap = Number(input.dataset.defaultQty);
-    if (Number.isFinite(cap) && value > cap) return false;
+    const row = getPickRowBySplitId(splitId);
+    if (row && isPickGroupExceeds(row.taskDetailId)) return false;
     return true;
   }
 
-  /** A short pick = entered qty strictly less than Planned Qty — see the
-   * qty `input` handler, the only place `.overridden` is set for Pick
-   * rows (unlike Putaway, an equal or larger entry never counts). Also
-   * true, harmlessly, for a split row whose own slice is naturally less
-   * than the line's original Planned Qty — the reason-code prompt this
-   * triggers is a reasonable "why are you not doing the whole line as
-   * one pick" nudge, not a bug; the picker can just note the split
-   * reason or a real short reason, whichever applies. */
+  /** A short pick = the row's *split group* currently totals strictly
+   * less than the line's Required Qty (2026-08-11, corrected same day
+   * from a per-row-only comparison — see pickSplitGroupTotal()'s
+   * docstring). A group that's never been split is just that one row,
+   * so this behaves identically to the original per-row check in the
+   * common (unsplit) case. */
   function isPickShort(splitId) {
-    const input = getPickQtyInput(splitId);
-    return !!input && input.classList.contains("overridden");
+    const row = getPickRowBySplitId(splitId);
+    return !!row && isPickGroupShort(row.taskDetailId);
   }
 
   function getPickReasonSelect(splitId) {
@@ -3129,6 +3209,10 @@
       }
       if (result.olpnId) updatePickOlpnStatus(result.olpnId, result.olpnStatus, result.olpnStatusLabel);
       if (result.toteId) updatePickToteStatus(groupKey, result.toteId, result.toteStatus, result.toteStatusLabel);
+      // A row completing fixes its own contribution to the split group's
+      // total (2026-08-11) — its not-yet-done siblings, if any, may now
+      // be short/exceeds (or no longer be) as a result.
+      refreshPickQtyGroupDisplays(row.taskDetailId);
       updatePickLineActionButtons();
     } catch (e) {
       state.pickRowStatus[row.splitId] = { success: false, error: e.message || String(e) };
@@ -3265,6 +3349,11 @@
         rows.forEach((r) => failures.push("Line " + r.taskDetailId + ": " + (e.message || String(e))));
       }
     }
+    // Same reasoning as completePickRow() (2026-08-11): a row completing
+    // fixes its contribution to its split group's total, which can
+    // change whether any not-yet-done siblings (e.g. one that failed
+    // above) are still short/exceeds.
+    new Set(allPickLinesPending.map((r) => r.taskDetailId)).forEach((id) => refreshPickQtyGroupDisplays(id));
     renderPickTaskMeta();
     // Unlike Putaway, this doesn't end with a full reload/re-render
     // (would lose split/drag/tote-in-progress state on other rows —
@@ -3611,19 +3700,12 @@
   el.pickLinesBody.addEventListener("input", (e) => {
     const qtyInput = e.target.closest(".pick-qty-input");
     if (qtyInput) {
-      const value = Number(qtyInput.value);
-      const planned = Number(qtyInput.dataset.defaultQty);
-      const short = Number.isFinite(value) && Number.isFinite(planned) && value < planned;
-      // Over the row's own required qty (2026-08-10) — the up-arrow can
-      // still increment past it (nothing here blocks typing/spinning),
-      // but this flags it red and updatePickLineActionButtons() (via
-      // isPickQtyValid()) keeps Complete Line/Complete All disabled
-      // until it's brought back down.
-      const exceeds = Number.isFinite(value) && Number.isFinite(planned) && value > planned;
-      qtyInput.classList.toggle("overridden", short);
-      qtyInput.classList.toggle("exceeds", exceeds);
-      qtyInput.title = exceeds ? "Exceeds required qty of " + planned : "";
-      toggleReasonSelect(qtyInput, short);
+      // Group-based, not this row alone (2026-08-11, corrected same day
+      // — see pickSplitGroupTotal()'s docstring) — one row's edit can
+      // change whether its split siblings are short/exceeds too, so the
+      // whole group refreshes together, not just the row that changed.
+      const row = getPickRowBySplitId(qtyInput.dataset.splitId);
+      if (row) refreshPickQtyGroupDisplays(row.taskDetailId);
       updatePickLineActionButtons();
       return;
     }
