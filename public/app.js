@@ -76,10 +76,24 @@
     // otherwise wipe already-completed rows' status on every such
     // action the way a plain re-render did before this session.
     pickRowStatus: {},
-    // Synthetic keys for empty tote groups created via "+ Add Tote"
-    // (2026-08-10) — a drop target needs to exist before anything's
-    // been dragged into it. Array, not a Set, so insertion order is
+    // Empty tote groups created via "+ Add Tote" (2026-08-10) — a drop
+    // target needs to exist before anything's been dragged into it.
+    // Array of {key, slotId, label}, not a Set, so insertion order is
     // preserved for tie-broken sorting (see renderPickGroups()).
+    // `slotId`/`label` (2026-08-11, per explicit instruction — a cart's
+    // "+ Add Tote" moved from one global, slot-less button to a small
+    // "+" beside each slot's own tote textbox, since neither the app nor
+    // MAWM's data exposes how many slots a physical cart actually has —
+    // only the ones a line is already planned against — so there's no
+    // way to offer "pick an unused slot." The real need is overflow: a
+    // slot's picks don't fit one tote, so the extra tote is tied to
+    // *that* slot for the picker's physical reference, not an unrelated
+    // free-floating one) are set once at creation time (see the
+    // "+ Add Tote"-per-slot click handler) and never recomputed — an
+    // empty group has no rows yet for groupInfoFor() to derive a slotId
+    // from the way a natural group does. A plain non-cart "Pick to
+    // Tote" task (no slots at all) still uses the single global
+    // #addToteBtn, whose own entries carry `slotId: ""`.
     extraToteGroups: [],
     // groupKey -> {value, locked, status, statusLabel} (2026-08-10) —
     // the source of truth for every TOTE textbox's own state, since
@@ -2649,10 +2663,25 @@
    * near the bottom of this section — and its own drop target even
    * when empty (an "+ Add Tote" group with zero rows so far). A tote
    * box also gates on duplicateToteGroupKeys() (2026-08-10) — see that
-   * function's docstring.
+   * function's docstring. A cart slot's own tote box also gets a small
+   * "+" beside it (2026-08-11, per explicit instruction — see
+   * state.extraToteGroups' own docstring for why this replaced a single
+   * global "add a tote somewhere" button for cart tasks) that creates
+   * another tote tied to *that* slot, for overflow — never offered on a
+   * slot-less group (the plain non-cart case, where the global
+   * #addToteBtn already covers this) or on an oLPN-kind group (tote-only
+   * for now, per explicit instruction — oLPN overflow, generating a
+   * brand-new oLPN, is a later, more involved feature).
    */
   function pickGroupHeaderRowHtml(groupKey, info) {
-    const slotLabel = pickOlpnSlotLabel(info.slotId);
+    const baseSlotLabel = pickOlpnSlotLabel(info.slotId);
+    // An extra tote's own slot label gets a numbered suffix (2026-08-11)
+    // — "Slot 1 (Extra 1)" — set once at creation time (see the
+    // "+ Add Tote"-per-slot click handler), not recomputed here, so
+    // relabeling never happens out from under an in-progress entry.
+    const slotLabel = info.extraLabel
+      ? (baseSlotLabel ? baseSlotLabel + " (" + info.extraLabel + ")" : "(" + info.extraLabel + ")")
+      : baseSlotLabel;
     // Slot shown before TOTE/oLPN, bold/larger via .pick-olpn-slot
     // (2026-08-10, per explicit instruction — a cart picker locates a
     // group by its slot first, the container label second).
@@ -2674,6 +2703,14 @@
           : info.validating
             ? "Checking…"
             : info.validationMessage || "";
+      const addToteForSlotBtn = info.slotId
+        ? `<button
+              type="button"
+              class="btn btn-outline-secondary btn-sm add-tote-for-slot-btn"
+              data-slot-id="${escapeAttr(info.slotId)}"
+              title="Add another tote for ${escapeAttr(baseSlotLabel)}"
+            >+</button>`
+        : "";
       return `
         <tr class="pick-olpn-header pick-tote-header" data-group-key="${escapeAttr(groupKey)}">
           <td colspan="10">
@@ -2686,6 +2723,7 @@
               value="${escapeAttr(info.value || "")}"
               ${info.locked ? "disabled" : ""}
             />
+            ${addToteForSlotBtn}
             <span class="tote-validation-msg">${escapeHtml(message)}</span>
             <span class="pick-olpn-status">${info.status ? statusBadgeHtml(info.statusLabel, info.status) : ""}</span>
           </td>
@@ -2837,18 +2875,33 @@
     });
     // Empty drop targets from "+ Add Tote" (2026-08-10) — a group has
     // to exist before anything's been dragged into it.
-    state.extraToteGroups.forEach((key) => {
-      if (!byGroup.has(key)) {
-        byGroup.set(key, []);
-        groupKeys.push(key);
+    const extraToteGroupsByKey = new Map(state.extraToteGroups.map((e) => [e.key, e]));
+    state.extraToteGroups.forEach((entry) => {
+      if (!byGroup.has(entry.key)) {
+        byGroup.set(entry.key, []);
+        groupKeys.push(entry.key);
       }
     });
 
-    el.addToteBtn.style.display = rows.some((r) => r.isToteDestined) ? "" : "none";
+    // The global button only makes sense for a slot-less, non-cart
+    // "Pick to Tote" task (2026-08-11) — a cart task's own per-slot "+"
+    // (see pickGroupHeaderRowHtml()) replaces it, since a plain global
+    // "add a tote somewhere" has no way to say *which* slot it's for.
+    const isCart = rows.some((r) => r.isToteDestined && r.plannedSlotId);
+    el.addToteBtn.style.display = rows.some((r) => r.isToteDestined) && !isCart ? "" : "none";
 
     const groupInfoFor = (key) => {
       const groupRows = byGroup.get(key) || [];
       const firstRow = groupRows[0];
+      const extra = extraToteGroupsByKey.get(key);
+      if (extra) {
+        // Always the group's own designated slot (2026-08-11), never a
+        // dragged-in row's own original slot — an extra tote's whole
+        // point is representing overflow *for a specific slot*, which
+        // shouldn't change just because a different slot's row later
+        // gets dragged into it.
+        return { kind: "tote", containerId: "", slotId: extra.slotId, extraLabel: extra.label, ...getToteGroupState(key) };
+      }
       if (!firstRow || firstRow.isToteDestined) {
         return { kind: "tote", containerId: "", slotId: firstRow ? firstRow.plannedSlotId : "", ...getToteGroupState(key) };
       }
@@ -2890,6 +2943,22 @@
       const bHasSlot = Number.isFinite(slotB);
       if (aHasSlot && bHasSlot && slotA !== slotB) return slotA - slotB;
       if (aHasSlot !== bHasSlot) return aHasSlot ? -1 : 1;
+      // Within the same slot, a primary group always sorts before that
+      // slot's own extras (2026-08-11) — otherwise this would fall
+      // through to plain insertion order, which follows *row* iteration
+      // order (task-line order), not "primary created before its
+      // extras"; dragging a different line's row into an extra tote can
+      // make that row's line sort earlier than the primary's own line,
+      // flipping extra-above-primary (confirmed live on PICK0393 before
+      // this fix — Slot 1 (Extra 1) rendered above Slot 1 itself once a
+      // Slot-2 line was dragged into it). Extras for the same slot then
+      // sort by their own numbered label ("Extra 1" before "Extra 2").
+      const aExtra = !!infoA.extraLabel;
+      const bExtra = !!infoB.extraLabel;
+      if (aExtra !== bExtra) return aExtra ? 1 : -1;
+      if (aExtra && bExtra) {
+        return infoA.extraLabel.localeCompare(infoB.extraLabel, undefined, { numeric: true });
+      }
       return groupLabel(a, infoA).localeCompare(groupLabel(b, infoB));
     });
 
@@ -3739,10 +3808,31 @@
     true
   );
 
+  /** Creates a new empty tote group tied to `slotId` (2026-08-11) — see
+   * state.extraToteGroups' own docstring for why a cart's "+ Add Tote"
+   * is per-slot now instead of one global, slot-less button. Numbers
+   * the label against however many extras this *specific* slot already
+   * has (not a global counter), so two different slots' first extras
+   * both read "Extra 1". */
+  function addToteForSlot(slotId) {
+    const existingCount = state.extraToteGroups.filter((e) => e.slotId === slotId).length;
+    state.extraToteGroups.push({
+      key: "extra:" + slotId + ":" + Date.now(),
+      slotId,
+      label: "Extra " + (existingCount + 1),
+    });
+    renderPickGroups();
+  }
+
   el.pickLinesBody.addEventListener("click", (e) => {
     const splitBtn = e.target.closest(".pick-split-btn");
     if (splitBtn) {
       splitPickRow(splitBtn.dataset.splitId);
+      return;
+    }
+    const addToteBtn = e.target.closest(".add-tote-for-slot-btn");
+    if (addToteBtn) {
+      addToteForSlot(addToteBtn.dataset.slotId);
       return;
     }
     const row = e.target.closest("tr.pick-line-row");
@@ -3831,7 +3921,10 @@
   });
 
   el.addToteBtn.addEventListener("click", () => {
-    state.extraToteGroups.push("extra:" + Date.now() + ":" + state.extraToteGroups.length);
+    // Only reachable on a slot-less, non-cart task (see its own
+    // display-toggle in renderPickGroups()), so `slotId: ""` — no slot
+    // to tie it to.
+    state.extraToteGroups.push({ key: "extra:" + Date.now(), slotId: "", label: "" });
     renderPickGroups();
   });
 

@@ -3896,3 +3896,71 @@ not the split default of `2` it reverted to before this fix, confirmed
 both visually and via a fresh page load afterward showing the pristine
 unsplit `5` again (confirming the override resets cleanly on a new
 search, no stale carryover). No console errors.
+
+## Picking: "+ Add Tote" is now per-slot on a cart, not one global button (2026-08-11)
+
+The user found a real gap live on `PICK0393`: the single global
+"+ Add Tote" button (built for a plain non-cart "Pick to Tote" task,
+which has no slots at all) created an unlabeled, slot-less group that
+sorted to the very bottom of a *cart* task's own numbered slots — "which
+slot does it go to?!?" Discussed two options before coding, per explicit
+request: (a) a modal with a dropdown of slots, or (b) a small "+" beside
+each slot's own tote textbox.
+
+**Why (a) doesn't actually resolve the ambiguity**: neither the app nor
+MAWM's own data exposes how many slots a physical cart has — only the
+slots a line is already planned against (`PlannedSlotId`). A dropdown
+can only ever list slots that already have a container, so "pick a
+slot" doesn't mean anything different from "pick an existing tote
+group," which isn't what a new tote is for. Reframing the actual need
+as *overflow* (a slot's picks don't fit one tote) turns "which slot does
+it go to" into "whose overflow is this" — answerable, since it's
+whichever slot's tote box the picker is already looking at. That points
+straight at (b), and per direct comparison there's no real complexity
+argument for building (a) first either — both need the same core change
+(a tote group has to carry which slot it's tied to instead of deriving
+it from a row that may not exist yet), and (a) adds a whole modal round-
+trip on top of that same change that (b) skips entirely.
+
+**Built, tote-only for now** (oLPN overflow — generating a brand-new
+oLPN — flagged by the user as a later, more advanced feature, not
+attempted here): `state.extraToteGroups` changed from an array of bare
+key strings to `{key, slotId, label}` objects. `addToteForSlot(slotId)`
+(new) counts how many extras *that specific slot* already has and mints
+the next one ("Extra 1", "Extra 2", …), pushes it, and re-renders — a
+small "+" (`.add-tote-for-slot-btn`) renders beside every tote-kind
+slot's own textbox (both a primary slot group and any of its existing
+extras — `pickGroupHeaderRowHtml()`), reached via a `data-slot-id`
+attribute and a delegated click handler, no modal. `groupInfoFor()` now
+resolves an extra group's slot from its own stored `slotId` — not from
+whatever row happens to be dragged into it first, which would let a
+differently-slotted row silently "steal" the label. The single global
+`#addToteBtn` still exists, unchanged, for a plain non-cart task (no
+slots at all); `renderPickGroups()` now hides it whenever any row on
+screen has a `plannedSlotId` (i.e. it's a cart) since each slot's own
+"+" replaces it there.
+
+**A real ordering bug found live while testing, fixed same day**: the
+sort comparator's existing same-slot tie-break fell through to plain
+insertion order, which follows *row* iteration order (task-line order)
+— not "a primary group was created before its own extras." Dragging a
+*different* line's row into Slot 1's extra tote made that row's own
+line sort earlier than Slot 1's primary line, which flipped the render
+order to "Slot 1 (Extra 1)" *above* "Slot 1" itself. Fixed by adding an
+explicit tie-break ahead of the old one: a non-extra group always sorts
+before any of its own slot's extras, and extras for the same slot sort
+by their own numbered label (numeric-aware `localeCompare`, so "Extra
+10" doesn't sort before "Extra 2").
+
+**Confirmed live on `PICK0393`**: Slot 1 and Slot 2 (both tote-kind)
+each show their own "+"; Slot 3 (oLPN-kind) shows none, as designed.
+Clicked Slot 1's "+" → "Slot 1 (Extra 1)" appeared immediately after
+Slot 1's own rows, before Slot 2 — not at the bottom of the table.
+Dragged a Slot 2 line into it → order still read Slot 1 → Extra 1 →
+Slot 2 → Slot 3 (the ordering bug above, caught and fixed in this same
+pass, not left for a later report). Clicked Slot 1's "+" again →
+correctly produced "Slot 1 (Extra 2)", sorted directly after "Extra 1".
+Separately confirmed on `PICK0319` (a plain non-cart "Pick to Tote"
+task) that the single global `#addToteBtn` still renders exactly as
+before, with no slot label and no per-slot "+" on its own tote row. No
+console errors at any point.
