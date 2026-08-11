@@ -15,60 +15,63 @@ JasperReports version, and the JRXML file format itself. The notes below
 exist so the next report (or the next change to this one) doesn't have to
 rediscover all of this from scratch.
 
-## Current status (paused 2026-08-10)
+## Current status (resolved 2026-08-10)
 
-**The JRXML itself is proven correct** — extensively verified locally
-against the real JasperReports 6.4.0 engine (see
-`local-640-harness/README.md`), including reproducing the exact
-"compiles and deploys fine, but the PDF has no data" symptom on demand.
-**The open question is no longer about the report definition — it's
-about what MAWM's runtime actually hands the report**, specifically
-whether `REPORT_DATA_SOURCE` at generation time is the full envelope
-(`{"Data": [...]}`) or the bare `Data` array (`[...]`) by itself. Each
-shape needs a different `<queryString>` (`Data.*` vs `*` respectively) —
-both work correctly when matched to the right shape, and both produce
-silent, error-free, zero-data output when mismatched. This can't be
-resolved by more local testing or more JRXML edits; it requires either
-observing MAWM's actual runtime payload directly, or exhausting the
-handful of untested field-mapping key names below.
+**Root-caused and fixed by the user's R&D team.** The `Data.*` vs `*`
+question documented in earlier versions of this section was never the
+real issue — it was a red herring created by trying to fix the wrong
+layer. The actual bug, per R&D: **JasperReports 6.4.0's top-level
+`<detail>` band iteration cannot correctly consume a JSON object
+wrapping an array** (our real payload shape, `{"Data": [...]}`) — it
+expects a bare array (`[{...}, {...}]`) to drive per-record iteration.
+No root `queryString` suffix fixes this, because the problem isn't the
+suffix — it's that the *root query* was the wrong place to do
+per-location iteration at all, on this specific engine version. R&D
+could not reproduce the bug on a newer JasperReports version, and it's
+unclear whether it's a genuine 6.4.0 bug or an intentional behavior
+difference — but since the WMS can't be upgraded, this app has to work
+around it either way, not chase the older assumption further.
 
-**Current file state**: `cyclecountsheet.jrxml` has
-`<queryString language="jsonql"><![CDATA[Data.*]]></queryString>` (the
-envelope-shaped assumption) as of the last commit. This exact query
-string was already tested once before under different upstream WMS
-arguments and failed; it was re-tried after those arguments changed,
-per explicit instruction, with the honest expectation ("10% chance") that
-it might not be the fix either. **If it comes back blank again**, the
-next thing to actually try is the bare-array assumption
-(`<![CDATA[*]]>`) — already proven correct for that shape locally, and
-not yet tested against production under the *current* WMS argument
-configuration (only under the old one, where it also came back blank —
-see the "JsonQL vs plain JSON" section's full timeline below for exactly
-which combination was tested when).
+**The fix**: stop using the root query to drive per-location iteration.
+- Root `<queryString language="jsonql">` is now **empty** — an empty
+  JsonQL selectExpression just returns the root node as a single
+  record, so the `<detail>` band fires exactly once per report, not
+  once per location.
+- A `jr:list` component, wrapped inside that single detail-band firing,
+  does the *real* per-location iteration via its own `datasetRun`/
+  `dataSourceExpression`: `subDataSource("Data")` — **no `.*` suffix**.
+  This mirrors what `jr:table`'s `subDataSource("Items")` (also no
+  `.*`) was already doing correctly for per-item iteration — `jr:list`/
+  `jr:table` components apparently handle the object-wrapping-an-array
+  shape correctly where the top-level detail-band query never could.
+  **Both `subDataSource()` calls need the bare name — `.*` on either
+  breaks it again** (confirmed: the `.*`-suffixed form was tried and
+  failed).
 
-**A pattern worth being suspicious of going forward**: several rounds in
-this investigation involved Glean proposing a JRXML change, it failing in
+This is a structural change, not a one-line query-string flip: the
+location header rectangle/text and the item `jr:table` moved from being
+direct children of `<detail><band>` to being children of the new
+`jr:list`'s `<jr:listContents>`, bound through a new `Dataset1`
+subDataset (fields `DisplayLocation`/`LocationBarcode`/`LocationId`/
+`Items`) instead of the report's own top-level fields.
+
+**Confirmed via a working file** the user's R&D team produced and
+handed back (`cyclecountsheet_WORKING.jrxml`), which was diffed against
+the committed version to derive the above and then ported in — see
+`git log --oneline -p -- Jasper/cyclecountsheet.jrxml` for the exact
+change. QR code is still removed in this version (unrelated to this
+fix — see "QR code temporarily removed" below); re-confirm the location/
+item table renders correctly with real data before revisiting that.
+
+**A pattern worth remembering for any future investigation like this**:
+several earlier rounds involved proposing a JRXML change, it failing in
 production, and a later round proposing to revert to a combination
-already tried and already failed — without new evidence that anything
-about the runtime environment had changed. Two of those were caught and
-pushed back on (see the git log for `Jasper/cyclecountsheet.jrxml` for the
-exact sequence). Before applying the next suggested query-string flip,
-check `git log --oneline -p -- Jasper/cyclecountsheet.jrxml` (or ask
-Claude to) to confirm it's not a repeat of something already
-production-tested under the same conditions.
-
-**If local testing genuinely runs out of runway** (i.e. neither `Data.*`
-nor `*` works against production even though both are proven correct for
-their respective JSON shapes locally), the field-mapping key names
-themselves are the next thing to question — they were taken from a single
-captured sample payload and assumed to be stable, but MAWM's real
-`Items[]` objects carry dozens of fields (see the "real MAWM payload
-shape" section below); if the real generation-time payload uses
-different field names or a different nesting than the captured sample,
-that would produce the exact same silent-blank-output symptom as a root
-query mismatch, and neither this report's git history nor the local
-harness has ruled that out — it's just less likely given the sample was
-described as a genuine capture.
+already tried and already failed — without new evidence anything about
+the runtime environment had changed. The eventual fix only emerged once
+an independent team (R&D) actually diffed a known-working file against
+the committed one, rather than continuing to hypothesize about query
+suffixes from first principles. Worth trying that approach earlier next
+time a similar investigation stalls.
 
 ## Files
 
@@ -84,9 +87,10 @@ described as a genuine capture.
   plain JSON" below. **Never open/save this one in Jaspersoft Studio** —
   Studio will silently rewrite it back into the newer format and break it
   again. It carries an inline XML comment at the top saying the same
-  thing. **Currently has no QR code** — temporarily removed to isolate a
-  NullPointerException; see "QR code temporarily removed" below before
-  re-adding it.
+  thing. **QR code lives in the Title band, upper-right corner**, using
+  `evaluationTime="Report"` — schema-validated locally but not yet
+  confirmed live; see "QR code re-added in the Title band" below before
+  changing it.
 - **`location_inventory_sample.json`** — sample payload used by Studio's
   "Location Inventory JSON" data adapter for Preview. Root shape:
   `{ "Locations": [ { LocationId, DisplayLocation, LocationBarcode,
@@ -181,46 +185,57 @@ must use the `jsonql` variant. The `<property>` element goes as the
 `<fieldDescription>` (confirmed against JasperReports' own bundled
 classic `jasperreport.xsd`).
 
-**Update — the `.*` suffix question is now resolved, and it does matter.**
+**Update — the `.*` suffix theory below turned out to be a dead end;
+kept for the historical record, corrected in "Current status" above.**
+At the time, `Data.*`/`Items.*` seemed to explain a report that deployed
+but kept coming back with no data. It wasn't actually the fix — see
+"Current status" at the top of this document for the real root cause
+(root-level `<detail>`-band iteration can't consume an object-wrapped
+array on 6.4.0 at all, `.*` or not) and the real fix (empty root query,
+`jr:list`/`jr:table` driving iteration via bare, non-`.*`
+`subDataSource()` calls). The reasoning below was self-consistent and
+carefully checked against JasperReports' own source at the time, but
+the underlying premise — that the root query and `subDataSource()`
+follow the same rules and just needed the same suffix — was wrong; they
+turned out to behave differently on this engine version specifically
+for the object-wrapping-an-array shape.
+
 After the field-mapping fix, the QR removal, and the `Locations`→`Data`/
 `OnHandQty`→`OnHandSum` payload-shape fixes (see later sections), the
 report finally deployed and rendered a PDF — but kept excluding data.
-The root cause was exactly the `.*` question flagged above: **both**
+The hypothesis at the time was that **both**
 `<queryString language="jsonql">Data</queryString>` **and**
-`subDataSource("Items")` needed the suffix — `Data.*` and `Items.*`.
+`subDataSource("Items")` needed a `.*` suffix — `Data.*` and `Items.*`.
 
 Glean's own diagnosis at this point only proposed fixing the root query
 (`Data` → `Data.*`) and explicitly said to leave `subDataSource("Items")`
-unchanged. **That second half was checked against `JsonQLDataSource`'s
-actual source before applying anything** (fetched directly from
+unchanged. That second half was checked against `JsonQLDataSource`'s
+actual source before applying anything (fetched directly from
 `TIBCOSoftware/jasperreports` on GitHub) — `subDataSource(String)`
 constructs a new `JsonQLDataSource` using the exact same
 `jsonQLExecuter.selectNodes(root, selectExpression)` call, with
 `next()`/`recordCount()` just iterating whatever list that returns, as
-the root query. There's no special-casing between the two — a
-`subDataSource()` call is mechanically just another JsonQL query,
-evaluated with the current location object as its root instead of the
-whole document. If `Data` needs `.*` to iterate, `Items` needs it for
-the identical mechanical reason. Both were changed together:
-
-- `<queryString language="jsonql"><![CDATA[Data.*]]></queryString>`
-- `subDataSource("Items.*")`
-
-**General rule for any future JsonQL query in this file (or a new
-report)**: a bare field name referring to an array (`Foo`) selects the
-array itself as a single node. Appending `.*` (`Foo.*`) expands it into
-one node per element — required whenever the intent is "one report
-record per array element," which is true for essentially every
-list/subreport binding in a report like this one. Apply it consistently
-to *every* JsonQL selectExpression that targets an array, not just
-whichever one the visible symptom happens to point at first — this
-whole detour happened because the two array-selecting expressions in
-this file were fixed one upload at a time instead of both at once.
+the root query — which seemed to mean no special-casing existed between
+the two. Both were changed together at the time: `Data.*` and
+`Items.*`. **This is exactly the combination now known to be wrong**
+(root-level iteration doesn't work regardless of suffix; `subDataSource()`
+wants no suffix at all) — the source-code check was real, but it
+answered "are these two calls mechanically similar," not "does either
+of them actually work for this payload shape on this engine," which
+only a real upload (or R&D's own environment) could answer.
 
 Since Studio 7.0.6 doesn't have `JsonQLDataSource` at all (JsonQL support
 was restructured again in the 7.x line), none of this can be verified
-locally — the WMS upload is the only ground truth, same as everything
-else in this document.
+in Studio's own Preview. **It can be verified locally another way,
+though** — see "How to verify a change before uploading to the WMS"
+further down: `local-640-harness/` uses the real open-source
+JasperReports 6.4.0 engine directly (not Studio), which does have
+`JsonQLDataSource`, and can render an actual PDF from
+`cyclecountsheet.jrxml` in seconds. This section's own findings
+(`Data.*`/`Items.*` vs the eventual no-suffix `subDataSource()` fix)
+predate that tooling existing — a future case like this should use it
+first, rather than reasoning from source code and burning a WMS upload
+to find out.
 
 ## Classic JRXML syntax notes (for the WMS-bound file)
 
@@ -265,16 +280,34 @@ WMS's own validator error messages:
 
 ## Design notes worth knowing before changing anything
 
-- **The blind-quantity line is two separate elements, not one.** A
-  `staticText` with a fixed position and fixed width (the blank
-  underscore line — always identical across every row, regardless of
-  data) plus a separate small `textField` positioned to start exactly
-  where the line ends, left-aligned, holding `(actualQty)` in small grey
-  text. **Do not combine these into one text run** — if the line and the
+- **The blind-quantity line is two separate elements, not one** — a
+  blank line (always identical across every row, regardless of data)
+  plus a separate small `textField` positioned to start right after the
+  line ends, left-aligned, holding `(actualQty)` in small grey text.
+  **Do not combine these into one text run** — if the line and the
   quantity are one right-aligned block, a wider number (e.g. `1,737`)
   pushes the whole block, including the line itself, further left than a
   narrower number (`750`) would, so the blank lines stop lining up
   between rows. Splitting them was the actual fix for that.
+  **Confirmed live, 2026-08-10, real bug found in the first live PDF**:
+  the blank line was originally a `staticText` containing 32 literal
+  underscore characters, in a box only 95pt wide — too narrow for that
+  string at the `Detail` style's 9pt font, so it silently *wrapped onto
+  two lines* inside a 22pt-tall cell (JasperReports wraps text to fit
+  width regardless of `isStretchWithOverflow`; only the *height* used to
+  accommodate overflow is what that flag controls). The real symptom in
+  the PDF was a broken, two-segment line overlapping the `(qty)` label —
+  not obvious from the JRXML alone, only visible once actually rendered.
+  **Fixed by using a real `<line>` graphic element instead of underscore
+  text** (`<line><reportElement x="0" y="16" width="90" height="1"/></line>`,
+  no `graphicElement` override needed — the default 1pt black pen is
+  correct) — a vector line has no font metrics and can never wrap,
+  which is the more robust fix over just widening the old text box or
+  shrinking the font to force it onto one line. General lesson: prefer
+  an actual `<line>`/`<rectangle>` graphic over "fake" glyph-based
+  lines (underscores, dashes) for anything that needs to render as a
+  single unbroken segment — glyph-based fakes are one font-size or
+  locale change away from silently wrapping again.
 - **`OnHandQty`'s field class must be a concrete number type**
   (`java.lang.Double`), never the abstract `java.lang.Number` — JSON data
   source's `convertNumber()` only knows how to instantiate specific
@@ -293,80 +326,262 @@ WMS's own validator error messages:
   If "all locations in the warehouse" is the intent, confirm the
   data source query actually has that scope — the QR just concatenates
   whatever `Locations[]` the JSON payload contains.
-- The QR code is built by accumulating a report `<variable>`
-  (`resetType="Report"`, `calculation="Nothing"`) across every detail
-  record, then rendering it in the **Summary band only — never the
-  Title band.** (An earlier version of this note claimed the title band
-  would work too, reasoning that JasperReports evaluates a variable
-  "across the whole fill" regardless of which band displays it — **that
-  was wrong**, confirmed both by an actual blank-QR symptom on a real
-  WMS run and independently by Glean's diagnosis of the same file. A
-  `<title>` band is filled and printed *before* any detail records are
-  processed at all, so a variable referenced there only ever sees its
-  initial value — it is not retroactively updated once later bands fill
-  it in. Only a `<summary>` band, which prints after every detail record
-  has run, actually sees the fully-accumulated value. If a design
-  request ever asks to move the QR back to the title/header area for
-  layout reasons, that's a real tension with no clean answer — either
-  keep it in the summary band and accept it printing at the end, or
-  find a different way to pre-compute all location IDs before the
-  report starts filling (e.g. a two-pass query) rather than
-  accumulating them during the fill.
+- **Superseded 2026-08-10 — see "QR code re-added in the Title band"
+  below.** This subsection originally documented a hard "Summary band
+  only, never Title" rule, reasoned from how a plain `<variable>`
+  behaves across bands. That reasoning is still correct **for plain
+  variables**, but it turned out not to be the only option: barcode/QR
+  components support their own `evaluationTime="Report"` attribute
+  (schema-confirmed, see below), which defers *evaluation* of the QR's
+  content independent of *where* the element physically sits — making a
+  Title-band, upper-right-corner QR possible after all. Kept here for
+  the historical reasoning; don't re-derive the old Summary-band-only
+  design without reading the newer section first.
 
-## QR code temporarily removed from cyclecountsheet.jrxml (as of this writing)
+## QR code re-added in the Title band, upper-right corner (2026-08-10)
 
-After the field-mapping fix above, a real upload attempt still failed
-with a bare `java.lang.NullPointerException` — no message, no stack
-trace at all. Glean's diagnosis was that the self-referencing
-`AllLocationsCsv` variable itself was the unsafe part. **That specific
-theory is doubtful** — that accumulator pattern is a completely standard
-JasperReports idiom, and it was independently verified end-to-end
-against the real JasperReports 7.0.6 engine earlier in this project
-(full compile → fill → PDF export, no error) — but the *action* taken
-was reasonable regardless: both the variable and the entire `<summary>`
-band containing the QR component were removed, to isolate whether the
-core location/item table renders correctly on its own, deferring the QR
-feature until that's confirmed.
+The QR code was previously removed after a real WMS upload came back
+with a bare, message-less `java.lang.NullPointerException` (see the
+superseded section above for the full original investigation — the
+"missing runtime library" theory there is still the leading
+explanation and is **still unconfirmed**; re-adding the QR does not
+resolve that risk, it just means the next WMS upload is the real test
+of it again).
 
-**A more likely explanation**, matching the "Runtime library
-dependencies" section below: QR rendering needs barcode4j, ZXing, Batik,
-and a PDF backend all present on whatever engine executes the report,
-separate from anything in the JRXML — none of that has ever been
-confirmed present in MAWM's JasperReports 6.4.0 deployment. A bare,
-message-less NPE is a plausible symptom of that class of failure. If the
-location/item table now renders correctly with this QR-free version,
-that's evidence for this theory over the self-referencing-variable one —
-worth confirming with whoever manages the WMS's JasperReports deployment
-whether barcode/QR support is actually installed, rather than continuing
-to tweak the JRXML if it comes back to bite again once the QR is
-re-added.
+**Two real things changed since that removal, both required by the
+root-query restructuring earlier in this document** (the `<detail>`
+band now fires exactly once, with per-location data living inside the
+`jr:list`'s own isolated `Dataset1` subDataset, not the parent report):
 
-**To re-add the QR code once the core report is confirmed working**, the
-variable and summary band removed here were (immediately before removal):
+1. **The accumulator variable can no longer live at the parent-report
+   level and read `$F{DisplayLocation}` directly** — those fields
+   belong to `Dataset1`'s own separate fill context now, not the parent
+   report's. It's defined *inside* `Dataset1` instead, accumulating
+   exactly as before (`resetType="Report"`, `calculation="Nothing"`,
+   the same string-concatenation `variableExpression`), and its final
+   value is propagated out to a parent-report variable of the same name
+   via a `<returnValue fromVariable="AllLocationsCsv"
+   toVariable="AllLocationsCsv" calculation="Nothing"/>` on the
+   `jr:list`'s `<datasetRun>` — the standard JasperReports mechanism for
+   getting a value out of a list/table/crosstab's own subdataset into
+   the parent report (schema-confirmed: `<datasetRun>`'s content model
+   in `jasperreport.xsd` explicitly allows `<returnValue>` after
+   `<dataSourceExpression>`). The parent-level variable is declared
+   with `calculation="System"` and no expression of its own — per the
+   schema's own documentation, a `returnValue` target "should be a
+   variable with `calculation="System"`".
+
+2. **The QR itself moved from the `<summary>` band into the `<title>`
+   band, upper-right corner** (`x="446" y="0" width="94" height="94"`,
+   the same size and same right-edge position it always had — only the
+   band changed), with `<jr:QRCode evaluationTime="Report">` added.
+   This is new: `barcode4j.xsd`'s `Barcode` complexType (which `QRCode`
+   extends) declares its own `evaluationTime`/`evaluationGroup`
+   attributes, separate from — and not blocked by — the fact that the
+   generic `<componentElement>` wrapper in the core schema has no such
+   attribute itself (confirmed by reading both schemas directly: core
+   `jasperreport.xsd`'s `componentElement` complexType is just
+   `reportElement` + `component`, no attributes at all; but
+   `barcode4j.xsd`'s `Barcode` complexType — the base type for every
+   barcode symbology including `QRCode` — separately declares
+   `evaluationTime type="jr:basicEvaluationTime"`). `evaluationTime="Report"`
+   means: the QR element prints in its normal position (Title band, top
+   of page 1) but its `codeExpression` is evaluated only once at the
+   very end of the fill, using whatever value `$V{AllLocationsCsv}`
+   holds by then — the same delayed-evaluation mechanism JasperReports
+   uses for "Page X of Y" totals, just applied to a component instead
+   of a text field. By the time the fill ends, the single `<detail>`
+   band (which contains the `jr:list` that accumulates and returns
+   `AllLocationsCsv`) has already run, so the deferred QR sees the
+   fully-accumulated value even though it's positioned at the top of
+   the page.
+
+**Locally schema-validated** (not just well-formed-XML-checked) against
+the real bundled JasperReports 6.4.0 classic schemas — `jasperreport.xsd`
+and `components.xsd` from the actual `jasperreports-6.4.0.jar` in
+`local-640-harness/cp/`, plus a `barcode4j.xsd` extracted in an earlier
+session from Jaspersoft Studio's own installation — using `lxml` instead
+of Java's `SchemaFactory` (no JDK was available in this session), but hitting
+the exact same same-namespace-import gotcha already documented in "How
+to verify a change" below: importing `components.xsd` before
+`barcode4j.xsd` validates the whole file clean; importing them in the
+opposite order produces a spurious `jr:list` error (only whichever
+same-namespace schema loads first fully registers its substitution
+group members — a tooling artifact, not a real error, per the existing
+documented rule "only trust an error that shows up in both runs"). The
+`components.xsd`-first ordering — the trustworthy one — validated the
+whole file, including the new `<returnValue>`, the parent `calculation="System"`
+variable, and `<jr:QRCode evaluationTime="Report">`, with **zero**
+errors.
+
+**CONFIRMED LIVE, 2026-08-10.** The user uploaded this version and got
+back a real PDF with a correctly-rendered QR code in the upper-right
+corner of page 1 — this resolves every open question in the paragraph
+that used to be here: MAWM's embedded JasperReports 6.4.0 **does** have
+the barcode/ZXing/Batik runtime libraries needed to render a QR
+(closing out the "Runtime library dependencies" theory below as the
+explanation for the *original* NPE, at least as far as barcode support
+goes), the `evaluationTime="Report"` deferred-evaluation mechanism
+works end to end on the real engine for a component element (not just
+per the schema), and the `Dataset1`-scoped accumulator +
+`returnValue` propagation correctly delivers the full, real
+location list to the parent-report variable. See "QR/layout polish
+after first live confirmation" below for what still needed fixing in
+that same first PDF (title layout, the blank-line rendering, location
+ordering).
+
+For reference, the QR block currently in the `<title>` band looks like
+this:
 
 ```xml
-<variable name="AllLocationsCsv" class="java.lang.String" resetType="Report" calculation="Nothing">
-    <variableExpression><![CDATA[($V{AllLocationsCsv} == null || $V{AllLocationsCsv}.equals("")) ? ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation}) : $V{AllLocationsCsv} + ";" + ($F{DisplayLocation} == null ? $F{LocationId} : $F{DisplayLocation})]]></variableExpression>
-    <initialValueExpression><![CDATA[""]]></initialValueExpression>
-</variable>
+<componentElement>
+    <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
+    <jr:QRCode evaluationTime="Report">
+        <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
+    </jr:QRCode>
+</componentElement>
 ```
 
-```xml
-<summary>
-    <band height="98">
-        <componentElement>
-            <reportElement x="446" y="0" width="94" height="94" uuid="e5b7c3a2-1f6d-4e89-8a2c-3d9f7b0c4a63"/>
-            <jr:QRCode>
-                <jr:codeExpression><![CDATA[$V{AllLocationsCsv}]]></jr:codeExpression>
-            </jr:QRCode>
-        </componentElement>
-    </band>
-</summary>
-```
+(`location_inventory_report.jrxml`, the Studio-editable copy, was never
+updated to match this — it still has the QR code in its own
+compact-format equivalent, in the position/band this section originally
+described before being superseded. Worth revisiting if the Studio copy
+needs to stay a faithful preview of the deployment file, but not done
+automatically since Studio's compact format doesn't have the same
+`evaluationTime` story to port over without its own verification.)
 
-(`location_inventory_report.jrxml`, the Studio-editable copy, still has
-the QR code intact in its own compact-format equivalent — this removal
-only applies to the WMS deployment copy.)
+## QR/layout polish after first live confirmation (2026-08-10)
+
+Four fixes made from the user's own reading of the first successful live
+PDF (`cyclecountoutput.pdf`), none affecting the data/query mechanisms
+above — purely layout and ordering:
+
+- **Title now spans the full page width** (`x="0" width="540"`,
+  matching the column width) and is centered/vertically-middled across
+  the entire `94`pt-tall title band, **independent of the QR** — it no
+  longer shares a narrowed box with the QR the way it did when the
+  subtitle still existed. At the enlarged size (see below), the
+  rendered text is comfortably narrower than the ~440pt available before
+  the QR's `x=446` starting point, so the two don't actually visually
+  collide even though their `reportElement` bounding boxes overlap —
+  only real rendered glyphs matter for visual overlap, not declared box
+  width. If `REPORT_TITLE` is ever set to something much longer than
+  "Cycle Count Sheet," this could start visually overlapping the QR;
+  not solved preemptively.
+- **Title font size increased 14 → 21** (the requested 50% increase).
+- **The "Generated from the Location Inventory JSON payload" subtitle
+  was removed outright** (`staticText`), per explicit instruction —
+  not hidden/commented, actually deleted from the title band.
+- **Locations sort by `DisplayLocation` — attempted via `<sortField>`,
+  reverted after breaking live rendering. See "sortField regression"
+  below**, added right after this list. The location-sequence question
+  itself was resolved with the user first (ascending alphanumeric sort
+  on `DisplayLocation`, not a dedicated physical walk-sequence field —
+  that field isn't in this report's payload today) — only the
+  *mechanism* used to implement it turned out to be wrong.
+- **Fixed the broken blank-line rendering** — see the "blind-quantity
+  line" bullet in "Design notes" above for the full root cause (32
+  literal underscore characters silently wrapping onto two lines inside
+  a too-narrow, fixed-height cell) and the fix (a real `<line>` graphic
+  element instead of underscore text). This was the most important of
+  the four fixes per the user's own framing — the line is what a
+  warehouse worker actually hand-writes the physical count on, so a
+  broken/overlapping render there defeats the report's whole purpose.
+
+**Title/subtitle/line fixes confirmed schema-valid, sort field
+reverted** — see below for what actually happened on the real WMS
+upload.
+
+## `<sortField>` regression: broke all row data, reverted (2026-08-10)
+
+The user uploaded the four-fix version above. Result: the title/QR
+rendered, and the per-location banner header (the dark "Location: X"
+rectangle+text) rendered — but the nested item table's rows (Item /
+Description / On Hand, the actual data a warehouse worker needs) came
+back **completely empty** for every location. This is a real
+regression, not a rendering nitpick — worse than the original blank-line
+bug, since the report is now non-functional.
+
+**Root cause (reasoned from JasperReports architecture, not directly
+confirmed against the failing PDF's own content stream — see caveat
+below): `<sortField>` is very likely incompatible with this report's
+specific "reach back into the live `$P{REPORT_DATA_SOURCE}` cursor"
+idiom.** The nested item `jr:table`'s own `dataSourceExpression` —
+`((net.sf.jasperreports.engine.data.JsonQLDataSource)$P{REPORT_DATA_SOURCE}).subDataSource("Items")`
+— only works because, throughout `Dataset1`'s unsorted iteration,
+`$P{REPORT_DATA_SOURCE}` stays the *same* live `JsonQLDataSource`
+object, just advanced record-by-record via `next()`; each location's
+`jr:listContents` firing calls `subDataSource("Items")` on that same
+object at whatever position its cursor currently sits, pulling that
+location's own `Items` array directly, without ever going through
+`Dataset1`'s own declared `Items` field. Declaring a `<sortField>`
+forces JasperReports to fully buffer the dataset (read every record
+into memory, sort it, then serve the sorted, buffered copy) — that
+buffering pass is necessarily a *different* runtime object from the
+original live `JsonQLDataSource`, so by the time `jr:listContents`
+fires per (now-buffered, sorted) record, `$P{REPORT_DATA_SOURCE}`
+almost certainly isn't the live, cursor-correct object the item
+table's cast/`subDataSource()` call depends on anymore — silently
+returning no rows rather than throwing a visible error. This is
+architecturally consistent with what the user reported: the *outer*
+per-location iteration and banner header kept working (buffering still
+correctly replays N sorted location records), while only the *inner*
+`subDataSource()`-driven item table — the one piece of this report
+built around reaching outside the declared field set into a live
+cursor — broke.
+
+**Reverted**: the `<sortField name="DisplayLocation" order="Ascending"/>`
+line was removed from `Dataset1`. Locations are back to whatever order
+MAWM's own `Data[]` array returns them in (unsorted, matching the
+version that was confirmed fully working before this round of layout
+fixes) — re-validated locally as schema-valid, zero errors, same as
+every other change in this file.
+
+**Caveat on this diagnosis**: the user pasted the failing PDF as a
+base64 blob directly in chat; it appears to have been corrupted in
+transit (very long single-line pastes are a known fragile case) —
+decoding it locally successfully reconstructed the QR-code drawing
+object but the file's own trailer/`%%EOF` never appeared, so the
+actual page content stream (which would show definitively whether the
+item table's `BT`/`Tj` text-drawing operators are present or missing)
+couldn't be inspected directly. This diagnosis is reasoned from
+JasperReports' own architecture and is the most mechanically plausible
+explanation, but isn't independently confirmed against the real broken
+bytes the way this project's methodology otherwise insists on. If a
+future case needs this kind of forensic PDF inspection, share the file
+itself (a path, like `cyclecountoutput.pdf` was) rather than pasting
+base64 inline — large inline pastes risk exactly this kind of silent
+corruption.
+
+**Location-sequence sorting is still an open problem, not solved.**
+Whatever the real mechanism, it needs to avoid forcing JasperReports to
+buffer `Dataset1` out from under the live-cursor `subDataSource()`
+trick the item table depends on. Two directions worth investigating
+before the next attempt, neither tried yet:
+1. **Sort inside the JsonQL query itself** (`subDataSource("Data")`'s
+   own selectExpression) so the *already-sorted* result is still a
+   genuine live `JsonQLDataSource`, not a post-hoc buffered copy. This
+   needs `local-640-harness`'s `JsonQLProbe.java` (built for exactly
+   this kind of "isolate a pure JsonQL query-syntax question" case) to
+   confirm JsonQL's grammar actually supports an order-by/sort
+   construct before trying it live again — not yet attempted, and no
+   JDK was available in the session that found this regression.
+2. **Give up on `subDataSource()`'s live-cursor trick for the item
+   table** and rewire it to read from `Dataset1`'s own declared `Items`
+   field instead (which sorting is compatible with, since it's a plain
+   declared field like any other) — a bigger structural change, since
+   `Items` is currently declared `class="java.lang.String"` as a
+   pass-through handle, not actually parsed/used as a nested array
+   anywhere; would need real investigation into whether `JsonQLDataSource`
+   supports a field whose value is itself sub-queried via `<jr:table>`
+   the normal way (the way this file's *other* `subDataSource("Items")`
+   caller — inside `jr:list`, for `Data` itself — already does at the
+   top level, just not yet proven for a field-scoped one).
+
+Neither direction has been attempted or tested — flagged here rather
+than guessed at live again, consistent with this document's own
+repeated lesson about not re-trying an unconfirmed idea against
+production without local verification first.
 
 ## The real MAWM payload shape (confirmed, differs from the sample data)
 
@@ -442,33 +657,50 @@ report at runtime:
 
 ## How to verify a change before uploading to the WMS
 
-Direct proof was possible for the **compact-format** file: JasperReports
-jars extracted straight from Jaspersoft Studio's own installation
-(nested inside `net.sf.jasperreports_7.0.6.final.jar`'s `lib/` folder —
-digester, beanutils, jackson, barcode4j, zxing, batik, openpdf all
-needed adding one at a time) let a real compile → fill → PDF export run
-from the command line, independent of the Studio GUI.
+**Superseded 2026-08-10 — a full local PDF render of the classic-format
+file *is* possible after all.** Everything below about the classic
+loader's license gate is still true, but it turned out to only apply to
+**Jaspersoft Studio's own bundled jar** (`net.sf.jasperreports_7.0.6.final.jar`)
+— the real, open-source `net.sf.jasperreports:jasperreports:6.4.0`
+artifact from Maven Central (what `local-640-harness/` actually uses)
+has no such gate at all. This was already noted in
+`local-640-harness/README.md` for compile+fill (`ProdValidate.java`),
+but hadn't been extended to full PDF export (with the QR rendering)
+until this session, once the missing barcode4j/Batik/iText jars were
+tracked down — see `local-640-harness/README.md`'s "Rendering a real
+PDF for local QC" section for the full how-to. **This is now the
+preferred first step**, ahead of both schema validation and a live WMS
+upload:
 
-**This does not work for the classic-format file.** JasperReports'
-classic-format loader (`LegacyXmlLoader`) has a deliberate license gate —
-it only proceeds if either a paid JasperReports license is present, or
-it detects it's running inside Eclipse's own OSGi classloader with
-Jaspersoft Studio's classes reachable. Outside Studio, it always returns
-"no loader available," with no way around it. So for `cyclecountsheet.jrxml`:
-
-1. Validate it's well-formed XML and schema-valid against JasperReports'
+1. **Render an actual PDF locally**: `local-640-harness/render.ps1`
+   against a JSON payload in `my_test_payload.json` (edit it freely) —
+   compiles, fills, and exports a real PDF from `cyclecountsheet.jrxml`
+   in seconds, using the same two-argument `fillReport()` path MAWM's
+   own runtime uses. This is what would have caught the `<sortField>`
+   regression immediately, before it ever reached a WMS upload — see
+   "sortField regression" above.
+2. Validate it's well-formed XML and schema-valid against JasperReports'
    own bundled classic XSDs (`jasperreport.xsd`, `components.xsd`,
-   `barcode4j.xsd`) — this catches structural/naming mistakes without
-   needing the real engine. (Note: validating two same-namespace XSDs —
-   `components.xsd` and `barcode4j.xsd` — as separate `Source` objects in
-   one Java `SchemaFactory` call only fully registers whichever one
-   loads *first*; the other's top-level elements get incorrectly flagged
-   as invalid. Test with both orderings and only trust an error that
-   shows up in *both* runs.)
-2. Actually upload it to the WMS. This is the only real ground truth for
-   anything past basic schema validity — expression compilation errors
-   (like the `JsonDataSource` package mismatch) and other engine-version
-   differences only surface there.
+   `barcode4j.xsd`) — cheaper than a full render for catching pure
+   structural/naming mistakes, still worth doing first if a local JDK
+   genuinely isn't available. (Note: validating two same-namespace
+   XSDs — `components.xsd` and `barcode4j.xsd` — as separate `Source`
+   objects in one Java `SchemaFactory` call only fully registers
+   whichever one loads *first*; the other's top-level elements get
+   incorrectly flagged as invalid. Test with both orderings and only
+   trust an error that shows up in *both* runs. **Confirmed this same
+   technique, and the same ordering quirk, reproduces identically with
+   Python's `lxml`** (`etree.XMLSchema`) when no JDK is available in the
+   session — `jasperreport.xsd` + `components.xsd` imported before
+   `barcode4j.xsd` is the trustworthy ordering; the reverse spuriously
+   flags `jr:list` as unexpected.)
+3. Actually upload it to the WMS. Still the only *true* ground truth —
+   the local render uses the real open-source 6.4.0 engine and has
+   matched production closely so far, but it's not a guarantee the
+   WMS's actual embedded deployment doesn't differ in some way this
+   harness's `cp/` jars don't capture. Treat a local-render pass as
+   strong evidence, not a substitute for this step, especially for a
+   change nothing has uploaded and confirmed yet.
 
 ## Making a future change
 
@@ -491,9 +723,13 @@ Jaspersoft Studio's classes reachable. Outside Studio, it always returns
    bug this section documents. If you add a *new* subreport/list table
    (not just editing this one), its `dataSourceExpression`/
    `subDataSource()` call needs the same JsonQL treatment — see "JsonQL
-   vs plain JSON" above, **including appending `.*` to any
-   selectExpression that targets an array** (both the root `queryString`
-   and every `subDataSource()` call need it — confirmed, not optional).
+   vs plain JSON" above. **Do not drive top-level per-record iteration
+   from the root `queryString`** — on this engine, that can't correctly
+   consume our object-wrapped-array payload shape (`{"Data": [...]}`)
+   regardless of `.*`; leave the root query empty and add a `jr:list`/
+   `jr:table` component with its own `subDataSource("KeyName")` call
+   (bare key name, **no `.*`**) to iterate a new array — see "Current
+   status" at the top of this document for the full explanation.
 4. Re-upload `cyclecountsheet.jrxml` to the WMS and treat whatever error
    (if any) comes back as authoritative — that engine's exact version
    and available modules aren't fully known, so each new upload attempt

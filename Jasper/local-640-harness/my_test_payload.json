@@ -1,0 +1,47 @@
+{
+  "DocumentTemplateTypeId": "CYCLE_COUNT_SHEET",
+  "DocumentTemplateId": "CYCLE_COUNT_SHEET",
+  "Data": [
+    {
+      "LocationId": "A1AC0401",
+      "DisplayLocation": "A1AC0401",
+      "LocationBarcode": "A1AC0401",
+      "Items": [
+        {
+          "ItemId": "5000221",
+          "ItemDescription": "Floral Print Dress",
+          "OnHandSum": 2
+        }
+      ]
+    },
+    {
+      "LocationId": "A1AC0405",
+      "DisplayLocation": "A1AC0405",
+      "LocationBarcode": "A1AC0405",
+      "Items": [
+        {
+          "ItemId": "6000108",
+          "ItemDescription": "Dockside Oxford Shirt",
+          "OnHandSum": 240
+        },
+        {
+          "ItemId": "4000087",
+          "ItemDescription": "Colorblock Windbreaker",
+          "OnHandSum": 40
+        }
+      ]
+    },
+    {
+      "LocationId": "A2AC1201",
+      "DisplayLocation": "A2AC1201",
+      "LocationBarcode": "A2AC1201",
+      "Items": [
+        {
+          "ItemId": "4000087",
+          "ItemDescription": "Colorblock Windbreaker",
+          "OnHandSum": 20
+        }
+      ]
+    }
+  ]
+}
